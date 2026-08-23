@@ -1,0 +1,90 @@
+:root {
+  --dr-bg: #0a0f1a;
+  --dr-fg: #e6edf3;
+  --dr-accent: #003399;
+  --dr-lop: #ffcc00;
+  --dr-ghost: #4dd0e1;
+  --dr-muted: #8b949e;
+  --dr-panel: #111827;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--dr-bg);
+  color: var(--dr-fg);
+}
+
+dr-app {
+  display: block;
+  padding: 1rem;
+}
+
+.dr-panel {
+  background: var(--dr-panel);
+  border: 1px solid #1f2937;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.dr-panel h2 {
+  margin: 0 0 0.75rem 0;
+  font-size: 1rem;
+  color: var(--dr-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.dr-headline {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.dr-figure {
+  display: flex;
+  flex-direction: column;
+}
+
+.dr-figure .value {
+  font-size: 1.75rem;
+  font-weight: 600;
+}
+
+.dr-figure .label {
+  font-size: 0.75rem;
+  color: var(--dr-muted);
+}
+
+.dr-override {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.dr-override button {
+  font: inherit;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  border: 1px solid #2d3748;
+  background: #1a202c;
+  color: var(--dr-fg);
+  cursor: pointer;
+}
+
+.dr-override button.engaged {
+  background: var(--dr-accent);
+  border-color: var(--dr-accent);
+}
+
+dr-map-view {
+  display: block;
+  height: 60vh;
+  border-radius: 8px;
+  overflow: hidden;
+}

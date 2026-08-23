@@ -1,0 +1,47 @@
+{
+  "name": "@meri-imperiumi/signalk-dead-reckoning",
+  "version": "0.1.0",
+  "description": "Offline-first dead reckoning and sensor fusion engine for Signal K",
+  "main": "plugin/index.js",
+  "scripts": {
+    "format": "npx @biomejs/biome check --use-editorconfig=true --write plugin/ tests/ bin/ public/",
+    "lint": "npx @biomejs/biome check --use-editorconfig=true plugin/ public/",
+    "test": "node --test --test-force-exit \"tests/*.test.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/meri-imperiumi/signalk-dead-reckoning.git"
+  },
+  "bugs": {
+    "url": "https://github.com/meri-imperiumi/signalk-dead-reckoning/issues"
+  },
+  "homepage": "https://github.com/meri-imperiumi/signalk-dead-reckoning#readme",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-navigation",
+    "signalk-webapp"
+  ],
+  "author": "Henri Bergius <henri.bergias@iki.fi>",
+  "license": "EUPL-1.2",
+  "signalk-plugin-enabled-by-default": false,
+  "signalk": {
+    "displayName": "Dead Reckoning",
+    "appIcon": "./icon.png",
+    "requires": [
+      "@meri-imperiumi/signalk-internet"
+    ],
+    "recommends": [
+      "@meri-imperiumi/signalk-autostate",
+      "@meri-imperiumi/signalk-logbook"
+    ]
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "suncalc": "^1.9.0"
+  },
+  "devDependencies": {
+    "@signalk/server-api": "^2.30.0"
+  }
+}
