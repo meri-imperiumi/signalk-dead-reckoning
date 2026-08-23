@@ -200,10 +200,96 @@ function setState(db, key, value) {
   ).run(key, value, new Date().toISOString());
 }
 
+/**
+ * Records a DR correction on a snap-to-fix event (SPEC §4.5, §9.3).
+ * Symmetric across NORMAL and OVERRIDE modes — every confirmed fix that
+ * resets the DR origin writes a row, so the table doubles as the passage
+ * "how good was DR" diagnostic and the empirical input to the uncertainty
+ * polygon (§8) and backtesting (§10.2).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} r
+ * @param {number} r.fix_id - fixes row this correction refers to
+ * @param {string} r.timestamp - ISO timestamp of the snap
+ * @param {number} r.dr_lat
+ * @param {number} r.dr_lon
+ * @param {number} r.fix_lat
+ * @param {number} r.fix_lon
+ * @param {number} r.deviation_nm
+ * @param {number} r.deviation_bearing
+ * @param {number} r.dr_elapsed_seconds
+ * @param {string} [r.sail_state]
+ * @param {string} [r.sea_state]
+ * @returns {number} inserted correction_id
+ */
+function recordCorrection(db, r) {
+  const stmt = db.prepare(
+    `INSERT INTO dr_corrections (
+       fix_id, timestamp, dr_lat, dr_lon, fix_lat, fix_lon,
+       deviation_nm, deviation_bearing, dr_elapsed_seconds,
+       sail_state, sea_state
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const info = stmt.run(
+    r.fix_id,
+    r.timestamp,
+    r.dr_lat,
+    r.dr_lon,
+    r.fix_lat,
+    r.fix_lon,
+    r.deviation_nm,
+    r.deviation_bearing,
+    r.dr_elapsed_seconds,
+    r.sail_state ?? null,
+    r.sea_state ?? null,
+  );
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * Records a fix (SPEC §4.4). Used on every confirmed fix that resets the
+ * DR origin (§9.3) and by future fix-pipeline methods (celestial,
+ * bearing, ...). Returns the new fix_id so a corresponding
+ * dr_corrections row can reference it.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} r
+ * @param {string} r.timestamp - ISO timestamp
+ * @param {string} r.source_type - 'gps' | 'celestial' | 'bearing' | 'manual' | 'backfill'
+ * @param {number} r.latitude
+ * @param {number} r.longitude
+ * @param {number} [r.estimated_error_radius]
+ * @param {string} [r.confirmed_by]
+ * @param {boolean} [r.resets_dr_origin]
+ * @param {string} [r.notes]
+ * @returns {number} inserted fix_id
+ */
+function recordFix(db, r) {
+  const stmt = db.prepare(
+    `INSERT INTO fixes (
+       timestamp, source_type, latitude, longitude,
+       estimated_error_radius, confirmed_by, resets_dr_origin, notes
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const info = stmt.run(
+    r.timestamp,
+    r.source_type,
+    r.latitude,
+    r.longitude,
+    r.estimated_error_radius ?? null,
+    r.confirmed_by ?? null,
+    r.resets_dr_origin ? 1 : 0,
+    r.notes ?? null,
+  );
+  return Number(info.lastInsertRowid);
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
   openDatabase,
   getState,
   setState,
+  recordFix,
+  recordCorrection,
 };

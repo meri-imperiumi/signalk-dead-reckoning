@@ -9,8 +9,14 @@ const { mkdtemp, rm } = require("node:fs/promises");
 const { join } = require("node:path");
 const { tmpdir } = require("node:os");
 
-const { openDatabase, getState, setState, SCHEMA_VERSION } =
-  require("../plugin/db.js");
+const {
+  openDatabase,
+  getState,
+  setState,
+  recordFix,
+  recordCorrection,
+  SCHEMA_VERSION,
+} = require("../plugin/db.js");
 
 let tempDir;
 
@@ -78,5 +84,59 @@ test("dr_matrix_bins primary key enforces bin-level uniqueness", () => {
   ins.run("sailing", "unknown", 5, 45, 12, 4, 0.06, 2, 1);
   const count = db.prepare("SELECT COUNT(*) AS n FROM dr_matrix_bins").get().n;
   assert.strictEqual(count, 2);
+  db.close();
+});
+
+test("recordFix inserts a fixes row and returns its id", () => {
+  const db = openDatabase(join(tempDir, "e.sqlite"));
+  const id = recordFix(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    source_type: "gps",
+    latitude: 60.1,
+    longitude: 24.9,
+    confirmed_by: "crew",
+    resets_dr_origin: true,
+  });
+  assert.strictEqual(typeof id, "number");
+  assert.ok(id > 0);
+  const row = db.prepare("SELECT * FROM fixes WHERE fix_id = ?").get(id);
+  assert.strictEqual(row.source_type, "gps");
+  assert.strictEqual(row.latitude, 60.1);
+  assert.strictEqual(row.confirmed_by, "crew");
+  assert.strictEqual(row.resets_dr_origin, 1);
+  assert.strictEqual(row.logged_to_logbook, 0); // default
+  db.close();
+});
+
+test("recordCorrection inserts a dr_corrections row referencing a fix", () => {
+  const db = openDatabase(join(tempDir, "f.sqlite"));
+  const fixId = recordFix(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    source_type: "gps",
+    latitude: 60,
+    longitude: 24,
+    resets_dr_origin: true,
+  });
+  const cid = recordCorrection(db, {
+    fix_id: fixId,
+    timestamp: "2026-01-01T00:00:00Z",
+    dr_lat: 60.01,
+    dr_lon: 24.01,
+    fix_lat: 60,
+    fix_lon: 24,
+    deviation_nm: 0.62,
+    deviation_bearing: 200,
+    dr_elapsed_seconds: 2700,
+    sail_state: "sailing",
+    sea_state: "unknown",
+  });
+  assert.ok(cid > 0);
+  const row = db
+    .prepare("SELECT * FROM dr_corrections WHERE correction_id = ?")
+    .get(cid);
+  assert.strictEqual(row.fix_id, fixId);
+  assert.strictEqual(row.deviation_nm, 0.62);
+  assert.strictEqual(row.dr_elapsed_seconds, 2700);
+  assert.strictEqual(row.sail_state, "sailing");
   db.close();
 });

@@ -14,9 +14,16 @@
 /** @typedef {import("@signalk/server-api").Plugin} Plugin */
 
 const { join } = require("node:path");
-const { openDatabase, getState, setState } = require("./db.js");
+const { openDatabase, getState, setState, recordFix, recordCorrection } =
+  require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
+const {
+  TrainingState,
+  resolveCurrent,
+  tick: trainingTick,
+} = require("./training.js");
+const { distanceNm, bearingDeg } = require("./geo.js");
 
 /**
  * Plugin identifier (matches package name without the scope).
@@ -74,8 +81,15 @@ const deps = {
   openDatabase,
   getState,
   setState,
+  recordFix,
+  recordCorrection,
   DeadReckoningEngine,
   MatrixStore,
+  TrainingState,
+  resolveCurrent,
+  trainingTick,
+  distanceNm,
+  bearingDeg,
 };
 
 /**
@@ -100,6 +114,12 @@ module.exports = (app) => {
 
   /** @type {DeadReckoningEngine|null} */
   let engine = null;
+
+  /** @type {TrainingState|null} */
+  let training = null;
+
+  /** @type {number|null} monotonic seconds counter for the training loop */
+  let clockS = 0;
 
   /** @type {number|null} */
   let tickInterval = null;
@@ -142,6 +162,8 @@ module.exports = (app) => {
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
+      training = new deps.TrainingState();
+      clockS = 0;
 
       // Seed the engine origin from the last known good position, if any.
       const lastFix = deps.getState(db, "last_known_good_fix");
@@ -209,6 +231,8 @@ module.exports = (app) => {
       }
       matrix = null;
       engine = null;
+      training = null;
+      clockS = 0;
       setStatus("Dead reckoning stopped");
     },
   };
@@ -231,10 +255,61 @@ module.exports = (app) => {
         // Seed the engine origin from the first GPS fix if we have none yet.
         if (v.path === "navigation.position" && !engine?.origin) {
           const pos = unwrapPosition(v.value);
-          if (pos) engine?.snapToFix(pos);
+          if (pos) snapToFix(pos, "gps", { confirmed_by: null, resets: true });
         }
       }
     }
+  }
+
+  /**
+   * Snaps the DR origin to a fix, recording a `fixes` row and — when there
+   * was a prior origin to deviate from — a `dr_corrections` row (SPEC
+   * §4.5, §9.3). Symmetric across NORMAL and OVERRIDE: every confirmed
+   * fix that resets the origin is recorded, regardless of mode.
+   *
+   * @param {{latitude:number, longitude:number}} fix
+   * @param {string} sourceType - 'gps' | 'celestial' | 'bearing' | 'manual'
+   * @param {object} [opts]
+   * @param {string|null} [opts.confirmed_by]
+   * @param {boolean} [opts.resets] - whether this fix resets the DR origin
+   * @returns {void}
+   */
+  function snapToFix(fix, sourceType, opts = {}) {
+    if (!engine || !db) return;
+    const priorOrigin = engine.origin;
+    const elapsed = engine.elapsedSinceOriginS;
+    const sailState = resolveSailState();
+    const seaState = "unknown";
+    const ts = new Date().toISOString();
+
+    const fixId = deps.recordFix(db, {
+      timestamp: ts,
+      source_type: sourceType,
+      latitude: fix.latitude,
+      longitude: fix.longitude,
+      confirmed_by: opts.confirmed_by ?? null,
+      resets_dr_origin: opts.resets !== false,
+    });
+
+    if (priorOrigin && opts.resets !== false) {
+      const deviation = deps.distanceNm(priorOrigin, fix);
+      const devBearing = deps.bearingDeg(priorOrigin, fix);
+      deps.recordCorrection(db, {
+        fix_id: fixId,
+        timestamp: ts,
+        dr_lat: priorOrigin.latitude,
+        dr_lon: priorOrigin.longitude,
+        fix_lat: fix.latitude,
+        fix_lon: fix.longitude,
+        deviation_nm: deviation,
+        deviation_bearing: devBearing,
+        dr_elapsed_seconds: elapsed,
+        sail_state: sailState,
+        sea_state: seaState,
+      });
+    }
+
+    if (opts.resets !== false) engine.snapToFix(fix);
   }
 
   /**
@@ -243,15 +318,21 @@ module.exports = (app) => {
    * @returns {void}
    */
   function step() {
-    if (!engine || !matrix) return;
+    if (!engine || !matrix || !training) return;
+
+    clockS += config.tickIntervalMs / 1000;
 
     const rawStw = unwrapNumber(deltaState.get("navigation.speedThroughWater"));
     const headingMag = unwrapNumber(
       deltaState.get("navigation.headingMagnetic"),
     );
     const headingTrue = unwrapNumber(deltaState.get("navigation.headingTrue"));
-    const awa = unwrapNumber(deltaState.get("environment.wind.angleApparent"));
+    const awaRad = unwrapNumber(
+      deltaState.get("environment.wind.angleApparent"),
+    );
+    const aws = unwrapNumber(deltaState.get("environment.wind.speedApparent"));
     const heel = unwrapHeel(deltaState.get("navigation.attitude"));
+    const gps = unwrapPosition(deltaState.get("navigation.position"));
 
     // Heading: prefer true heading; fall back to magnetic (WMM correction
     // applied upstream in v1 — see SPEC §12). If neither, hold position.
@@ -263,13 +344,18 @@ module.exports = (app) => {
     // 'unknown' (SPEC §4.1).
     const sailState = resolveSailState();
     const seaState = "unknown";
+    const awaDeg = awaRad != null ? (awaRad * 180) / Math.PI : 0;
     const corrections = matrix.lookup({
       sail_state: sailState,
       sea_state: seaState,
       stwKn: rawStw,
-      awaDeg: awa != null ? (awa * 180) / Math.PI : 0,
+      awaDeg,
       heelDeg: heel ?? 0,
     });
+
+    // Resolve the best available current vector (SPEC §6.2). v1 ships
+    // tier 5 (zero); the resolver has a hook for tier 4 pilot charts.
+    const current = deps.resolveCurrent({}, undefined);
 
     const pos = engine.tick(
       {
@@ -277,10 +363,41 @@ module.exports = (app) => {
         headingTrueDeg,
         leewayDeg: corrections.leeway_angle,
         speedLoss: corrections.speed_loss,
-        current: { setTrue: 0, drift: 0 },
+        current,
       },
       config.tickIntervalMs / 1000,
     );
+
+    // --- Training Mode (SPEC §6.1) --------------------------------------
+    // When GPS is reliable and we're sailing (not motoring, paddlewheel
+    // not fouled, not in a tack/gybe transient), compute the error vector
+    // vs. GPS ground truth and EMA-merge it into the matching bin.
+    const tr = deps.trainingTick(training, {
+      timestampS: clockS,
+      gps,
+      stwKn: rawStw,
+      headingTrueDeg,
+      awaDeg,
+      awsKn: aws,
+      heelDeg: heel ?? 0,
+      propulsionState: deltaState.get("propulsion.main.state"),
+      current,
+      lookupLeewayDeg: corrections.leeway_angle,
+      lookupSpeedLoss: corrections.speed_loss,
+    });
+    if (tr.observation) {
+      matrix.update(
+        {
+          sail_state: sailState,
+          sea_state: seaState,
+          stwKn: rawStw,
+          awaDeg,
+          heelDeg: heel ?? 0,
+        },
+        tr.observation,
+        { source: "live" },
+      );
+    }
 
     if (pos) {
       publish({
@@ -291,6 +408,7 @@ module.exports = (app) => {
         [PATHS.tripLog]: engine.tripLogNm,
         [PATHS.stw]: rawStw,
         [PATHS.headingTrue]: headingTrueDeg,
+        [PATHS.current]: current,
       });
     }
   }
@@ -435,6 +553,50 @@ module.exports = (app) => {
       engine.active = !!body?.active;
       setStatus(engine.active ? "DR OVERRIDE engaged" : "DR OVERRIDE released");
       res.json({ active: engine.active });
+    });
+
+    /**
+     * POST /fix — confirm a fix (SPEC §9.1). Records a `fixes` row and,
+     * when the engine has a prior origin, a `dr_corrections` row (§9.3),
+     * then snaps the DR origin to the confirmed position. The full fix
+     * pipeline (LOP/CPL combination, celestial/bearing entry) is a
+     * separate work doc; this endpoint covers the GPS-confirm and manual-
+     * point cases that exercise the correction-recording path.
+     *
+     * Body: { latitude, longitude, source_type?, confirmed_by?, resets? }
+     */
+    router.post("/fix", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      let body = req.body;
+      if (body == null) {
+        try {
+          body = JSON.parse(req.body);
+        } catch {
+          body = {};
+        }
+      }
+      const lat = body?.latitude;
+      const lon = body?.longitude;
+      if (typeof lat !== "number" || typeof lon !== "number") {
+        res.status(400).json({ message: "latitude and longitude required" });
+        return;
+      }
+      const hadPrior = engine.origin != null;
+      snapToFix(
+        { latitude: lat, longitude: lon },
+        body?.source_type || "manual",
+        {
+          confirmed_by: body?.confirmed_by ?? null,
+          resets: body?.resets !== false,
+        },
+      );
+      res.json({
+        recorded_correction: hadPrior && body?.resets !== false,
+        origin: engine.origin,
+      });
     });
   };
 

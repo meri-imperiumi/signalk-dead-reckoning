@@ -8,6 +8,7 @@ const assert = require("node:assert/strict");
 const { mkdtemp, rm } = require("node:fs/promises");
 const { join } = require("node:path");
 const { tmpdir } = require("node:os");
+const { DatabaseSync } = require("node:sqlite");
 
 const makePlugin = require("../plugin/index.js");
 const { FakeSignalKApp, FakeRouter } = require("./fake-app.js");
@@ -188,4 +189,108 @@ test("unwrapPosition handles bare and wrapped values", () => {
   });
   assert.strictEqual(unwrapPosition(null), null);
   assert.strictEqual(unwrapPosition({ foo: 1 }), null);
+});
+
+test("training writes a matrix bin once GPS ground truth is available", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-train-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  // Fast tick so the test doesn't wait a full second per step.
+  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  // First GPS fix seeds the origin; second provides SOG/COG for training.
+  // Boat heading 0 (N), STW 5, but GPS drifts slightly E of N (leeward)
+  // → observed leeway should be positive and a bin should be written.
+  for (let i = 0; i < 3; i++) {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60 + i * 0.0002, longitude: 24 + 0.0001 * i },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+            { path: "environment.wind.angleApparent", value: 0.78 },
+            { path: "environment.wind.speedApparent", value: 12 },
+            { path: "navigation.attitude", value: { roll: 0.17 } },
+            { path: "propulsion.main.state", value: "stopped" },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  await new Promise((r) => setTimeout(r, 30));
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const n = db.prepare("SELECT COUNT(*) AS n FROM dr_matrix_bins").get().n;
+  assert.ok(n > 0, `expected at least one trained bin, got ${n}`);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix records a dr_corrections row when a prior origin exists", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-snap-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // First GPS fix seeds the origin (no prior → no correction).
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  // Sail a bit so the DR origin moves away from the seed and elapsed accrues.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 60));
+  // Confirm a fix away from the current DR origin → correction recorded.
+  const { status, body } = router.invoke("post", "/fix", {
+    latitude: 60.01,
+    longitude: 24.01,
+    source_type: "manual",
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.recorded_correction, true);
+  await new Promise((r) => setTimeout(r, 20));
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const corrections = db.prepare("SELECT * FROM dr_corrections").all();
+  assert.ok(
+    corrections.length >= 1,
+    `expected >=1 correction, got ${corrections.length}`,
+  );
+  assert.strictEqual(corrections[0].sail_state, "unknown");
+  assert.ok(corrections[0].deviation_nm > 0);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
 });
