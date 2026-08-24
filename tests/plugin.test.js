@@ -540,3 +540,109 @@ test("POST /fix still accepts a plain point fix (back-compat)", async () => {
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("POST /celestial/sight reduces a Sun sight and persists a celestial LOP", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-cel-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // Set a DR position so the engine has an origin to reduce from.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 40, longitude: -75 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  // A Sun sight at local noon: Hs chosen so the intercept is small.
+  const t = new Date("2026-06-21T17:00:00Z").getTime();
+  const { status, body } = router.invoke("post", "/celestial/sight", {
+    body: "Sun",
+    hs_deg: 72.5,
+    eye_height_m: 3,
+    epoch_ms: t,
+    limb: "lower",
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.lop_id > 0);
+  assert.strictEqual(body.reduction.body, "Sun");
+  assert.ok(Number.isFinite(body.reduction.intercept_nm));
+  assert.ok(
+    body.reduction.azimuth_true >= 0 && body.reduction.azimuth_true < 360,
+  );
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const row = db
+    .prepare("SELECT * FROM lines_of_position WHERE lop_id = ?")
+    .get(body.lop_id);
+  assert.strictEqual(row.lop_type, "celestial");
+  assert.strictEqual(row.body_or_object, "Sun");
+  assert.strictEqual(row.used_in_fix_id, null);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /celestial/sight rejects a missing required field", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-cel-bad-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/celestial/sight", {
+    body: "Sun",
+    hs_deg: 72.5,
+  });
+  assert.strictEqual(status, 400);
+  assert.ok(/body, hs_deg, epoch_ms required/.test(body.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /celestial/sight returns 400 for a below-cutoff sight", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-cel-low-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 40, longitude: -65 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const t = new Date("2026-06-21T08:30:00Z").getTime();
+  const { status, body } = router.invoke("post", "/celestial/sight", {
+    body: "Sun",
+    hs_deg: 6,
+    epoch_ms: t,
+  });
+  assert.strictEqual(status, 400);
+  assert.ok(/refraction cutoff/.test(body.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});

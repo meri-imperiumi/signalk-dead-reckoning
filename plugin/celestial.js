@@ -1,0 +1,386 @@
+/**
+ * Celestial sight reduction (SPEC §13).
+ *
+ * Reduces a raw sextant sight into a line of position ready for the
+ * unified fix pipeline (work doc #3): an assumed position, an azimuth
+ * (Zn), and a signed intercept (toward/away) in nautical miles.
+ *
+ * The method is Marcq St. Hilaire (intercept method):
+ *
+ *   1. From the timestamp and the body, find the body's geographic
+ *      position (GP): its GHA (Greenwich hour angle) and declination.
+ *      The GP is the point on earth directly under the body.
+ *   2. At the assumed position (here: the DR position, or an explicit
+ *      assumed_position per design decision Q4), compute the computed
+ *      altitude Hc and azimuth Zn of the body.
+ *   3. Correct the sextant altitude Hs to the observed altitude Ho
+ *      (index error, dip, refraction; plus semi-diameter and parallax
+ *      for Sun/Moon limb sights).
+ *   4. Intercept = (Ho − Hc) × 60 arcminutes → nautical miles. Positive
+ *      means the observer is toward the body from the assumed position
+ *      ("toward"); negative means away. The LOP is perpendicular to Zn,
+ *      offset by the intercept — exactly the form `recordLineOfPosition`
+ *      and the fix resolver expect.
+ *
+ * Ephemeris (SPEC §13):
+ *   - Sun and Moon: computed locally from the timestamp via standard
+ *     formulas (the same `aa.quae.nl` derivation suncalc uses, but we
+ *     need GHA/declination, which suncalc's public API doesn't expose).
+ *   - Stars: from a bundled static almanac (plugin/star-almanac.js),
+ *     GHA = GHA Aries + SHA, declination from the almanac. Proper motion
+ *     is negligible over the almanac's stated valid epoch (§13).
+ *
+ * The module is pure: no DB, no I/O, no `new Date()` (the sight time is
+ * passed in explicitly so reduction is deterministic and testable).
+ * Time-sync staleness (§11) is read from a passed-in indicator and
+ * carried on the result, not computed here.
+ *
+ * @file celestial.js
+ */
+
+const { normalizeDeg360 } = require("./geo.js");
+
+/** Radians per degree. */
+const RAD = Math.PI / 180;
+/** Degrees per radian. */
+const DEG = 180 / Math.PI;
+/** Mean obliquity of the ecliptic (J2000), degrees. */
+const OBLIQUITY_DEG = 23.4397;
+
+/**
+ * Greenwich Mean Sidereal Time in degrees [0, 360), for a given UTC
+ * timestamp. Standard USNO formula; used to turn SHA → GHA for stars and
+ * RA → GHA for Sun/Moon.
+ *
+ * @param {number} epochMs - Date.getTime() value (UTC ms)
+ * @returns {number}
+ */
+function gmstDeg(epochMs) {
+  const jd = epochMs / 86400000 + 2440587.5;
+  const T = (jd - 2451545.0) / 36525;
+  const g =
+    280.46061837 +
+    360.98564736629 * (jd - 2451545.0) +
+    0.000387933 * T * T -
+    (T * T * T) / 38710000;
+  return normalizeDeg360(g);
+}
+
+/**
+ * Reduces an ecliptic longitude/latitude to right ascension (degrees).
+ *
+ * @param {number} lonDeg - ecliptic longitude, degrees
+ * @param {number} latDeg - ecliptic latitude, degrees (0 for the Sun)
+ * @returns {number} RA, degrees
+ */
+function raFromEcliptic(lonDeg, latDeg) {
+  const e = OBLIQUITY_DEG * RAD;
+  const l = lonDeg * RAD;
+  const b = latDeg * RAD;
+  const ra = Math.atan2(
+    Math.sin(l) * Math.cos(e) - Math.tan(b) * Math.sin(e),
+    Math.cos(l),
+  );
+  return normalizeDeg360(ra * DEG);
+}
+
+/**
+ * Reduces an ecliptic longitude/latitude to declination (degrees).
+ *
+ * @param {number} lonDeg
+ * @param {number} latDeg
+ * @returns {number} declination, degrees [-90, 90]
+ */
+function decFromEcliptic(lonDeg, latDeg) {
+  const e = OBLIQUITY_DEG * RAD;
+  const l = lonDeg * RAD;
+  const b = latDeg * RAD;
+  const dec = Math.asin(
+    Math.sin(b) * Math.cos(e) + Math.cos(b) * Math.sin(e) * Math.sin(l),
+  );
+  return dec * DEG;
+}
+
+/**
+ * Sun's geographic position at a timestamp: GHA and declination.
+ *
+ * Derived from the low-precision solar position formulas (good to ~0.01°,
+ * ample for sextant work). Same source as suncalc (aa.quae.nl).
+ *
+ * @param {number} epochMs
+ * @returns {{gha_deg: number, declination_deg: number}}
+ */
+function sunGeographicPosition(epochMs) {
+  const d = epochMs / 86400000 - 10957.5; // days since J2000
+  const M = normalizeDeg360(357.5291 + 0.98560028 * d); // mean anomaly
+  const C =
+    1.9148 * Math.sin(M * RAD) +
+    0.02 * Math.sin(2 * M * RAD) +
+    0.0003 * Math.sin(3 * M * RAD); // equation of center
+  const lon = normalizeDeg360(280.4665 + 0.9856474 * d + C); // true ecliptic longitude
+  const ra = raFromEcliptic(lon, 0);
+  const dec = decFromEcliptic(lon, 0);
+  // GHA = GMST − RA (Greenwich hour angle of the body).
+  const gha = normalizeDeg360(gmstDeg(epochMs) - ra);
+  return { gha_deg: gha, declination_deg: dec };
+}
+
+/**
+ * Moon's geographic position at a timestamp: GHA and declination.
+ *
+ * Low-precision lunar position (good to ~0.1°). Same source as suncalc.
+ *
+ * @param {number} epochMs
+ * @returns {{gha_deg: number, declination_deg: number}}
+ */
+function moonGeographicPosition(epochMs) {
+  const d = epochMs / 86400000 - 10957.5; // days since J2000
+  const L = normalizeDeg360(218.316 + 13.176396 * d); // mean longitude
+  const M = normalizeDeg360(134.963 + 13.064993 * d); // mean anomaly
+  const F = normalizeDeg360(93.272 + 13.22935 * d); // argument of latitude
+  // Ecliptic longitude with the two largest correction terms.
+  const lon =
+    L +
+    6.289 * Math.sin(M * RAD) -
+    1.274 * Math.sin((2 * L - 2 * M) * RAD) +
+    0.658 * Math.sin(2 * F * RAD) -
+    0.186 * Math.sin((2 * L - 2 * M + 2 * F) * RAD);
+  // Ecliptic latitude (small, from F).
+  const lat =
+    5.128 * Math.sin(F * RAD) +
+    0.28 * Math.sin((M + F) * RAD) -
+    0.28 * Math.sin((M - F) * RAD);
+  const ra = raFromEcliptic(lon, lat);
+  const dec = decFromEcliptic(lon, lat);
+  const gha = normalizeDeg360(gmstDeg(epochMs) - ra);
+  return { gha_deg: gha, declination_deg: dec };
+}
+
+/**
+ * A star's geographic position, given GHA Aries (GMST) and the star's
+ * SHA + declination from the bundled almanac.
+ *
+ * @param {number} epochMs
+ * @param {{sha_deg: number, declination_deg: number}} star
+ * @returns {{gha_deg: number, declination_deg: number}}
+ */
+function starGeographicPosition(epochMs, star) {
+  const gha = normalizeDeg360(gmstDeg(epochMs) + star.sha_deg);
+  return { gha_deg: gha, declination_deg: star.declination_deg };
+}
+
+/**
+ * Computed altitude (Hc) and azimuth (Zn) of a body at an assumed
+ * position, from its geographic position. The spherical-trig heart of
+ * sight reduction.
+ *
+ * @param {{latitude: number, longitude: number}} assumed - degrees
+ * @param {{gha_deg: number, declination_deg: number}} gp - body's geographic position
+ * @returns {{hc_deg: number, zn_deg: number, lha_deg: number}}
+ */
+function computeHcZn(assumed, gp) {
+  const lat = assumed.latitude * RAD;
+  const dec = gp.declination_deg * RAD;
+  // Local hour angle: LHA = GHA + longitude (east-positive convention,
+  // matching Signal K). LHA is west-positive: 0 = body on the observer's
+  // meridian, 90 = on the western horizon, 270 = on the eastern horizon.
+  const lha = normalizeDeg360(gp.gha_deg + assumed.longitude) * RAD;
+  const sinHc =
+    Math.sin(lat) * Math.sin(dec) +
+    Math.cos(lat) * Math.cos(dec) * Math.cos(lha);
+  const hc = Math.asin(Math.max(-1, Math.min(1, sinHc))) * DEG;
+  // Azimuth (true bearing, clockwise from north):
+  //   Zn = atan2(sin LHA, cos LHA·sin lat − tan dec·cos lat) + 180
+  // The +180 converts the raw angle (measured from the north point,
+  // westward to the body's geographical direction) into the conventional
+  // bearing-from-observer-to-body measured clockwise from north.
+  const y = Math.sin(lha);
+  const x = Math.cos(lha) * Math.sin(lat) - Math.tan(dec) * Math.cos(lat);
+  const zn = normalizeDeg360(Math.atan2(y, x) * DEG + 180);
+  return { hc_deg: hc, zn_deg: zn, lha_deg: lha * DEG };
+}
+
+/**
+ * Bennett's refraction formula (arcminutes), valid for altitudes above
+ * ~5° (design decision Q3). Returns 0 for non-positive apparent altitude.
+ *
+ * @param {number} altDeg - apparent (geometric) altitude, degrees
+ * @returns {number} refraction in arcminutes (subtract from observed)
+ */
+function refractionArcmin(altDeg) {
+  if (altDeg <= 0) return 0;
+  // Bennett's formula (degrees in, arcminutes out):
+  //   R = 1.02 / tan(h + 10.3 / (h + 5.11))   with h in degrees.
+  // Compute the argument in degrees, then convert to radians for tan.
+  const h = altDeg;
+  const argDeg = h + 10.3 / (h + 5.11);
+  return Math.max(0, 1.02 / Math.tan(argDeg * RAD));
+}
+
+/**
+ * Dip of the sea horizon in arcminutes, from height of eye in metres.
+ *
+ * @param {number} eyeHeightM
+ * @returns {number} dip in arcminutes (subtract from observed)
+ */
+function dipArcmin(eyeHeightM) {
+  if (!eyeHeightM || eyeHeightM <= 0) return 0;
+  // Standard dip: 1.76 * sqrt(h_m), h in metres → arcminutes.
+  return 1.76 * Math.sqrt(eyeHeightM);
+}
+
+/**
+ * Corrects a sextant altitude (Hs) to observed altitude (Ho).
+ *
+ *   Ho = Hs + index_error − dip − refraction (+ semi-diameter −/+
+ *   parallax for Sun/Moon limb sights)
+ *
+ * Index error is signed (positive if on the arc → subtract; here the
+ * convention is: pass the index correction already as "apply to Hs",
+ * i.e. Ho = Hs + IC). Dip and refraction are always subtracted (they make
+ * the observed body lower than the horizon sight). Refraction uses the
+ * *apparent* (post-dip) altitude per convention.
+ *
+ * @param {object} c
+ * @param {number} c.hs_deg - sextant altitude, degrees
+ * @param {number} [c.index_correction_deg] - signed index correction (+ added to Hs)
+ * @param {number} [c.eye_height_m] - height of eye above sea level, metres
+ * @param {number} [c.semi_diameter_deg] - Sun/Moon limb correction (added for lower limb, subtracted for upper)
+ * @param {number} [c.parallax_deg] - horizontal parallax correction for the Moon (added)
+ * @returns {{hs_deg:number, ha_deg:number, ho_deg:number}}
+ */
+function correctAltitude(c) {
+  const hs = c.hs_deg;
+  const ic = c.index_correction_deg ?? 0;
+  const ha = hs + ic; // apparent altitude (no dip yet)
+  const dip = dipArcmin(c.eye_height_m ?? 0) / 60;
+  const altForRefraction = ha - dip;
+  const refr = refractionArcmin(altForRefraction) / 60;
+  let ho = ha - dip - refr;
+  if (c.semi_diameter_deg != null) ho += c.semi_diameter_deg;
+  if (c.parallax_deg != null) ho += c.parallax_deg;
+  return { hs_deg: hs, ha_deg: ha, ho_deg: ho };
+}
+
+/**
+ * Sight-reduction input.
+ *
+ * @typedef {Object} SightInput
+ * @property {string} body - 'Sun' | 'Moon' | star name from the almanac
+ * @property {number} hs_deg - sextant altitude, degrees
+ * @property {number} [index_correction_deg] - signed IC, + added to Hs
+ * @property {number} [eye_height_m] - height of eye, metres (for dip)
+ * @property {number} epoch_ms - sight time, UTC ms (Date.getTime())
+ * @property {{latitude:number, longitude:number}} [assumed_position] - reduction point; defaults to dr_position
+ * @property {{latitude:number, longitude:number}} dr_position - dead-reckoned position
+ * @property {'lower'|'upper'|null} [limb] - 'lower'|'upper' for Sun/Moon limb sights
+ * @property {number} [time_sync_staleness_s] - carried through to the result (§11)
+ * @property {object} [almanac] - star almanac lookup (for star bodies)
+ */
+
+/**
+ * Result of a sight reduction — the LOP plus diagnostic detail for the UI.
+ *
+ * @typedef {Object} SightResult
+ * @property {string} body
+ * @property {number} assumed_lat
+ * @property {number} assumed_lon
+ * @property {number} azimuth_true - Zn, degrees true
+ * @property {number} intercept_nm - signed, + toward body
+ * @property {'toward'|'away'} intercept_direction
+ * @property {number} hc_deg
+ * @property {number} ho_deg
+ * @property {number} lha_deg
+ * @property {number|null} time_sync_staleness_s
+ */
+
+/**
+ * Reduces a sight to a line of position. Returns the LOP fields ready for
+ * `recordLineOfPosition`, plus Hc/Ho/LHA for UI feedback.
+ *
+ * @param {SightInput} input
+ * @returns {SightResult}
+ */
+function reduceSight(input) {
+  const assumed = input.assumed_position ?? input.dr_position;
+  const epochMs = input.epoch_ms;
+
+  // 1. Geographic position of the body.
+  let gp;
+  let semiDiameterDeg = null;
+  let parallaxDeg = null;
+  const body = input.body;
+  if (body === "Sun") {
+    gp = sunGeographicPosition(epochMs);
+    // Sun semi-diameter ≈ 0.2666° (varies ~0.263–0.274). Use the mean;
+    // the variation is below sextant-reading precision for v1.
+    const sd = 0.2666;
+    semiDiameterDeg =
+      input.limb === "upper" ? -sd : input.limb === "lower" ? sd : null;
+  } else if (body === "Moon") {
+    gp = moonGeographicPosition(epochMs);
+    // Moon semi-diameter ≈ 0.2725° (mean; HP ≈ 0.95°). Parallax-in-altitude
+    // correction ≈ HP * cos(Ha); included as a rough mean for v1.
+    const sd = 0.2725;
+    semiDiameterDeg =
+      input.limb === "upper" ? -sd : input.limb === "lower" ? sd : null;
+    const ha = (input.hs_deg + (input.index_correction_deg ?? 0)) * RAD;
+    parallaxDeg = 0.95 * Math.cos(ha); // horizontal parallax scaled by cos(Ha)
+  } else if (input.almanac) {
+    const star = input.almanac.lookup(body);
+    if (!star) throw new Error(`unknown body: ${body}`);
+    gp = starGeographicPosition(epochMs, star);
+  } else {
+    throw new Error(`unknown body and no almanac provided: ${body}`);
+  }
+
+  // 2. Hc and Zn at the assumed position.
+  const { hc_deg, zn_deg, lha_deg } = computeHcZn(assumed, gp);
+
+  // Refuse low-altitude sights (Q3): refraction is unreliable below 5°.
+  if (hc_deg < 5) {
+    throw new Error(
+      `sight below the 5° refraction cutoff (Hc=${hc_deg.toFixed(1)}°)`,
+    );
+  }
+
+  // 3. Ho from Hs.
+  const { ho_deg } = correctAltitude({
+    hs_deg: input.hs_deg,
+    index_correction_deg: input.index_correction_deg,
+    eye_height_m: input.eye_height_m,
+    semi_diameter_deg: semiDiameterDeg,
+    parallax_deg: parallaxDeg,
+  });
+
+  // 4. Intercept: (Ho − Hc) in degrees × 60 = nautical miles.
+  const interceptNm = (ho_deg - hc_deg) * 60;
+  const direction = interceptNm >= 0 ? "toward" : "away";
+
+  return {
+    body,
+    assumed_lat: assumed.latitude,
+    assumed_lon: assumed.longitude,
+    azimuth_true: zn_deg,
+    intercept_nm: interceptNm,
+    intercept_direction: direction,
+    hc_deg,
+    ho_deg,
+    lha_deg,
+    time_sync_staleness_s: input.time_sync_staleness_s ?? null,
+  };
+}
+
+module.exports = {
+  gmstDeg,
+  raFromEcliptic,
+  decFromEcliptic,
+  sunGeographicPosition,
+  moonGeographicPosition,
+  starGeographicPosition,
+  computeHcZn,
+  refractionArcmin,
+  dipArcmin,
+  correctAltitude,
+  reduceSight,
+};

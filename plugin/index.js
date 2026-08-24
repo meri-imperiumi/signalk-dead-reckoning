@@ -30,6 +30,8 @@ const {
   attachObservationsToFix,
 } = require("./db.js");
 const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
+const { reduceSight } = require("./celestial.js");
+const starAlmanac = require("./star-almanac.js");
 
 /**
  * Plugin identifier (matches package name without the scope).
@@ -225,6 +227,16 @@ module.exports = (app) => {
 
       publishMeta();
       setStatus("Dead reckoning started");
+      // §13: star almanac expiry check — warn (not fail) the same way WMM
+      // does (§12). A warning here surfaces via the plugin status message;
+      // a full notification delta is left to the integrity/notification
+      // work and is out of scope for this doc.
+      if (starAlmanac.isExpired(new Date())) {
+        const d = starAlmanac.daysUntilExpiry(new Date());
+        setStatus(
+          `Star almanac expired (${d} days past validity) — sights may be inaccurate`,
+        );
+      }
     },
 
     stop: () => {
@@ -632,6 +644,75 @@ module.exports = (app) => {
         confirmed_by: b.confirmed_by ?? null,
       });
       res.json({ cpl_id: id });
+    });
+
+    /**
+     * POST /celestial/sight — reduce a raw sextant sight (SPEC §13) and
+     * persist the resulting line of position. Returns the LOP id plus the
+     * reduction details (Hc, Ho, intercept, Zn, LHA) for UI feedback. The
+     * LOP is then resolvable/confirmable through POST /fix/resolve +
+     * POST /fix (work doc #3).
+     *
+     * Body:
+     *   { body, hs_deg, index_correction_deg?, eye_height_m?, epoch_ms,
+     *     assumed_position?, limb?, confirmed_by?, time_sync_staleness_s? }
+     * `body` is 'Sun', 'Moon', or a bundled star name. `epoch_ms` is the
+     * sight time (UTC ms). The DR position is used as the reduction point
+     * unless `assumed_position` is supplied (design Q4).
+     */
+    router.post("/celestial/sight", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const b = parseBody(req.body);
+      if (!b.body || typeof b.hs_deg !== "number" || !b.epoch_ms) {
+        res.status(400).json({ message: "body, hs_deg, epoch_ms required" });
+        return;
+      }
+      let result;
+      try {
+        result = reduceSight({
+          body: b.body,
+          hs_deg: b.hs_deg,
+          index_correction_deg: b.index_correction_deg,
+          eye_height_m: b.eye_height_m,
+          epoch_ms: b.epoch_ms,
+          assumed_position: b.assumed_position,
+          dr_position: engine.origin ?? { latitude: 0, longitude: 0 },
+          limb: b.limb,
+          time_sync_staleness_s: b.time_sync_staleness_s,
+          almanac: starAlmanac,
+        });
+      } catch (err) {
+        res.status(400).json({ message: err.message });
+        return;
+      }
+      const lopId = deps.recordLineOfPosition(db, {
+        timestamp: new Date(b.epoch_ms).toISOString(),
+        lop_type: "celestial",
+        assumed_lat: result.assumed_lat,
+        assumed_lon: result.assumed_lon,
+        azimuth_true: result.azimuth_true,
+        intercept_nm: result.intercept_nm,
+        body_or_object: result.body,
+        confirmed_by: b.confirmed_by ?? null,
+      });
+      res.json({
+        lop_id: lopId,
+        reduction: {
+          body: result.body,
+          assumed_lat: result.assumed_lat,
+          assumed_lon: result.assumed_lon,
+          azimuth_true: result.azimuth_true,
+          intercept_nm: result.intercept_nm,
+          intercept_direction: result.intercept_direction,
+          hc_deg: result.hc_deg,
+          ho_deg: result.ho_deg,
+          lha_deg: result.lha_deg,
+          time_sync_staleness_s: result.time_sync_staleness_s,
+        },
+      });
     });
 
     /**
