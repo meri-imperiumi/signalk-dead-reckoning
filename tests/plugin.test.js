@@ -294,3 +294,249 @@ test("POST /fix records a dr_corrections row when a prior origin exists", async 
   db.close();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("POST /fix/lop persists a line of position and returns its id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lop-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+    body_or_object: "North Rock",
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.lop_id > 0);
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const row = db
+    .prepare("SELECT * FROM lines_of_position WHERE lop_id = ?")
+    .get(body.lop_id);
+  assert.strictEqual(row.lop_type, "bearing");
+  assert.strictEqual(row.azimuth_true, 45);
+  assert.strictEqual(row.body_or_object, "North Rock");
+  assert.strictEqual(row.used_in_fix_id, null);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix/lop rejects missing required fields", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lop-bad-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+  });
+  assert.strictEqual(status, 400);
+  assert.ok(
+    /assumed_lat, assumed_lon, azimuth_true required/.test(body.message),
+  );
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix/cpl persists a circular position line and returns its id", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-cpl-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/fix/cpl", {
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 2,
+    source_object: "Lighthouse",
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.cpl_id > 0);
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const row = db
+    .prepare("SELECT * FROM circular_position_lines WHERE cpl_id = ?")
+    .get(body.cpl_id);
+  assert.strictEqual(row.cpl_type, "vertical-angle");
+  assert.strictEqual(row.radius_nm, 2);
+  assert.strictEqual(row.source_object, "Lighthouse");
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix/resolve previews a candidate without confirming", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-resolve-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/fix/resolve", {
+    source_type: "bearing",
+    observations: [
+      { kind: "lop", assumed_lat: 60, assumed_lon: 24, azimuth_true: 0 },
+      { kind: "lop", assumed_lat: 60, assumed_lon: 24, azimuth_true: 90 },
+    ],
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.candidate);
+  assert.ok(Math.abs(body.candidate.latitude - 60) < 1e-6);
+  assert.ok(Math.abs(body.candidate.longitude - 24) < 1e-6);
+  assert.ok(body.candidate.residual_nm < 1e-6);
+  // Preview must NOT write a fix.
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const n = db.prepare("SELECT COUNT(*) AS n FROM fixes").get().n;
+  assert.strictEqual(n, 0);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix/resolve returns 400 for an unresolvable single LOP", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-resolve-bad-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/fix/resolve", {
+    source_type: "celestial",
+    observations: [
+      { kind: "lop", assumed_lat: 60, assumed_lon: 24, azimuth_true: 0 },
+    ],
+  });
+  assert.strictEqual(status, 400);
+  assert.ok(/not resolvable/.test(body.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix with LOP ids confirms a resolved fix and attaches observations", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-fix-lop-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // Seed a prior DR origin so a correction is recorded.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60.05, longitude: 24.05 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  // Persist two bearing LOPs.
+  const a = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    body_or_object: "Rock A",
+  }).body.lop_id;
+  const b = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 90,
+    body_or_object: "Rock B",
+  }).body.lop_id;
+  // Confirm the fix, resolving the two LOPs through the pipeline.
+  const { status, body } = router.invoke("post", "/fix", {
+    source_type: "bearing",
+    observations: [
+      { kind: "lop", assumed_lat: 60, assumed_lon: 24, azimuth_true: 0 },
+      { kind: "lop", assumed_lat: 60, assumed_lon: 24, azimuth_true: 90 },
+    ],
+    lop_ids: [a, b],
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.fix_id > 0);
+  assert.ok(
+    body.recorded_correction,
+    "expected a correction with a prior origin",
+  );
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const attached = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM lines_of_position WHERE used_in_fix_id = ?",
+    )
+    .get(body.fix_id).n;
+  assert.strictEqual(attached, 2);
+  const fixes = db
+    .prepare("SELECT * FROM fixes WHERE fix_id = ?")
+    .get(body.fix_id);
+  assert.strictEqual(fixes.source_type, "bearing");
+  assert.strictEqual(fixes.confirmed_by, "crew");
+  const corrections = db.prepare("SELECT * FROM dr_corrections").all();
+  assert.ok(corrections.length >= 1);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix still accepts a plain point fix (back-compat)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-fix-point-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // Seed a prior origin.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const { status, body } = router.invoke("post", "/fix", {
+    latitude: 60.01,
+    longitude: 24.01,
+    source_type: "manual",
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.fix_id > 0);
+  assert.strictEqual(body.recorded_correction, true);
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});

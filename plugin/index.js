@@ -24,6 +24,12 @@ const {
   tick: trainingTick,
 } = require("./training.js");
 const { distanceNm, bearingDeg } = require("./geo.js");
+const {
+  recordLineOfPosition,
+  recordCircularPositionLine,
+  attachObservationsToFix,
+} = require("./db.js");
+const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
 
 /**
  * Plugin identifier (matches package name without the scope).
@@ -83,6 +89,11 @@ const deps = {
   setState,
   recordFix,
   recordCorrection,
+  recordLineOfPosition,
+  recordCircularPositionLine,
+  attachObservationsToFix,
+  resolveCandidateFix,
+  confirmFix,
   DeadReckoningEngine,
   MatrixStore,
   TrainingState,
@@ -542,59 +553,209 @@ module.exports = (app) => {
         res.status(503).json({ message: "Plugin not started" });
         return;
       }
-      let body = req.body;
-      if (body == null) {
-        try {
-          body = JSON.parse(req.body);
-        } catch {
-          body = {};
-        }
-      }
+      const body = parseBody(req.body);
       engine.active = !!body?.active;
       setStatus(engine.active ? "DR OVERRIDE engaged" : "DR OVERRIDE released");
       res.json({ active: engine.active });
     });
 
     /**
-     * POST /fix — confirm a fix (SPEC §9.1). Records a `fixes` row and,
-     * when the engine has a prior origin, a `dr_corrections` row (§9.3),
-     * then snaps the DR origin to the confirmed position. The full fix
-     * pipeline (LOP/CPL combination, celestial/bearing entry) is a
-     * separate work doc; this endpoint covers the GPS-confirm and manual-
-     * point cases that exercise the correction-recording path.
+     * POST /fix/lop — persist a line of position (SPEC §4.4) and return its
+     * id, so the UI can submit observations first and then resolve+confirm
+     * them in a separate, explicit step (§9.1).
      *
-     * Body: { latitude, longitude, source_type?, confirmed_by?, resets? }
+     * Body fields mirror `recordLineOfPosition`: timestamp, lop_type,
+     * assumed_lat, assumed_lon, azimuth_true, intercept_nm?, body_or_object?,
+     * confirmed_by?
+     */
+    router.post("/fix/lop", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const b = parseBody(req.body);
+      if (
+        typeof b.assumed_lat !== "number" ||
+        typeof b.assumed_lon !== "number" ||
+        typeof b.azimuth_true !== "number"
+      ) {
+        res
+          .status(400)
+          .json({ message: "assumed_lat, assumed_lon, azimuth_true required" });
+        return;
+      }
+      const id = deps.recordLineOfPosition(db, {
+        timestamp: b.timestamp ?? new Date().toISOString(),
+        lop_type: b.lop_type || "bearing",
+        assumed_lat: b.assumed_lat,
+        assumed_lon: b.assumed_lon,
+        azimuth_true: b.azimuth_true,
+        intercept_nm: b.intercept_nm ?? null,
+        body_or_object: b.body_or_object ?? null,
+        confirmed_by: b.confirmed_by ?? null,
+      });
+      res.json({ lop_id: id });
+    });
+
+    /**
+     * POST /fix/cpl — persist a circular position line (SPEC §4.4) and
+     * return its id.
+     *
+     * Body fields mirror `recordCircularPositionLine`: timestamp, cpl_type,
+     * center_lat, center_lon, radius_nm, radius_uncertainty_nm?, source_object?,
+     * confirmed_by?
+     */
+    router.post("/fix/cpl", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const b = parseBody(req.body);
+      if (
+        typeof b.center_lat !== "number" ||
+        typeof b.center_lon !== "number" ||
+        typeof b.radius_nm !== "number"
+      ) {
+        res
+          .status(400)
+          .json({ message: "center_lat, center_lon, radius_nm required" });
+        return;
+      }
+      const id = deps.recordCircularPositionLine(db, {
+        timestamp: b.timestamp ?? new Date().toISOString(),
+        cpl_type: b.cpl_type || "vertical-angle",
+        center_lat: b.center_lat,
+        center_lon: b.center_lon,
+        radius_nm: b.radius_nm,
+        radius_uncertainty_nm: b.radius_uncertainty_nm ?? null,
+        source_object: b.source_object ?? null,
+        confirmed_by: b.confirmed_by ?? null,
+      });
+      res.json({ cpl_id: id });
+    });
+
+    /**
+     * POST /fix/resolve — preview a candidate fix from LOP/CPL inputs WITHOUT
+     * confirming it (SPEC §9.1: candidate is presented to the watchkeeper with
+     * context, then a human explicitly confirms). Returns the resolved
+     * position, the cocked-hat residual, and any alternate Circle×Circle /
+     * LOP×Circle candidate. Point fixes (gps/manual) resolve trivially.
+     *
+     * Body:
+     *   { source_type, point?, observations?, lop_ids?, cpl_ids? }
+     * `observations` is the array of LOP/CPL primitives (see plugin/fixes.js);
+     * `lop_ids`/`cpl_ids` are db ids of already-persisted observations to
+     * attach on a later confirm.
+     */
+    router.post("/fix/resolve", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const b = parseBody(req.body);
+      const candidate = deps.resolveCandidateFix({
+        source_type: b.source_type || "manual",
+        point:
+          typeof b.latitude === "number" && typeof b.longitude === "number"
+            ? { latitude: b.latitude, longitude: b.longitude }
+            : null,
+        observations: Array.isArray(b.observations) ? b.observations : [],
+        observationIds: {
+          lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
+          cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
+        },
+        drPosition: engine.origin ?? undefined,
+        engine,
+      });
+      if (!candidate) {
+        res.status(400).json({ message: "observations not resolvable" });
+        return;
+      }
+      res.json({ candidate });
+    });
+
+    /**
+     * POST /fix — confirm a fix (SPEC §9.1, §9.3). Routes both point fixes
+     * (GPS confirm, manual point) and LOP/CPL-resolved fixes through the
+     * unified pipeline: writes a `fixes` row, attaches any LOP/CPL rows,
+     * writes a `dr_corrections` row when there is a prior DR origin and the
+     * fix resets it (symmetric across NORMAL/OVERRIDE), and snaps the DR
+     * origin. Does NOT flip navigational authority — OVERRIDE stays a
+     * separate human action (§7, §14.1).
+     *
+     * Point body: { latitude, longitude, source_type?, confirmed_by?, resets? }
+     * LOP/CPL body: { source_type, observations?, lop_ids?, cpl_ids?,
+     *                confirmed_by?, resets? } — resolved via the pipeline
+     *   (a pre-resolved `candidate` from POST /fix/resolve may also be passed
+     *   back verbatim as { candidate }).
      */
     router.post("/fix", (req, res) => {
       if (!engine || !db) {
         res.status(503).json({ message: "Plugin not started" });
         return;
       }
-      let body = req.body;
-      if (body == null) {
-        try {
-          body = JSON.parse(req.body);
-        } catch {
-          body = {};
-        }
+      const b = parseBody(req.body);
+      const resets = b.resets !== false;
+      const confirmedBy = b.confirmed_by ?? null;
+      const sailState = resolveSailState();
+      const seaState = "unknown";
+      const helpers = {
+        recordFix: deps.recordFix,
+        recordCorrection: deps.recordCorrection,
+        recordLineOfPosition: deps.recordLineOfPosition,
+        recordCircularPositionLine: deps.recordCircularPositionLine,
+        attachObservationsToFix: deps.attachObservationsToFix,
+        distanceNm: deps.distanceNm,
+        bearingDeg: deps.bearingDeg,
+      };
+
+      // Build the candidate: either a passed-back pre-resolved candidate,
+      // a point fix, or a fresh LOP/CPL resolution.
+      let candidate;
+      if (b.candidate?.source_type) {
+        candidate = b.candidate;
+      } else if (
+        typeof b.latitude === "number" &&
+        typeof b.longitude === "number"
+      ) {
+        candidate = deps.resolveCandidateFix({
+          source_type: b.source_type || "manual",
+          point: { latitude: b.latitude, longitude: b.longitude },
+          observationIds: {
+            lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
+            cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
+          },
+          engine,
+        });
+      } else {
+        candidate = deps.resolveCandidateFix({
+          source_type: b.source_type || "manual",
+          observations: Array.isArray(b.observations) ? b.observations : [],
+          observationIds: {
+            lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
+            cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
+          },
+          drPosition: engine.origin ?? undefined,
+          engine,
+        });
       }
-      const lat = body?.latitude;
-      const lon = body?.longitude;
-      if (typeof lat !== "number" || typeof lon !== "number") {
-        res.status(400).json({ message: "latitude and longitude required" });
+      if (!candidate) {
+        res.status(400).json({ message: "observations not resolvable" });
         return;
       }
-      const hadPrior = engine.origin != null;
-      snapToFix(
-        { latitude: lat, longitude: lon },
-        body?.source_type || "manual",
-        {
-          confirmed_by: body?.confirmed_by ?? null,
-          resets: body?.resets !== false,
-        },
-      );
+
+      const result = deps.confirmFix(db, candidate, engine, helpers, {
+        confirmedBy,
+        resets,
+        sailState,
+        seaState,
+      });
       res.json({
-        recorded_correction: hadPrior && body?.resets !== false,
+        fix_id: result.fix_id,
+        correction_id: result.correction_id,
+        deviation_nm: result.deviation_nm,
+        deviation_bearing: result.deviation_bearing,
+        recorded_correction: result.correction_id != null,
         origin: engine.origin,
       });
     });
@@ -604,6 +765,23 @@ module.exports = (app) => {
 };
 
 // --- Value unpacking helpers (kept module-level for reuse/testing) -------
+
+/**
+ * Normalizes a route body that may arrive already-parsed (object) or as a
+ * JSON string (some Signal K server setups). Never throws.
+ *
+ * @param {unknown} body
+ * @returns {Record<string, unknown>}
+ */
+function parseBody(body) {
+  if (body == null) return {};
+  if (typeof body === "object") return body;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return {};
+  }
+}
 
 /**
  * Unwraps a Signal K position value to {latitude, longitude}.
@@ -660,3 +838,4 @@ module.exports.DEFAULT_CONFIG = DEFAULT_CONFIG;
 module.exports.unwrapPosition = unwrapPosition;
 module.exports.unwrapNumber = unwrapNumber;
 module.exports.unwrapHeel = unwrapHeel;
+module.exports.parseBody = parseBody;
