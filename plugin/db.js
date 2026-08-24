@@ -284,6 +284,107 @@ function recordFix(db, r) {
   return Number(info.lastInsertRowid);
 }
 
+/**
+ * Records a line of position (SPEC §4.4). A LOP is the linearized local
+ * form of an observation near an assumed position: a celestial sight
+ * (intercept method), a compass bearing, or an RDF bearing. `used_in_fix_id`
+ * is left NULL until the LOP is resolved into a confirmed fix via
+ * `attachObservationsToFix`.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} r
+ * @param {string} r.timestamp - ISO timestamp of the observation
+ * @param {string} r.lop_type - 'celestial' | 'bearing' | 'rdf'
+ * @param {number} r.assumed_lat - assumed position latitude (celestial) or observer latitude (bearing/rdf)
+ * @param {number} r.assumed_lon - assumed position longitude
+ * @param {number} r.azimuth_true - Zn (celestial) or measured bearing (deg true)
+ * @param {number} [r.intercept_nm] - signed intercept, toward/away — celestial only
+ * @param {string} [r.body_or_object] - 'Sun LL', 'Polaris', 'Radio Antenna XYZ'
+ * @param {string} [r.confirmed_by]
+ * @returns {number} inserted lop_id
+ */
+function recordLineOfPosition(db, r) {
+  const stmt = db.prepare(
+    `INSERT INTO lines_of_position (
+       timestamp, lop_type, assumed_lat, assumed_lon, azimuth_true,
+       intercept_nm, body_or_object, confirmed_by
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const info = stmt.run(
+    r.timestamp,
+    r.lop_type,
+    r.assumed_lat,
+    r.assumed_lon,
+    r.azimuth_true,
+    r.intercept_nm ?? null,
+    r.body_or_object ?? null,
+    r.confirmed_by ?? null,
+  );
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * Records a circular position line (SPEC §4.4). A CPL is the exact
+ * (un-linearized) form of an observation: a circle of equal altitude
+ * (vertical-angle-to-known-object) or a ranged ADS-B contact. As with
+ * LOPs, `used_in_fix_id` is NULL until attached to a confirmed fix.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} r
+ * @param {string} r.timestamp - ISO timestamp
+ * @param {string} r.cpl_type - 'vertical-angle' | 'adsb-ranged' | 'adsb-max-range'
+ * @param {number} r.center_lat - charted object (static) or reporting object (transient)
+ * @param {number} r.center_lon
+ * @param {number} r.radius_nm - radius of the circle
+ * @param {number} [r.radius_uncertainty_nm]
+ * @param {string} [r.source_object] - chart ref, ICAO hex/callsign
+ * @param {string} [r.confirmed_by]
+ * @returns {number} inserted cpl_id
+ */
+function recordCircularPositionLine(db, r) {
+  const stmt = db.prepare(
+    `INSERT INTO circular_position_lines (
+       timestamp, cpl_type, center_lat, center_lon, radius_nm,
+       radius_uncertainty_nm, source_object, confirmed_by
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const info = stmt.run(
+    r.timestamp,
+    r.cpl_type,
+    r.center_lat,
+    r.center_lon,
+    r.radius_nm,
+    r.radius_uncertainty_nm ?? null,
+    r.source_object ?? null,
+    r.confirmed_by ?? null,
+  );
+  return Number(info.lastInsertRowid);
+}
+
+/**
+ * Marks the given LOP and CPL rows as the observations that resolved into
+ * a confirmed fix, by setting `used_in_fix_id` on each (SPEC §4.4). Call
+ * after `recordFix` returns the fix_id. Missing/already-attached ids are
+ * ignored rather than throwing, so partial inputs (a fix from a single
+ * LOP) attach cleanly.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} fix_id
+ * @param {object} ids
+ * @param {number[]} [ids.lopIds]
+ * @param {number[]} [ids.cplIds]
+ */
+function attachObservationsToFix(db, fixId, ids) {
+  const lop = db.prepare(
+    "UPDATE lines_of_position SET used_in_fix_id = ? WHERE lop_id = ?",
+  );
+  const cpl = db.prepare(
+    "UPDATE circular_position_lines SET used_in_fix_id = ? WHERE cpl_id = ?",
+  );
+  for (const id of ids?.lopIds ?? []) lop.run(fixId, id);
+  for (const id of ids?.cplIds ?? []) cpl.run(fixId, id);
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
@@ -291,5 +392,8 @@ module.exports = {
   getState,
   setState,
   recordFix,
+  recordLineOfPosition,
+  recordCircularPositionLine,
+  attachObservationsToFix,
   recordCorrection,
 };
