@@ -156,10 +156,8 @@ const PATHS = {
   uncertainty: "navigation.deadReckoning.uncertainty",
   divergence: "navigation.deadReckoning.divergence",
   state: "navigation.deadReckoning.state",
-  gpsSpoofed: "notifications.navigation.gpsSpoofed",
   divergenceAdvisory:
     "notifications.navigation.deadReckoning.divergenceAdvisory",
-  status: "notifications.navigation.deadReckoning.status",
 };
 
 /**
