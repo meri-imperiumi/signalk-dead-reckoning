@@ -118,6 +118,7 @@ class DrMapView extends HTMLElement {
       snaps: null,
       drMarker: null,
       candidate: null,
+      advancements: null,
     };
     this.tileLayers = {};
     this.follow = true;
@@ -350,10 +351,11 @@ class DrMapView extends HTMLElement {
 
     // REST-sourced overlays.
     this.renderFixes(snap.fixes ?? [], vm);
-    this.renderLops(snap.lops ?? [], vm);
-    this.renderCpls(snap.cpls ?? [], vm);
+    this.renderLops(snap.lops ?? [], vm, snap.highlight);
+    this.renderCpls(snap.cpls ?? [], vm, snap.highlight);
     this.renderSnaps(snap.corrections ?? [], vm);
     this.renderCandidate(snap.candidate);
+    this.renderAdvancements(snap.candidate?.advancements ?? null, snap);
 
     // Divergence readout + sparkline.
     this.renderDivergence(snap.divergence, snap.sparkStats);
@@ -370,18 +372,101 @@ class DrMapView extends HTMLElement {
   renderCandidate(candidate) {
     this.layers.candidate?.clearLayers();
     if (!candidate || candidate.latitude == null) return;
+    const unadvanced = vm.hasUnadvanced(candidate.advancements);
     L.circleMarker([candidate.latitude, candidate.longitude], {
       radius: 8,
-      color: "#ffcc00",
+      color: unadvanced ? "#f85149" : "#ffcc00",
       fill: false,
       weight: 2,
       dashArray: "3 3",
     })
       .bindTooltip(
-        `candidate${candidate.residual_nm != null ? ` (residual ${candidate.residual_nm.toFixed(2)} nm)` : ""} — confirm?`,
+        `candidate${candidate.residual_nm != null ? ` (residual ${candidate.residual_nm.toFixed(2)} nm)` : ""}${unadvanced ? " — ⚠ includes un-advanced observation" : ""} — confirm?`,
         { direction: "top" },
       )
       .addTo(this.layers.candidate);
+  }
+
+  /**
+   * Renders the running-fix advancement layer (work doc #13 stage B):
+   * for each observation in the preview candidate, the faded original
+   * point, the dashed DR-run vector to the advanced point, and — when
+   * the observation participates in the intersection at a moved
+   * position — the advanced constraint geometry (LOP line / CPL arc
+   * hint). Older observations that couldn't be advanced draw in a
+   * warning style: the honest failure made visible, not hidden behind
+   * a plausible-looking intersection.
+   *
+   * @param {Array<object>|null} advancements - candidate.advancements
+   * @param {object} snap - for the observation rows (azimuth/radius by id)
+   * @returns {void}
+   */
+  renderAdvancements(advancements, snap) {
+    const layer = this.layers.advancements;
+    layer?.clearLayers();
+    if (!advancements || advancements.length === 0) return;
+    const rowsById = {
+      lop: new Map((snap.lops ?? []).map((l) => [l.lop_id, l])),
+      cpl: new Map((snap.cpls ?? []).map((c) => [c.cpl_id, c])),
+    };
+    for (const spec of vm.advancementLayerSpecs(advancements, rowsById)) {
+      const warn = spec.warning ? "#f85149" : null;
+      // Faded original point — where the observation was taken.
+      L.circleMarker(spec.original, {
+        radius: 3,
+        color: warn ?? vm.STYLE.lop,
+        fillOpacity: 0.5,
+        opacity: 0.5,
+        weight: 1,
+      })
+        .bindTooltip(
+          spec.warning
+            ? "taken here — not advanced (no DR track)"
+            : "taken here",
+          { direction: "top" },
+        )
+        .addTo(layer);
+      if (spec.displacementNm == null) continue;
+      // DR-run vector — the transport over the interval.
+      L.polyline([spec.original, spec.advanced], {
+        color: "#b39ddb",
+        weight: 1.5,
+        opacity: 0.9,
+        dashArray: "4 4",
+      })
+        .bindTooltip(
+          `advanced ${spec.displacementNm.toFixed(1)} nm along DR track`,
+          { direction: "top" },
+        )
+        .addTo(layer);
+      // Solid advanced point.
+      L.circleMarker(spec.advanced, {
+        radius: 4,
+        color: warn ?? vm.STYLE.lop,
+        fillOpacity: 0.9,
+        weight: 2,
+      })
+        .bindTooltip("participates here", { direction: "top" })
+        .addTo(layer);
+      // The advanced constraint itself: LOP drawn at the advanced
+      // position with the row's azimuth.
+      if (spec.kind === "lop" && spec.azimuthDeg != null) {
+        const line = vm.extendLineSpec(
+          {
+            anchor: spec.advanced,
+            azimuthDeg: spec.azimuthDeg,
+            lopType: rowsById.lop.get(spec.id)?.lop_type ?? "celestial",
+          },
+          40,
+        );
+        L.polyline(line, {
+          color: warn ?? "#ffffff",
+          weight: 1,
+          opacity: 0.6,
+          dashArray: "2 6",
+        }).addTo(layer);
+      }
+    }
   }
 
   /**
@@ -413,6 +498,7 @@ class DrMapView extends HTMLElement {
         weight: 1.5,
       })
         .bindTooltip(spec.label, { direction: "top" })
+        .addEventListener("click", () => this.dispatchInspect("fix", f.fix_id))
         .addTo(this.layers.fixes);
     }
   }
@@ -420,21 +506,26 @@ class DrMapView extends HTMLElement {
   /**
    * @param {Array<object>} lops
    * @param {object} vm
+   * @param {{kind: string, id: number}|null} [highlight]
    * @returns {void}
    */
-  renderLops(lops, vm) {
+  renderLops(lops, vm, highlight) {
     this.layers.lops.clearLayers();
     for (const lop of lops) {
       const spec = vm.lopLineSpec(lop);
       const line = vm.extendLineSpec(spec, 60);
+      const hl = highlight?.kind === "lop" && highlight.id === lop.lop_id;
       L.polyline(line, {
-        color: spec.used ? vm.STYLE.lopUsed : vm.STYLE.lop,
-        weight: 1.5,
+        color: hl ? "#ffffff" : spec.used ? vm.STYLE.lopUsed : vm.STYLE.lop,
+        weight: hl ? 3.5 : 1.5,
         opacity: 0.9,
       })
         .bindTooltip(
           `${lop.body_or_object ?? lop.lop_type} LOP${spec.used ? " (used)" : ""}`,
           { direction: "top" },
+        )
+        .addEventListener("click", () =>
+          this.dispatchInspect("lop", lop.lop_id),
         )
         .addTo(this.layers.lops);
     }
@@ -443,24 +534,47 @@ class DrMapView extends HTMLElement {
   /**
    * @param {Array<object>} cpls
    * @param {object} vm
+   * @param {{kind: string, id: number}|null} [highlight]
    * @returns {void}
    */
-  renderCpls(cpls, vm) {
+  renderCpls(cpls, vm, highlight) {
     this.layers.cpls.clearLayers();
     for (const cpl of cpls) {
       const spec = vm.cplCircleSpec(cpl);
+      const hl = highlight?.kind === "cpl" && highlight.id === cpl.cpl_id;
       L.circle(spec.center, {
         radius: spec.radiusNm * 1852,
-        color: spec.used ? vm.STYLE.cplUsed : vm.STYLE.cpl,
+        color: hl ? "#ffffff" : spec.used ? vm.STYLE.cplUsed : vm.STYLE.cpl,
         fillOpacity: 0.05,
-        weight: 1.5,
+        weight: hl ? 3.5 : 1.5,
         dashArray: "6 4",
       })
         .bindTooltip(
           `${cpl.source_object ?? "CPL"} r=${spec.radiusNm.toFixed(1)} nm${spec.used ? " (used)" : ""}`,
         )
+        .addEventListener("click", () =>
+          this.dispatchInspect("cpl", cpl.cpl_id),
+        )
         .addTo(this.layers.cpls);
     }
+  }
+
+  /**
+   * Dispatches a map-click inspection event (work doc #13): the app
+   * opens the detail popover for the clicked record.
+   *
+   * @param {"lop"|"cpl"|"fix"} kind
+   * @param {number} id
+   * @returns {void}
+   */
+  dispatchInspect(kind, id) {
+    this.dispatchEvent(
+      new CustomEvent("dr-inspect", {
+        bubbles: true,
+        composed: true,
+        detail: { kind, id },
+      }),
+    );
   }
 
   /**

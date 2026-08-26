@@ -15,6 +15,8 @@ import * as vm from "./dr-viewmodel.js";
 import "./dr-map-view.js";
 import "./dr-sight-panel.js";
 import "./dr-fix-panel.js";
+import "./dr-pending-list.js";
+import "./dr-detail-popover.js";
 
 /** Signal K mounts plugin REST routes under /plugins/<name>/. */
 const API = "/plugins/signalk-dead-reckoning";
@@ -115,6 +117,19 @@ template.innerHTML = /* html */ `
     dialog::backdrop {
       background: rgba(0, 0, 0, 0.6);
     }
+    /* Phone-first (work doc #13 update #2): dialogs become bottom
+       sheets on narrow viewports — the map stays visible around the
+       form, dismissable with ✕, re-visible on submit. */
+    @media (max-width: 600px) {
+      dialog {
+        margin: auto auto 0 auto;
+        width: 100vw;
+        max-width: none;
+        border-radius: 12px 12px 0 0;
+        border-bottom: none;
+        max-height: 85vh;
+      }
+    }
   </style>
   <section class="dr-panel dr-headline">
     <div class="dr-figure">
@@ -148,12 +163,21 @@ template.innerHTML = /* html */ `
     <dr-map-view id="dr-map"></dr-map-view>
   </section>
 
+  <section class="dr-panel">
+    <h2>Pending Observations</h2>
+    <dr-pending-list id="dr-pending"></dr-pending-list>
+  </section>
+
   <dialog id="sight-dialog">
     <dr-sight-panel id="dr-sight"></dr-sight-panel>
   </dialog>
 
   <dialog id="fix-dialog">
     <dr-fix-panel id="dr-fix"></dr-fix-panel>
+  </dialog>
+
+  <dialog id="detail-dialog">
+    <dr-detail-popover id="dr-detail"></dr-detail-popover>
   </dialog>
 
   <section class="dr-panel dr-override">
@@ -190,10 +214,10 @@ class DrApp extends HTMLElement {
 
     /** @type {HTMLDialogElement|null} */
     this.sightDialog = root.querySelector("#sight-dialog");
-    /** Open the sight dialog and re-hydrate pending observations. */
+    /** Opens the sight dialog (entry form — the pending list lives
+     *  alongside the map now, work doc #13 stage A). */
     const openSight = () => {
       this.sightDialog?.showModal();
-      this.sight?.hydratePending();
     };
     root.querySelector("#btn-sight")?.addEventListener("click", openSight);
 
@@ -219,17 +243,77 @@ class DrApp extends HTMLElement {
     /** @type {import("./dr-sight-panel.js").default|null} */
     this.sight = root.querySelector("#dr-sight");
     this.sight?.loadBodies();
-    this.sight?.addEventListener("dr-observations-changed", () =>
-      this.refreshOverlays(),
-    );
-    this.sight?.addEventListener("dr-candidate-resolved", (e) =>
+
+    // Pending observations list (work doc #13 stage A): selection drives
+    // the map highlight; preview/confirm resolve the selected subset.
+    /** @type {import("./dr-pending-list.js").default|null} */
+    this.pendingList = root.querySelector("#dr-pending");
+    this.pendingList?.refresh();
+    this.pendingList?.addEventListener("dr-select-observation", (e) => {
+      const { kind, id, selected } = e.detail;
+      const key = `${kind}:${id}`;
+      this.selectedObservations ??= new Set();
+      if (selected) this.selectedObservations.add(key);
+      else this.selectedObservations.delete(key);
+      // Highlight the most recent selection; clear when none remain.
+      this.snap.highlight =
+        this.selectedObservations.size > 0 ? { kind, id } : null;
+      this.render();
+    });
+    this.pendingList?.addEventListener("dr-candidate-resolved", (e) =>
       this.showCandidate(e.detail),
     );
-    this.sight?.addEventListener("dr-fix-confirmed", () => {
+    this.pendingList?.addEventListener("dr-fix-confirmed", () => {
       this.snap.candidate = null;
+      this.snap.highlight = null;
+      this.selectedObservations = new Set();
       this.refreshOverlays();
     });
+
+    // Detail popover (work doc #13 update #1): map-click inspection.
+    /** @type {HTMLDialogElement|null} */
+    this.detailDialog = root.querySelector("#detail-dialog");
+    /** @type {import("./dr-detail-popover.js").default|null} */
+    this.detail = root.querySelector("#dr-detail");
+    this.detail?.addEventListener("dr-close", () => this.detailDialog?.close());
+    this.map?.addEventListener("dr-inspect", (e) => {
+      const { kind, id } = e.detail;
+      const row =
+        kind === "lop"
+          ? this.snap.lops.find((l) => l.lop_id === id)
+          : kind === "cpl"
+            ? this.snap.cpls.find((c) => c.cpl_id === id)
+            : this.snap.fixes.find((f) => f.fix_id === id);
+      if (!row) return;
+      this.detail?.show({ kind, id, row }, this.snap);
+      this.detailDialog?.showModal();
+    });
+
+    // Edit requests (pending list rows + popover) → sight form seeded,
+    // submit PUTs via the panel's edit mode.
+    const beginEdit = (detail) => {
+      const { kind, id, row } = detail;
+      const record =
+        row ??
+        (kind === "lop"
+          ? this.snap.lops.find((l) => l.lop_id === id)
+          : this.snap.cpls.find((c) => c.cpl_id === id));
+      if (!record) return;
+      openSight();
+      this.sight?.beginEdit({ ...record, kind });
+    };
+    this.addEventListener("dr-edit-observation", (e) => beginEdit(e.detail));
+
+    // Any observation create/edit/delete (sight panel submit, pending
+    // list, popover) refreshes overlays + the pending list.
+    this.addEventListener("dr-observations-changed", () => {
+      this.refreshOverlays();
+      this.pendingList?.refresh();
+    });
     this.sight?.addEventListener("dr-close", () => this.sightDialog?.close());
+    // Esc closes the native dialog without a dr-close event — clear
+    // any lingering edit mode so the next submit creates, not PUTs.
+    this.sightDialog?.addEventListener("close", () => this.sight?.endEdit());
 
     // View-model state
     this.ghost = new vm.TrackLog(3600);
@@ -250,6 +334,7 @@ class DrApp extends HTMLElement {
       gpsTrack: [],
       sparkStats: null,
       gnss: null,
+      highlight: null,
     };
 
     this.connectStream();

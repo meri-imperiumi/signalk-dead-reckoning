@@ -70,6 +70,15 @@ const { resolveFix, advanceObservation } = require("./fixes.js");
  *           Circle×Circle / LOP×Circle candidate for the watchkeeper, or null
  * @property {{lopIds: number[], cplIds: number[]}} observationIds - db ids of
  *           the LOP/CPL rows that resolved into this candidate (empty for GPS)
+ * @property {Array<{id: number|null, kind: string, timestamp_ms: number|null,
+ *           original: {latitude:number,longitude:number},
+ *           advanced: {latitude:number,longitude:number},
+ *           displacement: {bearingTrue:number, distanceNm:number}|null}>} [advancements]
+ *           per-observation running-fix transport (work doc #13): original
+ *           reference point as taken, advanced reference point (equal to
+ *           original when not transported), and the displacement used —
+ *           empty for GPS point fixes. Lets the preview UI draw the
+ *           advancement instead of only the final fix.
  */
 
 /**
@@ -115,6 +124,7 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
     const row = helpers.getLineOfPosition(db, id);
     if (!row) continue;
     out.push({
+      id: row.lop_id,
       kind: "lop",
       assumed_lat: row.assumed_lat,
       assumed_lon: row.assumed_lon,
@@ -127,6 +137,7 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
     const row = helpers.getCircularPositionLine(db, id);
     if (!row) continue;
     out.push({
+      id: row.cpl_id,
       kind: "cpl",
       center_lat: row.center_lat,
       center_lon: row.center_lon,
@@ -135,6 +146,49 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
     });
   }
   return out;
+}
+
+/**
+ * Reference point of an observation — the point a running fix
+ * transports along the DR track: the assumed position for a LOP, the
+ * center for a CPL.
+ *
+ * @param {object} o - resolver-shaped observation
+ * @returns {{latitude: number, longitude: number}}
+ */
+function referencePoint(o) {
+  if (o.kind === "cpl") {
+    return { latitude: o.center_lat, longitude: o.center_lon };
+  }
+  return { latitude: o.assumed_lat, longitude: o.assumed_lon };
+}
+
+/**
+ * Builds the per-observation advancement record (work doc #13 stage C):
+ * where the observation was taken (`original`), where it participates
+ * in the intersection (`advanced` — equal to `original` when not
+ * transported), and the DR displacement used (null when not advanced).
+ * Enough for the map to draw both positions and the connecting track
+ * vector — the legible running fix.
+ *
+ * `id` is the db id for persisted observations (null for inline ones);
+ * `timestamp_ms` lets the UI distinguish "was the latest observation"
+ * from "older but un-advanced" (the honest-failure warning case).
+ *
+ * @param {object} o - the original observation
+ * @param {object} advanced - the (possibly same) advanced observation
+ * @param {{bearingTrue: number, distanceNm: number}|null} displacement
+ * @returns {object}
+ */
+function advancementRecord(o, advanced, displacement) {
+  return {
+    id: o.id ?? null,
+    kind: o.kind,
+    timestamp_ms: Number.isFinite(o.timestamp_ms) ? o.timestamp_ms : null,
+    original: referencePoint(o),
+    advanced: referencePoint(advanced),
+    displacement,
+  };
 }
 
 /**
@@ -147,22 +201,42 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
  * inputs suffice, but a single stale LOP will not silently yield a
  * wrong fix.
  *
+ * Returns both the advanced observation array and a per-input
+ * advancement record so the resolve preview can show the transport
+ * (original → advanced + the displacement used) instead of only the
+ * final fix.
+ *
  * @param {Array<object>} observations - each may carry `timestamp_ms`
  * @param {((t0: number, t1: number) => ({bearingTrue: number, distanceNm: number}|null))|null} advance
- * @returns {Array<object>} a new array
+ * @returns {{observations: Array<object>, advancements: Array<object>}}
  */
 function advanceToLatest(observations, advance) {
   const stamped = observations.filter((o) => Number.isFinite(o.timestamp_ms));
-  if (!advance || stamped.length < 2) return observations;
+  const unadvanced = () => ({
+    observations,
+    advancements: observations.map((o) => advancementRecord(o, o, null)),
+  });
+  if (!advance || stamped.length < 2) return unadvanced();
   const tLate = Math.max(...stamped.map((o) => o.timestamp_ms));
-  return observations.map((o) => {
+  const out = [];
+  const advancements = [];
+  for (const o of observations) {
     if (!Number.isFinite(o.timestamp_ms) || o.timestamp_ms >= tLate) {
-      return o;
+      out.push(o);
+      advancements.push(advancementRecord(o, o, null));
+      continue;
     }
     const disp = advance(o.timestamp_ms, tLate);
-    if (!disp || disp.distanceNm === 0) return o;
-    return advanceObservation(o, disp);
-  });
+    if (!disp || disp.distanceNm === 0) {
+      out.push(o);
+      advancements.push(advancementRecord(o, o, null));
+      continue;
+    }
+    const moved = advanceObservation(o, disp);
+    out.push(moved);
+    advancements.push(advancementRecord(o, moved, disp));
+  }
+  return { observations: out, advancements };
 }
 
 function resolveCandidateFix(input) {
@@ -179,6 +253,7 @@ function resolveCandidateFix(input) {
       residual_nm: 0,
       alternate: null,
       observationIds: { lopIds: [...lopIds], cplIds: [...cplIds] },
+      advancements: [],
     };
   }
 
@@ -205,7 +280,11 @@ function resolveCandidateFix(input) {
   // displacement provider (no GPS history), earlier observations are
   // left in place and the resolver may fail or return a weaker result —
   // the honest failure rather than a silently-wrong un-advanced fix.
-  observations = advanceToLatest(observations, input.advance || null);
+  const { observations: advancedObs, advancements } = advanceToLatest(
+    observations,
+    input.advance || null,
+  );
+  observations = advancedObs;
 
   const drPosition = input.drPosition ??
     input.engine?.origin ?? { latitude: 0, longitude: 0 };
@@ -219,6 +298,7 @@ function resolveCandidateFix(input) {
     residual_nm: resolved.residual_nm,
     alternate: resolved.alternate,
     observationIds: { lopIds: [...lopIds], cplIds: [...cplIds] },
+    advancements,
   };
 }
 

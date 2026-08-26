@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Running-fix visualization & interactive resolve** (work doc #13):
+  - `POST /fix/resolve` candidates now carry per-observation
+    `advancements` — the original reference point as taken, the
+    DR-transported advanced point, and the displacement used (null when
+    not advanced) — so the preview can show the transport instead of
+    only the final fix.
+  - **Pending observations are first-class**: new `<dr-pending-list>`
+    panel alongside the map (moved out of the sight-entry modal) with
+    per-row select (map highlight), edit and delete. A single pending
+    observation shows a "needs a partner" hint. "Preview selected"
+    resolves just the checked subset into a live candidate ring;
+    confirm stays the deliberate second step.
+  - **Advancement layer on the map**: for each previewed observation,
+    the faded original point, the dashed DR-run vector, the advanced
+    point and the advanced LOP line. Older observations that could not
+    be advanced (no DR track over the interval) render in a warning
+    style and the candidate ring flags "includes un-advanced
+    observation" — the honest failure made visible.
+  - **Map-click detail popover** (`<dr-detail-popover>`): click any
+    LOP, CPL or fix on the map for its full record, with Edit (LOP/CPL
+    → seeded sight form; fix → inline notes editor) and Delete actions.
+  - **Observation & fix CRUD** (REST + db): `DELETE`/`PUT
+    /fix/lop/:id`, `/fix/cpl/:id`, `/fix/:id`. LOPs/CPLs attached to a
+    confirmed fix are guarded (409 — delete the fix first); deleting a
+    fix un-confirms it: its observations return to pending, the
+    correction row and any queued logbook entry are dropped, and the
+    DR origin is not rewound. Fix edits allow only audit metadata
+    (notes, confirmed_by, estimated error radius) — position and
+    source_type are guarded.
+  - **Phone-first layout pass** for the fix workflow: dialogs become
+    bottom sheets on narrow viewports, tap targets ≥ 44 px, no
+    hover-only affordances.
 - **"Fix at coordinates" dialog** (replaces the one-tap "Fix at GPS"
   button): opens prefilled with the live GNSS position, editable before
   confirming. Covers three point-fix workflows with one flow —

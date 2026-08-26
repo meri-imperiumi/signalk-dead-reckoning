@@ -102,6 +102,9 @@ class FakeRouter {
   put(path, handler) {
     this._add("put", path, handler);
   }
+  delete(path, handler) {
+    this._add("delete", path, handler);
+  }
 
   /**
    * Finds a registered route and invokes it with stub req/res.
@@ -114,9 +117,30 @@ class FakeRouter {
    */
   invoke(method, path, reqBody, reqQuery, reqExtra = {}) {
     const [pathname, search] = path.split("?");
-    const route = this.routes.find(
+    let route = this.routes.find(
       (r) => r.method === method && r.path === pathname,
     );
+    let params = {};
+    if (!route) {
+      // Param routes ("/fix/lop/:id"): match segment-wise, like Express.
+      outer: for (const r of this.routes) {
+        if (r.method !== method) continue;
+        const rSegs = r.path.split("/");
+        const pSegs = pathname.split("/");
+        if (rSegs.length !== pSegs.length) continue;
+        const p = {};
+        for (let i = 0; i < rSegs.length; i++) {
+          if (rSegs[i].startsWith(":")) {
+            p[rSegs[i].slice(1)] = decodeURIComponent(pSegs[i]);
+          } else if (rSegs[i] !== pSegs[i]) {
+            continue outer;
+          }
+        }
+        route = r;
+        params = p;
+        break;
+      }
+    }
     if (!route) throw new Error(`no ${method.toUpperCase()} ${path} route`);
     const query = {};
     if (search) {
@@ -133,7 +157,7 @@ class FakeRouter {
       },
     };
     route.handler(
-      { body: reqBody, query: reqQuery ?? query, ...reqExtra },
+      { body: reqBody, query: reqQuery ?? query, params, ...reqExtra },
       res,
     );
     return { status: res.statusCode, body: res.body };

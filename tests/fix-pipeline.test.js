@@ -215,13 +215,55 @@ test("advanceToLatest: advances earlier observations to the latest timestamp", (
       timestamp_ms: T1,
     },
   ];
-  const advanced = advanceToLatest(obs, () => ({
+  const { observations: advanced, advancements } = advanceToLatest(obs, () => ({
     bearingTrue: 90,
     distanceNm: 25,
   }));
   // First LOP moved east; second untouched.
   assert.ok(advanced[0].assumed_lon > 24);
   assert.strictEqual(advanced[1].assumed_lon, 24.5);
+  // Advancement records describe the transport (work doc #13 stage C).
+  assert.strictEqual(advancements.length, 2);
+  const [first, second] = advancements;
+  assert.strictEqual(first.kind, "lop");
+  assert.deepStrictEqual(first.original, { latitude: 60, longitude: 24 });
+  assert.ok(first.advanced.longitude > 24, "advanced east of original");
+  assert.deepStrictEqual(first.displacement, {
+    bearingTrue: 90,
+    distanceNm: 25,
+  });
+  // The latest observation reports advanced == original, no displacement.
+  assert.deepStrictEqual(second.original, { latitude: 60, longitude: 24.5 });
+  assert.deepStrictEqual(second.advanced, second.original);
+  assert.strictEqual(second.displacement, null);
+});
+
+test("advanceToLatest: advancements report the provider's per-interval displacement", () => {
+  const obs = [
+    {
+      kind: "cpl",
+      center_lat: 60,
+      center_lon: 24,
+      radius_nm: 2,
+      timestamp_ms: 0,
+    },
+    {
+      kind: "cpl",
+      center_lat: 60,
+      center_lon: 25,
+      radius_nm: 2,
+      timestamp_ms: 1000,
+    },
+  ];
+  const provider = (t0, t1) =>
+    t0 === 0 ? { bearingTrue: 45, distanceNm: 10 } : null;
+  const { advancements } = advanceToLatest(obs, provider);
+  assert.deepStrictEqual(advancements[0].displacement, {
+    bearingTrue: 45,
+    distanceNm: 10,
+  });
+  // provider saw the right interval
+  assert.strictEqual(advancements[1].displacement, null);
 });
 
 test("advanceToLatest: no provider → observations unchanged", () => {
@@ -241,9 +283,15 @@ test("advanceToLatest: no provider → observations unchanged", () => {
       timestamp_ms: 1000,
     },
   ];
-  const out = advanceToLatest(obs, null);
+  const out = advanceToLatest(obs, null).observations;
   assert.strictEqual(out[0].assumed_lon, 24);
   assert.strictEqual(out[1].assumed_lon, 24);
+  // No provider → every record reports advanced == original, null displacement.
+  const { advancements } = advanceToLatest(obs, null);
+  for (const a of advancements) {
+    assert.deepStrictEqual(a.advanced, a.original);
+    assert.strictEqual(a.displacement, null);
+  }
 });
 
 test("advanceToLatest: provider returns null → that observation left in place", () => {
@@ -263,8 +311,18 @@ test("advanceToLatest: provider returns null → that observation left in place"
       timestamp_ms: 1000,
     },
   ];
-  const out = advanceToLatest(obs, () => null);
+  const out = advanceToLatest(obs, () => null).observations;
   assert.strictEqual(out[0].assumed_lon, 24);
+  // Un-advanced (provider null) still records the original, verbatim.
+  const { advancements } = advanceToLatest(obs, () => null);
+  assert.deepStrictEqual(advancements[0].original, {
+    latitude: 60,
+    longitude: 24,
+  });
+  assert.deepStrictEqual(advancements[0].advanced, advancements[0].original);
+  assert.strictEqual(advancements[0].displacement, null);
+  // The older timestamp is preserved so the UI can flag "un-advanced".
+  assert.strictEqual(advancements[0].timestamp_ms, 0);
 });
 
 test("resolveCandidateFix: running fix — two time-separated LOPs resolve with an advance provider", () => {
@@ -312,6 +370,48 @@ test("resolveCandidateFix: single LOP with no point → null (not resolvable)", 
     drPosition: { latitude: 60, longitude: 24 },
   });
   assert.strictEqual(c, null);
+});
+
+test("resolveCandidateFix: candidate carries advancements with db ids for hydrated observations", () => {
+  const T0 = Date.UTC(2026, 0, 1, 10, 0, 0);
+  const T1 = Date.UTC(2026, 0, 1, 14, 0, 0);
+  const db = openDatabase(join(tempDir, "adv-ids.sqlite"));
+  const lopId = recordLineOfPosition(db, {
+    timestamp: new Date(T0).toISOString(),
+    lop_type: "celestial",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    intercept_nm: 0,
+  });
+  const cplId = recordCircularPositionLine(db, {
+    timestamp: new Date(T1).toISOString(),
+    cpl_type: "vertical-angle",
+    center_lat: 60.02,
+    center_lon: 24.2,
+    radius_nm: 2,
+  });
+  const c = resolveCandidateFix({
+    source_type: "celestial",
+    observationIds: { lopIds: [lopId], cplIds: [cplId] },
+    drPosition: { latitude: 60.01, longitude: 24.1 },
+    db,
+    helpers: { getLineOfPosition, getCircularPositionLine },
+    advance: () => ({ bearingTrue: 90, distanceNm: 5 }),
+  });
+  assert.ok(c);
+  assert.strictEqual(c.advancements.length, 2);
+  const [lopAdv, cplAdv] = c.advancements;
+  assert.strictEqual(lopAdv.id, lopId);
+  assert.strictEqual(lopAdv.kind, "lop");
+  assert.ok(lopAdv.advanced.longitude > lopAdv.original.longitude);
+  assert.strictEqual(lopAdv.timestamp_ms, T0);
+  // The latest observation is not transported.
+  assert.strictEqual(cplAdv.id, cplId);
+  assert.strictEqual(cplAdv.kind, "cpl");
+  assert.deepStrictEqual(cplAdv.advanced, cplAdv.original);
+  assert.strictEqual(cplAdv.displacement, null);
+  db.close();
 });
 
 test("resolveCandidateFix: Circle×Circle surfaces an alternate candidate", () => {

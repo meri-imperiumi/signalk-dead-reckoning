@@ -584,6 +584,156 @@ export function verticalAngleCplBody(form) {
  *   limb?, sight_time, assumed_position?, noon?, confirmed_by? }
  * @returns {object}
  */
+// ---------------------------------------------------------------------------
+// Pending observations & resolve preview (work doc #13 stages A/B)
+// Pure shapers for <dr-pending-list> and the map's advancement layer.
+// ---------------------------------------------------------------------------
+
+/**
+ * Shapes a db LOP row into a pending-list row spec.
+ *
+ * @param {object} lop - row from GET /observations
+ * @returns {{kind: "lop", id: number, label: string, timestamp: string, used: boolean}}
+ */
+export function pendingLopRow(lop) {
+  return {
+    kind: "lop",
+    id: lop.lop_id,
+    label: lop.body_or_object
+      ? `${lop.body_or_object} ${lop.lop_type ?? ""} LOP`.trim()
+      : `${lop.lop_type ?? "celestial"} LOP`,
+    timestamp: lop.timestamp,
+    used: lop.used_in_fix_id != null,
+    fixId: lop.used_in_fix_id ?? null,
+  };
+}
+
+/**
+ * Shapes a db CPL row into a pending-list row spec.
+ *
+ * @param {object} cpl - row from GET /observations
+ * @returns {{kind: "cpl", id: number, label: string, timestamp: string, used: boolean}}
+ */
+export function pendingCplRow(cpl) {
+  return {
+    kind: "cpl",
+    id: cpl.cpl_id,
+    label: cpl.source_object
+      ? `${cpl.source_object} r=${(cpl.radius_nm ?? 0).toFixed(1)} nm`
+      : `CPL r=${(cpl.radius_nm ?? 0).toFixed(1)} nm`,
+    timestamp: cpl.timestamp,
+    used: cpl.used_in_fix_id != null,
+    fixId: cpl.used_in_fix_id ?? null,
+  };
+}
+
+/**
+ * Whether a pending list is too small to resolve: a single observation is
+ * a constraint, not a fix (the "needs a partner" hint).
+ *
+ * @param {Array<object>} rows
+ * @returns {boolean}
+ */
+export function needsPartner(rows) {
+  return rows.length === 1;
+}
+
+/**
+ * Builds the POST /fix/resolve body for a selected subset of pending
+ * rows — the interactive what-if of work doc #13 stage B.
+ *
+ * @param {Array<{kind: "lop"|"cpl", id: number}>} selection
+ * @returns {{source_type: string, lop_ids: number[], cpl_ids: number[]}}
+ */
+export function resolvePreviewBody(selection) {
+  return {
+    source_type: "manual",
+    lop_ids: selection.filter((s) => s.kind === "lop").map((s) => s.id),
+    cpl_ids: selection.filter((s) => s.kind === "cpl").map((s) => s.id),
+  };
+}
+
+/**
+ * Detects the honest-failure case (work doc #13): an observation older
+ * than the latest one that could not be advanced (no DR track over the
+ * interval) — its `displacement` is null although it isn't the latest.
+ * The preview must show this, not hide it behind a plausible fix.
+ *
+ * @param {Array<{timestamp_ms: number|null, displacement: object|null}>} advancements
+ * @returns {boolean}
+ */
+export function hasUnadvanced(advancements) {
+  const stamped = (advancements ?? []).filter((a) =>
+    Number.isFinite(a.timestamp_ms),
+  );
+  if (stamped.length < 2) return false;
+  const tLate = Math.max(...stamped.map((a) => a.timestamp_ms));
+  return stamped.some((a) => a.timestamp_ms < tLate && a.displacement == null);
+}
+
+/**
+ * Render specs for the map's advancement layer (work doc #13 stage B):
+ * per observation, the faded original point, the solid advanced point,
+ * the dashed DR-run vector between them, and a warning flag when an
+ * older observation couldn't be advanced. Geometry of the advanced
+ * constraint (azimuth/radius) comes from the observation rows, matched
+ * by id.
+ *
+ * @param {Array<object>} advancements - from POST /fix/resolve candidate
+ * @param {object} rowsById - { lop: Map<number, row>, cpl: Map<number, row> }
+ * @returns {Array<{id: number|null, kind: string, original: [number, number],
+ *   advanced: [number, number], displacementNm: number|null,
+ *   azimuthDeg: number|null, radiusNm: number|null, warning: boolean}>}
+ */
+export function advancementLayerSpecs(advancements, rowsById) {
+  const stamped = (advancements ?? []).filter((a) =>
+    Number.isFinite(a.timestamp_ms),
+  );
+  const tLate =
+    stamped.length > 0 ? Math.max(...stamped.map((a) => a.timestamp_ms)) : null;
+  const out = [];
+  for (const a of advancements ?? []) {
+    const row =
+      a.kind === "cpl" ? rowsById.cpl.get(a.id) : rowsById.lop.get(a.id);
+    out.push({
+      id: a.id ?? null,
+      kind: a.kind,
+      original: [a.original.latitude, a.original.longitude],
+      advanced: [a.advanced.latitude, a.advanced.longitude],
+      displacementNm: a.displacement?.distanceNm ?? null,
+      azimuthDeg: row?.azimuth_true ?? null,
+      radiusNm: row?.radius_nm ?? null,
+      warning:
+        tLate != null &&
+        Number.isFinite(a.timestamp_ms) &&
+        a.timestamp_ms < tLate &&
+        a.displacement == null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Relative timestamp for pending-list rows ("3m ago"); the absolute
+ * time goes in the hover title.
+ *
+ * @param {string} iso
+ * @param {number} [nowMs=Date.now()]
+ * @returns {string}
+ */
+export function relativeTimeText(iso, nowMs = Date.now()) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const s = Math.max(0, Math.round((nowMs - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ${m - h * 60}m ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
 export function celestialSightBody(form) {
   const body = {
     body: form.body,

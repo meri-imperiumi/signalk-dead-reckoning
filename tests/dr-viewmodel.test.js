@@ -583,3 +583,174 @@ test("gnssStats: rows only for known fields, none when empty", async () => {
   const partial = vm.gnssStats({ type: "GLONASS" });
   assert.deepStrictEqual(partial, [{ label: "System", value: "GLONASS" }]);
 });
+
+// --- Pending list & advancement layer (work doc #13 stages A/B) ------------
+
+test("pendingLopRow/pendingCplRow: shape db rows into list rows", async () => {
+  const vm = await loadVm();
+  const lop = vm.pendingLopRow({
+    lop_id: 3,
+    timestamp: "2026-08-26T10:00:00Z",
+    lop_type: "bearing",
+    body_or_object: "North Rock",
+    used_in_fix_id: null,
+  });
+  assert.deepStrictEqual(lop, {
+    kind: "lop",
+    id: 3,
+    label: "North Rock bearing LOP",
+    timestamp: "2026-08-26T10:00:00Z",
+    used: false,
+    fixId: null,
+  });
+  const cpl = vm.pendingCplRow({
+    cpl_id: 5,
+    timestamp: "2026-08-26T11:00:00Z",
+    source_object: "lighthouse",
+    radius_nm: 1.25,
+    used_in_fix_id: 7,
+  });
+  assert.strictEqual(cpl.kind, "cpl");
+  assert.strictEqual(cpl.label, "lighthouse r=1.3 nm");
+  assert.strictEqual(cpl.used, true);
+  assert.strictEqual(cpl.fixId, 7);
+});
+
+test("needsPartner: true only for exactly one observation", async () => {
+  const vm = await loadVm();
+  assert.strictEqual(vm.needsPartner([]), false);
+  assert.strictEqual(vm.needsPartner([{ id: 1 }]), true);
+  assert.strictEqual(vm.needsPartner([{ id: 1 }, { id: 2 }]), false);
+});
+
+test("resolvePreviewBody: splits the selection into lop/cpl ids", async () => {
+  const vm = await loadVm();
+  const body = vm.resolvePreviewBody([
+    { kind: "lop", id: 2 },
+    { kind: "cpl", id: 5 },
+    { kind: "lop", id: 9 },
+  ]);
+  assert.deepStrictEqual(body, {
+    source_type: "manual",
+    lop_ids: [2, 9],
+    cpl_ids: [5],
+  });
+});
+
+test("hasUnadvanced: flags older observations without displacement", async () => {
+  const vm = await loadVm();
+  // No advancements → false.
+  assert.strictEqual(vm.hasUnadvanced(null), false);
+  assert.strictEqual(vm.hasUnadvanced([]), false);
+  // Latest un-advanced → fine (nothing needed advancing).
+  assert.strictEqual(
+    vm.hasUnadvanced([
+      { timestamp_ms: 100, displacement: { bearingTrue: 0, distanceNm: 1 } },
+      { timestamp_ms: 200, displacement: null },
+    ]),
+    false,
+  );
+  // Older observation left un-advanced → the honest-failure warning.
+  assert.strictEqual(
+    vm.hasUnadvanced([
+      { timestamp_ms: 100, displacement: null },
+      { timestamp_ms: 200, displacement: null },
+    ]),
+    true,
+  );
+  // Untimestamped observations don't count toward the warning.
+  assert.strictEqual(
+    vm.hasUnadvanced([
+      { timestamp_ms: null, displacement: null },
+      { timestamp_ms: 200, displacement: null },
+    ]),
+    false,
+  );
+});
+
+test("advancementLayerSpecs: original/advanced/displacement + warning rows", async () => {
+  const vm = await loadVm();
+  const advancements = [
+    {
+      id: 2,
+      kind: "lop",
+      timestamp_ms: 100,
+      original: { latitude: 60, longitude: 24 },
+      advanced: { latitude: 60.02, longitude: 24.04 },
+      displacement: { bearingTrue: 90, distanceNm: 2.5 },
+    },
+    {
+      id: 5,
+      kind: "cpl",
+      timestamp_ms: 300,
+      original: { latitude: 60.1, longitude: 24.1 },
+      advanced: { latitude: 60.1, longitude: 24.1 },
+      displacement: null,
+    },
+    {
+      id: 8,
+      kind: "lop",
+      timestamp_ms: 200,
+      original: { latitude: 60.05, longitude: 24.05 },
+      advanced: { latitude: 60.05, longitude: 24.05 },
+      displacement: null, // older than 300, no DR track → warning
+    },
+  ];
+  const rowsById = {
+    lop: new Map([
+      [2, { azimuth_true: 45, lop_type: "bearing" }],
+      [8, { azimuth_true: 90, lop_type: "celestial" }],
+    ]),
+    cpl: new Map([[5, { radius_nm: 1.5 }]]),
+  };
+  const specs = vm.advancementLayerSpecs(advancements, rowsById);
+  assert.strictEqual(specs.length, 3);
+  assert.deepStrictEqual(specs[0].original, [60, 24]);
+  assert.deepStrictEqual(specs[0].advanced, [60.02, 24.04]);
+  assert.strictEqual(specs[0].displacementNm, 2.5);
+  assert.strictEqual(specs[0].azimuthDeg, 45);
+  assert.strictEqual(specs[0].warning, false);
+  // The latest observation: no warning, radius available.
+  assert.strictEqual(specs[1].radiusNm, 1.5);
+  assert.strictEqual(specs[1].warning, false);
+  // Older + un-advanced → warning.
+  assert.strictEqual(specs[2].warning, true);
+  assert.strictEqual(specs[2].azimuthDeg, 90);
+  // Ids unknown to the row maps degrade to null geometry.
+  const orphan = vm.advancementLayerSpecs(
+    [
+      {
+        id: 99,
+        kind: "lop",
+        timestamp_ms: null,
+        original: { latitude: 1, longitude: 2 },
+        advanced: { latitude: 1, longitude: 2 },
+        displacement: null,
+      },
+    ],
+    rowsById,
+  );
+  assert.strictEqual(orphan[0].azimuthDeg, null);
+});
+
+test("relativeTimeText: watchkeeper-granularity ages", async () => {
+  const vm = await loadVm();
+  const now = Date.UTC(2026, 7, 26, 12, 0, 0);
+  assert.strictEqual(vm.relativeTimeText("not-a-date", now), "");
+  assert.strictEqual(
+    vm.relativeTimeText("2026-08-26T11:59:30Z", now),
+    "30s ago",
+  );
+  assert.strictEqual(
+    vm.relativeTimeText("2026-08-26T11:45:00Z", now),
+    "15m ago",
+  );
+  assert.strictEqual(
+    vm.relativeTimeText("2026-08-26T09:20:00Z", now),
+    "2h 40m ago",
+  );
+  assert.strictEqual(
+    vm.relativeTimeText("2026-08-23T12:00:00Z", now),
+    "3d ago",
+  );
+});

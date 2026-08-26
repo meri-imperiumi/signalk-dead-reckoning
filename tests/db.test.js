@@ -205,3 +205,283 @@ test("getDeviationRateStats returns recent rows filtered by sail/sea state", asy
   db.close();
   await rm(dir, { recursive: true, force: true });
 });
+
+// --- Observation & fix CRUD (work doc #13 stage D) -------------------------
+
+const {
+  recordLineOfPosition,
+  recordCircularPositionLine,
+  getLineOfPosition,
+  getCircularPositionLine,
+  getFix,
+  deleteLineOfPosition,
+  deleteCircularPositionLine,
+  deleteFix,
+  updateLineOfPosition,
+  updateCircularPositionLine,
+  updateFix,
+  attachObservationsToFix,
+} = require("../plugin/db.js");
+
+test("deleteLineOfPosition: deletes pending, refuses attached, 404s missing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-crud-lop-"));
+  const db = openDatabase(join(dir, "crud.sqlite"));
+  const pendingId = recordLineOfPosition(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+  });
+  assert.deepStrictEqual(deleteLineOfPosition(db, pendingId), { ok: true });
+  assert.strictEqual(getLineOfPosition(db, pendingId), undefined);
+
+  // Attached: confirm a fix that uses the LOP, then refuse the delete.
+  const fixId = recordFix(db, {
+    timestamp: "2026-01-01T00:01:00Z",
+    source_type: "bearing",
+    latitude: 60.01,
+    longitude: 24.01,
+    resets_dr_origin: true,
+  });
+  const lopId = recordLineOfPosition(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+  });
+  attachObservationsToFix(db, fixId, { lopIds: [lopId], cplIds: [] });
+  const refused = deleteLineOfPosition(db, lopId);
+  assert.strictEqual(refused.ok, false);
+  assert.strictEqual(refused.reason, "attached");
+  assert.strictEqual(refused.fixId, fixId);
+  assert.ok(getLineOfPosition(db, lopId), "row still there");
+
+  // Missing id.
+  assert.deepStrictEqual(deleteLineOfPosition(db, 99999), {
+    ok: false,
+    reason: "not_found",
+  });
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("deleteCircularPositionLine: same guard as LOPs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-crud-cpl-"));
+  const db = openDatabase(join(dir, "crud.sqlite"));
+  const cplId = recordCircularPositionLine(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 2,
+  });
+  assert.deepStrictEqual(deleteCircularPositionLine(db, cplId), { ok: true });
+  assert.strictEqual(getCircularPositionLine(db, cplId), undefined);
+  assert.deepStrictEqual(deleteCircularPositionLine(db, 99999), {
+    ok: false,
+    reason: "not_found",
+  });
+
+  const fixId = recordFix(db, {
+    timestamp: "2026-01-01T00:01:00Z",
+    source_type: "bearing",
+    latitude: 60.01,
+    longitude: 24.01,
+    resets_dr_origin: true,
+  });
+  const attachedId = recordCircularPositionLine(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 2,
+  });
+  attachObservationsToFix(db, fixId, { lopIds: [], cplIds: [attachedId] });
+  const refused = deleteCircularPositionLine(db, attachedId);
+  assert.strictEqual(refused.ok, false);
+  assert.strictEqual(refused.reason, "attached");
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("deleteFix: returns observations to pending, drops correction + queued logbook", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-crud-fix-"));
+  const db = openDatabase(join(dir, "crud.sqlite"));
+  const fixId = recordFix(db, {
+    timestamp: "2026-01-01T00:01:00Z",
+    source_type: "bearing",
+    latitude: 60.01,
+    longitude: 24.01,
+    resets_dr_origin: true,
+    notes: "will be deleted",
+  });
+  const lopId = recordLineOfPosition(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+  });
+  const cplId = recordCircularPositionLine(db, {
+    timestamp: "2026-01-01T00:00:30Z",
+    cpl_type: "vertical-angle",
+    center_lat: 60.02,
+    center_lon: 24.02,
+    radius_nm: 1.5,
+  });
+  attachObservationsToFix(db, fixId, { lopIds: [lopId], cplIds: [cplId] });
+  recordCorrection(db, {
+    fix_id: fixId,
+    timestamp: "2026-01-01T00:01:00Z",
+    dr_lat: 60,
+    dr_lon: 24,
+    fix_lat: 60.01,
+    fix_lon: 24.01,
+    deviation_nm: 0.7,
+    deviation_bearing: 45,
+    dr_elapsed_seconds: 600,
+  });
+  const { enqueueLogbookPending } = require("../plugin/db.js");
+  enqueueLogbookPending(db, "fix", { text: "queued entry" }, fixId);
+
+  assert.deepStrictEqual(deleteFix(db, fixId), { ok: true });
+  // Fix + correction + queued logbook row gone.
+  assert.strictEqual(getFix(db, fixId), undefined);
+  assert.strictEqual(
+    db
+      .prepare("SELECT COUNT(*) AS n FROM dr_corrections WHERE fix_id = ?")
+      .get(fixId).n,
+    0,
+  );
+  assert.strictEqual(
+    db
+      .prepare("SELECT COUNT(*) AS n FROM logbook_pending WHERE fix_id = ?")
+      .get(fixId).n,
+    0,
+  );
+  // Observations survive and are pending again.
+  const lop = getLineOfPosition(db, lopId);
+  assert.ok(lop);
+  assert.strictEqual(lop.used_in_fix_id, null);
+  const cpl = getCircularPositionLine(db, cplId);
+  assert.ok(cpl);
+  assert.strictEqual(cpl.used_in_fix_id, null);
+  // Missing id.
+  assert.deepStrictEqual(deleteFix(db, 99999), {
+    ok: false,
+    reason: "not_found",
+  });
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("updateLineOfPosition: edits allowed columns, ignores unknown, guards attached", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-crud-upd-"));
+  const db = openDatabase(join(dir, "crud.sqlite"));
+  const lopId = recordLineOfPosition(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+    body_or_object: "Rock",
+  });
+  const result = updateLineOfPosition(db, lopId, {
+    azimuth_true: 52,
+    body_or_object: "North Rock",
+    lop_type: "celestial", // not editable — ignored
+    assumed_lat: 60.001,
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.row.azimuth_true, 52);
+  assert.strictEqual(result.row.body_or_object, "North Rock");
+  assert.strictEqual(result.row.assumed_lat, 60.001);
+  assert.strictEqual(result.row.lop_type, "bearing", "type not editable");
+
+  // No editable fields → refusal the route maps to 400.
+  assert.deepStrictEqual(updateLineOfPosition(db, lopId, { lop_type: "rdf" }), {
+    ok: false,
+    reason: "no_fields",
+  });
+
+  // Attached → refuse.
+  const fixId = recordFix(db, {
+    timestamp: "2026-01-01T00:01:00Z",
+    source_type: "bearing",
+    latitude: 60.01,
+    longitude: 24.01,
+    resets_dr_origin: true,
+  });
+  attachObservationsToFix(db, fixId, { lopIds: [lopId], cplIds: [] });
+  const refused = updateLineOfPosition(db, lopId, { azimuth_true: 10 });
+  assert.strictEqual(refused.ok, false);
+  assert.strictEqual(refused.reason, "attached");
+
+  assert.deepStrictEqual(updateLineOfPosition(db, 99999, { azimuth_true: 1 }), {
+    ok: false,
+    reason: "not_found",
+  });
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("updateCircularPositionLine: edits center/radius/object", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-crud-updc-"));
+  const db = openDatabase(join(dir, "crud.sqlite"));
+  const cplId = recordCircularPositionLine(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 2,
+    source_object: "light",
+  });
+  const result = updateCircularPositionLine(db, cplId, {
+    radius_nm: 2.75,
+    center_lon: 24.02,
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.row.radius_nm, 2.75);
+  assert.strictEqual(result.row.center_lon, 24.02);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("updateFix: edits audit metadata, guards position/source_type/timestamp", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-crud-updf-"));
+  const db = openDatabase(join(dir, "crud.sqlite"));
+  const fixId = recordFix(db, {
+    timestamp: "2026-01-01T00:01:00Z",
+    source_type: "bearing",
+    latitude: 60.01,
+    longitude: 24.01,
+    resets_dr_origin: true,
+  });
+  const result = updateFix(db, fixId, { notes: "re-checked on chart" });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.row.notes, "re-checked on chart");
+
+  // Guarded columns.
+  const guarded = updateFix(db, fixId, { latitude: 61 });
+  assert.strictEqual(guarded.ok, false);
+  assert.strictEqual(guarded.reason, "guarded");
+  assert.deepStrictEqual(guarded.fields, ["latitude"]);
+  const both = updateFix(db, fixId, { longitude: 25, source_type: "gps" });
+  assert.deepStrictEqual(both.fields, ["longitude", "source_type"]);
+
+  // Same-value guarded fields are tolerated (no-op, not a refusal).
+  const same = updateFix(db, fixId, {
+    latitude: 60.01,
+    notes: "again",
+  });
+  assert.strictEqual(same.ok, true);
+
+  assert.deepStrictEqual(updateFix(db, 99999, { notes: "x" }), {
+    ok: false,
+    reason: "not_found",
+  });
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});

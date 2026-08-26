@@ -105,7 +105,16 @@ template.innerHTML = /* html */ `
       font-size: 0.8rem;
       color: var(--dr-muted, #8b949e);
     }
-    .pending li { margin: 0.15rem 0; }
+    .status {
+      margin-top: 0.5rem;
+      font-size: 0.8rem;
+      color: #56d364;
+    }
+    .editing-note {
+      margin-top: 0.5rem;
+      font-size: 0.8rem;
+      color: #f0b429;
+    }
     .reduction {
       margin-top: 0.5rem;
       padding: 0.5rem;
@@ -291,11 +300,8 @@ template.innerHTML = /* html */ `
       <div class="reduction" id="reduction" hidden></div>
     </form>
 
-    <ul class="pending" id="pending"></ul>
-    <div class="actions">
-      <button type="button" id="resolve-btn" disabled>Resolve candidate</button>
-      <button type="button" id="confirm-btn" disabled>Confirm fix</button>
-    </div>
+    <div class="editing-note" id="editing-note" hidden></div>
+    <ul class="status" id="status" hidden></ul>
     <div class="error" id="error" hidden></div>
   </div>
 `;
@@ -309,8 +315,8 @@ class DrSightPanel extends HTMLElement {
     const root = this.attachShadow({ mode: "open" });
     root.appendChild(template.content.cloneNode(true));
 
-    this.pendingIds = { lop: [], cpl: [] };
-    this.candidate = null;
+    /** @type {{kind: "lop"|"cpl", id: number}|null} PUT-instead-of-POST target */
+    this.editing = null;
 
     // Tab switching
     root.querySelectorAll(".tabs button").forEach((btn) => {
@@ -321,14 +327,6 @@ class DrSightPanel extends HTMLElement {
     root.querySelectorAll("[data-submit]").forEach((btn) => {
       btn.addEventListener("click", () => this.submit(btn.dataset.submit));
     });
-
-    // Resolve / confirm
-    root
-      .querySelector("#resolve-btn")
-      .addEventListener("click", () => this.resolve());
-    root
-      .querySelector("#confirm-btn")
-      .addEventListener("click", () => this.confirm());
 
     // Live distance calc for vertical-angle form
     const vForm = root.querySelector("#form-vertical");
@@ -386,13 +384,12 @@ class DrSightPanel extends HTMLElement {
       });
     });
 
-    root
-      .querySelector("#close-btn")
-      ?.addEventListener("click", () =>
-        this.dispatchEvent(
-          new CustomEvent("dr-close", { bubbles: true, composed: true }),
-        ),
+    root.querySelector("#close-btn")?.addEventListener("click", () => {
+      this.endEdit();
+      this.dispatchEvent(
+        new CustomEvent("dr-close", { bubbles: true, composed: true }),
       );
+    });
 
     /** @type {HTMLElement|null} */
     this.errorEl = root.querySelector("#error");
@@ -750,25 +747,30 @@ class DrSightPanel extends HTMLElement {
     this.parseFormCoords(data, mode);
 
     try {
+      let method = "POST";
       let path;
       let body;
-      let idKey;
-      if (mode === "bearing") {
+      if (this.editing) {
+        // Edit mode (work doc #13): the forms PUT their editable
+        // columns instead of creating a new observation.
+        const edited = this.editBody(mode, data);
+        if (!edited) return;
+        method = "PUT";
+        path = `/fix/${this.editing.kind}/${this.editing.id}`;
+        body = edited;
+      } else if (mode === "bearing") {
         path = "/fix/lop";
         body = vm.bearingLopBody(data);
-        idKey = "lop_id";
       } else if (mode === "vertical") {
         path = "/fix/cpl";
         body = vm.verticalAngleCplBody(data);
-        idKey = "cpl_id";
       } else {
         path = "/celestial/sight";
         body = vm.celestialSightBody(data);
-        idKey = "lop_id";
       }
 
       const res = await fetch(`${API}${path}`, {
-        method: "POST",
+        method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
@@ -779,18 +781,8 @@ class DrSightPanel extends HTMLElement {
         this.showReduction(result.reduction);
       }
 
-      if (idKey === "lop_id" && result.lop_id != null) {
-        this.pendingIds.lop.push({
-          id: result.lop_id,
-          label: this.describeLop(mode, data),
-        });
-      } else if (idKey === "cpl_id" && result.cpl_id != null) {
-        this.pendingIds.cpl.push({
-          id: result.cpl_id,
-          label: this.describeCpl(data),
-        });
-      }
-      this.renderPending();
+      const wasEditing = this.editing != null;
+      this.endEdit();
       form.reset();
       // Clear dirty flags so the next sight re-seeds from the boat.
       form.querySelectorAll('[data-dirty="true"]').forEach((el) => {
@@ -806,8 +798,14 @@ class DrSightPanel extends HTMLElement {
         this.setDefaultPosition(this.lastKnownPosition);
       // Re-seed the sight time to now (reset cleared it).
       this.seedSightTime();
+      this.showStatus(
+        wasEditing ? "Observation updated" : "Observation added to pending",
+      );
       this.dispatchEvent(
-        new CustomEvent("dr-observations-changed", { bubbles: true }),
+        new CustomEvent("dr-observations-changed", {
+          bubbles: true,
+          composed: true,
+        }),
       );
     } catch (err) {
       this.showError(err.message);
@@ -815,36 +813,117 @@ class DrSightPanel extends HTMLElement {
   }
 
   /**
-   * @param {HTMLFormElement} form
-   * @returns {Record<string, string>}
-   */
-  /**
-   * Builds a short human label for a just-added LOP so the pending
-   * list is readable (e.g. "lighthouse bearing 045°").
+   * Builds the PUT body for an edit-mode submit, or null (with an
+   * error shown) when this record can't be edited in the forms.
    *
-   * @param {string} mode
-   * @param {Record<string,string>} data
-   * @returns {string}
+   * @param {"bearing"|"vertical"|"celestial"} mode
+   * @param {Record<string,string>} data - parsed form data
+   * @returns {object|null}
    */
-  describeLop(mode, data) {
-    if (mode === "celestial") {
-      return `${data.body ?? "celestial"} sight`;
+  editBody(mode, data) {
+    if (this.editing.kind === "lop") {
+      if (this.editing.type !== "bearing" || mode !== "bearing") {
+        this.showError(
+          "Only bearing LOPs are editable in this form — celestial LOPs must be deleted and re-reduced",
+        );
+        return null;
+      }
+      const bearing = Number(data.bearing_true);
+      if (!Number.isFinite(bearing)) {
+        this.showError("bearing required");
+        return null;
+      }
+      return {
+        body_or_object: data.object || null,
+        assumed_lat: data.object_lat,
+        assumed_lon: data.object_lon,
+        // The engine's azimuth convention: bearing + 90° (see
+        // bearingLopBody).
+        azimuth_true: (bearing + 90) % 360,
+      };
     }
-    return `${data.object || "object"} brg ${data.bearing_true ?? ""}°`;
+    // CPL edit: object + center always; radius only when the user
+    // re-entered a height/angle pair (a radius can't round-trip into
+    // those two fields).
+    if (mode !== "vertical") {
+      this.showError("Switch to the vertical-angle tab to edit this CPL");
+      return null;
+    }
+    const body = {
+      source_object: data.object || null,
+      center_lat: data.center_lat,
+      center_lon: data.center_lon,
+    };
+    const height = Number(data.height_m);
+    const angle = Number(data.angle_deg);
+    if (height > 0 && angle > 0) {
+      body.radius_nm = vm.verticalAngleDistanceNm(height, angle);
+    }
+    return body;
   }
 
   /**
-   * Builds a short label for a just-added CPL (e.g. "lighthouse 0.46nm").
+   * Starts edit mode for a persisted observation (work doc #13):
+   * pre-seeds the matching form and marks the panel so submit PUTs
+   * instead of POSTs.
    *
-   * @param {Record<string,string>} data
-   * @returns {string}
+   * @param {{kind: "lop"|"cpl", id: number, [k: string]: unknown}} record - db row
+   * @returns {void}
    */
-  describeCpl(data) {
-    const nm = vm.verticalAngleDistanceNm(
-      Number(data.height_m),
-      Number(data.angle_deg),
-    );
-    return `${data.object || "object"} ${nm.toFixed(2)}nm`;
+  beginEdit(record) {
+    if (record.kind === "lop" && record.lop_type !== "bearing") {
+      this.showError(
+        "Celestial LOPs can't be edited in the form — delete and re-reduce the sight",
+      );
+      return;
+    }
+    this.endEdit();
+    this.editing = {
+      kind: record.kind,
+      id: record.kind === "lop" ? record.lop_id : record.cpl_id,
+      type: record.kind === "lop" ? record.lop_type : record.cpl_type,
+    };
+    const mode = record.kind === "lop" ? "bearing" : "vertical";
+    this.switchTab(mode);
+    const form = this.shadowRoot.querySelector(`#form-${mode}`);
+    const note = this.shadowRoot.querySelector("#editing-note");
+    note.hidden = false;
+    note.textContent = `Editing ${record.kind === "lop" ? "LOP" : "CPL"} #${this.editing.id} — submit writes the change`;
+    if (record.kind === "lop") {
+      form.querySelector('[name="object"]').value = record.body_or_object ?? "";
+      form.querySelector('[name="bearing_true"]').value = String(
+        (((record.azimuth_true - 90) % 360) + 360) % 360,
+      );
+      const fs = form.querySelector('fieldset.coord[data-prefix="object"]');
+      this.seedCoordForced(fs, "lat", record.assumed_lat);
+      this.seedCoordForced(fs, "lon", record.assumed_lon);
+    } else {
+      form.querySelector('[name="object"]').value = record.source_object ?? "";
+      const fs = form.querySelector('fieldset.coord[data-prefix="center"]');
+      this.seedCoordForced(fs, "lat", record.center_lat);
+      this.seedCoordForced(fs, "lon", record.center_lon);
+    }
+    const tz = this.loadSightTz();
+    const timeInput = form.querySelector('input[name="sight_time"]');
+    timeInput.value = vm.isoToSightTimeInput(record.timestamp, tz);
+    timeInput.dataset.dirty = "true";
+  }
+
+  /** @returns {void} */
+  endEdit() {
+    this.editing = null;
+    const note = this.shadowRoot?.querySelector("#editing-note");
+    if (note) note.hidden = true;
+  }
+
+  /**
+   * @param {string} msg
+   * @returns {void}
+   */
+  showStatus(msg) {
+    const el = this.shadowRoot.querySelector("#status");
+    el.textContent = msg;
+    el.hidden = false;
   }
 
   readForm(form) {
@@ -888,124 +967,6 @@ class DrSightPanel extends HTMLElement {
         sec: data[`${name}_sec`] ?? null,
         hem: data[`${name}_hem`] ?? "",
       });
-    }
-  }
-
-  /** @returns {void} */
-  /**
-   * Re-hydrates the pending list from the server: any persisted LOP/CPL
-   * not yet attached to a confirmed fix (`used_in_fix_id IS NULL`) is
-   * work-in-progress and should appear here. Called by dr-app when the
-   * dialog opens so a reload or dialog-close doesn't lose your pending
-   * observations. Idempotent — merges with locally-added ids.
-   *
-   * @returns {Promise<void>}
-   */
-  async hydratePending() {
-    this.seedSightTime();
-    try {
-      const res = await fetch(`${API}/observations?limit=200`);
-      if (!res.ok) return;
-      const data = await res.json();
-      const have = (arr) => new Set(arr.map((o) => o.id));
-      const lopHave = have(this.pendingIds.lop);
-      const cplHave = have(this.pendingIds.cpl);
-      for (const l of data.lops ?? []) {
-        if (l.used_in_fix_id == null && !lopHave.has(l.lop_id)) {
-          this.pendingIds.lop.push({
-            id: l.lop_id,
-            label: `${l.body_or_object ?? l.lop_type} LOP`,
-          });
-        }
-      }
-      for (const c of data.cpls ?? []) {
-        if (c.used_in_fix_id == null && !cplHave.has(c.cpl_id)) {
-          this.pendingIds.cpl.push({
-            id: c.cpl_id,
-            label: `${c.source_object ?? "CPL"} r=${(c.radius_nm ?? 0).toFixed(1)}nm`,
-          });
-        }
-      }
-      this.renderPending();
-    } catch {
-      /* REST unavailable — keep the in-memory list */
-    }
-  }
-
-  renderPending() {
-    const ul = this.shadowRoot.querySelector("#pending");
-    ul.innerHTML = "";
-    const total = this.pendingIds.lop.length + this.pendingIds.cpl.length;
-    if (total === 0) {
-      ul.innerHTML = "<li>No pending observations</li>";
-    } else {
-      for (const o of this.pendingIds.lop) {
-        const li = document.createElement("li");
-        li.textContent = `#${o.id} · ${o.label}`;
-        ul.appendChild(li);
-      }
-      for (const o of this.pendingIds.cpl) {
-        const li = document.createElement("li");
-        li.textContent = `#${o.id} · ${o.label}`;
-        ul.appendChild(li);
-      }
-    }
-    this.shadowRoot.querySelector("#resolve-btn").disabled = total < 1;
-  }
-
-  /** @returns {Promise<void>} */
-  async resolve() {
-    this.hideError();
-    if (this.pendingIds.lop.length + this.pendingIds.cpl.length === 0) return;
-    try {
-      const res = await fetch(`${API}/fix/resolve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source_type: "manual",
-          lop_ids: this.pendingIds.lop.map((o) => o.id),
-          cpl_ids: this.pendingIds.cpl.map((o) => o.id),
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
-      this.candidate = data.candidate;
-      this.shadowRoot.querySelector("#confirm-btn").disabled = false;
-      this.dispatchEvent(
-        new CustomEvent("dr-candidate-resolved", {
-          bubbles: true,
-          detail: this.candidate,
-        }),
-      );
-    } catch (err) {
-      this.showError(err.message);
-    }
-  }
-
-  /** @returns {Promise<void>} */
-  async confirm() {
-    this.hideError();
-    if (!this.candidate) return;
-    try {
-      const res = await fetch(`${API}/fix`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          candidate: this.candidate,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
-      // Clear pending after a successful confirm.
-      this.pendingIds = { lop: [], cpl: [] };
-      this.candidate = null;
-      this.renderPending();
-      this.shadowRoot.querySelector("#confirm-btn").disabled = true;
-      this.dispatchEvent(
-        new CustomEvent("dr-fix-confirmed", { bubbles: true, detail: data }),
-      );
-    } catch (err) {
-      this.showError(err.message);
     }
   }
 

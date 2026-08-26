@@ -2366,3 +2366,237 @@ test("fouled paddlewheel: STW 0 while making way raises fouling alert + state fl
   }
   await rm(dir, { recursive: true, force: true });
 });
+
+// --- Observation & fix CRUD routes (work doc #13 stage D) ------------------
+
+test("DELETE /fix/lop/:id deletes pending LOPs, 404s missing, 409s attached", async () => {
+  const { app, plugin, router } = makeStarted();
+  const lop_id = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+    body_or_object: "Rock",
+  }).body.lop_id;
+  const gone = router.invoke("delete", `/fix/lop/${lop_id}`);
+  assert.strictEqual(gone.status, 200);
+  assert.strictEqual(gone.body.ok, true);
+  // Now missing.
+  assert.strictEqual(router.invoke("delete", `/fix/lop/${lop_id}`).status, 404);
+  // Invalid id.
+  assert.strictEqual(router.invoke("delete", "/fix/lop/abc").status, 400);
+
+  // Attached: confirm a fix using a fresh LOP, then refuse the delete.
+  const lop2 = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+  }).body.lop_id;
+  const fix = router.invoke("post", "/fix", {
+    source_type: "bearing",
+    latitude: 60,
+    longitude: 24,
+    lop_ids: [lop2],
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(fix.status, 200);
+  const refused = router.invoke("delete", `/fix/lop/${lop2}`);
+  assert.strictEqual(refused.status, 409);
+  assert.ok(
+    new RegExp(`fix #${fix.body.fix_id}`).test(refused.body.message),
+    `message names the fix: ${refused.body.message}`,
+  );
+  app.subscriptionmanager.subscriptions.length = 0;
+  plugin.stop();
+});
+
+test("PUT /fix/lop/:id edits a pending LOP, 409s attached, 400s empty", async () => {
+  const { app, plugin, router } = makeStarted();
+  const lop_id = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+    body_or_object: "Rock",
+  }).body.lop_id;
+  const updated = router.invoke("put", `/fix/lop/${lop_id}`, {
+    azimuth_true: 52,
+    body_or_object: "North Rock",
+  });
+  assert.strictEqual(updated.status, 200);
+  assert.strictEqual(updated.body.lop.azimuth_true, 52);
+  assert.strictEqual(updated.body.lop.body_or_object, "North Rock");
+
+  // No editable fields.
+  assert.strictEqual(
+    router.invoke("put", `/fix/lop/${lop_id}`, { lop_type: "rdf" }).status,
+    400,
+  );
+  assert.strictEqual(router.invoke("put", "/fix/lop/99999", {}).status, 404);
+
+  // Attached: point fix that carries the LOP id (a point fix resolves
+  // trivially and the observation is still attached to it).
+  const fix = router.invoke("post", "/fix", {
+    source_type: "bearing",
+    latitude: 60,
+    longitude: 24,
+    lop_ids: [lop_id],
+  });
+  assert.strictEqual(fix.status, 200);
+  assert.strictEqual(
+    router.invoke("put", `/fix/lop/${lop_id}`, { azimuth_true: 10 }).status,
+    409,
+  );
+  app.subscriptionmanager.subscriptions.length = 0;
+  plugin.stop();
+});
+
+test("PUT /fix/cpl/:id edits a pending CPL", async () => {
+  const { app, plugin, router } = makeStarted();
+  const cpl_id = router.invoke("post", "/fix/cpl", {
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 2,
+    source_object: "light",
+  }).body.cpl_id;
+  const updated = router.invoke("put", `/fix/cpl/${cpl_id}`, {
+    radius_nm: 2.75,
+  });
+  assert.strictEqual(updated.status, 200);
+  assert.strictEqual(updated.body.cpl.radius_nm, 2.75);
+  app.subscriptionmanager.subscriptions.length = 0;
+  plugin.stop();
+});
+
+test("DELETE /fix/:id un-confirms: observations return to pending, correction dropped", async () => {
+  const { app, plugin, router } = makeStarted();
+  // Seed an origin so the confirm writes a correction row.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const lop_id = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+    body_or_object: "Rock",
+  }).body.lop_id;
+  const cpl_id = router.invoke("post", "/fix/cpl", {
+    cpl_type: "vertical-angle",
+    center_lat: 60.02,
+    center_lon: 24.02,
+    radius_nm: 1.5,
+    source_object: "light",
+  }).body.cpl_id;
+  const fix = router.invoke("post", "/fix", {
+    source_type: "bearing",
+    lop_ids: [lop_id],
+    cpl_ids: [cpl_id],
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(fix.status, 200);
+  assert.strictEqual(fix.body.recorded_correction, true);
+
+  const deleted = router.invoke("delete", `/fix/${fix.body.fix_id}`);
+  assert.strictEqual(deleted.status, 200);
+
+  const after = router.invoke("get", "/observations?limit=10");
+  const lop = after.body.lops.find((l) => l.lop_id === lop_id);
+  const cpl = after.body.cpls.find((c) => c.cpl_id === cpl_id);
+  assert.ok(lop, "LOP survived the fix delete");
+  assert.strictEqual(lop.used_in_fix_id, null, "LOP pending again");
+  assert.ok(cpl, "CPL survived the fix delete");
+  assert.strictEqual(cpl.used_in_fix_id, null, "CPL pending again");
+
+  const fixes = router.invoke("get", "/fixes?limit=10").body.fixes;
+  assert.ok(!fixes.some((f) => f.fix_id === fix.body.fix_id), "fix row gone");
+  const corrections = router.invoke("get", "/corrections?limit=10").body
+    .corrections;
+  assert.ok(
+    !corrections.some((c) => c.fix_id === fix.body.fix_id),
+    "correction row gone",
+  );
+  assert.strictEqual(router.invoke("delete", "/fix/99999").status, 404);
+  app.subscriptionmanager.subscriptions.length = 0;
+  plugin.stop();
+});
+
+test("PUT /fix/:id edits notes, guards position/source_type (409)", async () => {
+  const { app, plugin, router } = makeStarted();
+  const fix = router.invoke("post", "/fix", {
+    latitude: 60,
+    longitude: 24,
+    source_type: "manual",
+    notes: "berth",
+  });
+  assert.strictEqual(fix.status, 200);
+  const updated = router.invoke("put", `/fix/${fix.body.fix_id}`, {
+    notes: "berth 12, west quay",
+  });
+  assert.strictEqual(updated.status, 200);
+  assert.strictEqual(updated.body.fix.notes, "berth 12, west quay");
+
+  const guarded = router.invoke("put", `/fix/${fix.body.fix_id}`, {
+    latitude: 61,
+  });
+  assert.strictEqual(guarded.status, 409);
+  assert.ok(/latitude/.test(guarded.body.message));
+  const guarded2 = router.invoke("put", `/fix/${fix.body.fix_id}`, {
+    source_type: "gps",
+  });
+  assert.strictEqual(guarded2.status, 409);
+  assert.strictEqual(
+    router.invoke("put", "/fix/99999", { notes: "x" }).status,
+    404,
+  );
+  app.subscriptionmanager.subscriptions.length = 0;
+  plugin.stop();
+});
+
+test("POST /fix/resolve response carries per-observation advancements (work doc #13 C)", async () => {
+  const { app, plugin, router } = makeStarted();
+  const early = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    timestamp: "2026-01-01T10:00:00Z",
+  }).body.lop_id;
+  const late = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24.4,
+    azimuth_true: 90,
+    timestamp: "2026-01-01T14:00:00Z",
+  }).body.lop_id;
+  const { status, body } = router.invoke("post", "/fix/resolve", {
+    source_type: "bearing",
+    lop_ids: [early, late],
+  });
+  assert.strictEqual(status, 200);
+  const advancements = body.candidate.advancements;
+  assert.ok(Array.isArray(advancements), "advancements present");
+  assert.strictEqual(advancements.length, 2);
+  const byId = Object.fromEntries(advancements.map((a) => [a.id, a]));
+  assert.ok(byId[early], "early LOP advancement carries its id");
+  // No ground track in this test → nothing advanced, but the records
+  // still report original == advanced with null displacement.
+  assert.deepStrictEqual(byId[early].advanced, byId[early].original);
+  assert.strictEqual(byId[early].displacement, null);
+  assert.strictEqual(byId[late].displacement, null);
+  app.subscriptionmanager.subscriptions.length = 0;
+  plugin.stop();
+});

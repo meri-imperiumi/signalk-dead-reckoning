@@ -32,6 +32,13 @@ const {
   getLineOfPosition,
   getCircularPositionLine,
   listCorrections,
+  getFix,
+  deleteLineOfPosition,
+  deleteCircularPositionLine,
+  deleteFix,
+  updateLineOfPosition,
+  updateCircularPositionLine,
+  updateFix,
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
@@ -255,6 +262,13 @@ const deps = {
   getLineOfPosition,
   getCircularPositionLine,
   listCorrections,
+  getFix,
+  deleteLineOfPosition,
+  deleteCircularPositionLine,
+  deleteFix,
+  updateLineOfPosition,
+  updateCircularPositionLine,
+  updateFix,
   DeadReckoningEngine,
   MatrixStore,
   GroundTrack,
@@ -1910,6 +1924,204 @@ module.exports = (app) => {
         recorded_correction: result.correction_id != null,
         origin: engine.origin,
       });
+    });
+
+    // ------------------------------------------------------------------
+    // Observation & fix CRUD (work doc #13 stage D)
+    // ------------------------------------------------------------------
+
+    /**
+     * Parses and validates a numeric `:id` route param.
+     * @param {unknown} raw
+     * @returns {number|null}
+     */
+    const numericId = (raw) => {
+      const n = Number(raw);
+      return Number.isInteger(n) && n > 0 ? n : null;
+    };
+
+    /**
+     * DELETE /fix/lop/:id — delete a pending LOP. 409 when attached to a
+     * confirmed fix (delete the fix instead; its observations return to
+     * pending).
+     */
+    router.delete("/fix/lop/:id", (req, res) => {
+      if (!db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const id = numericId(req.params?.id);
+      if (id == null) {
+        res.status(400).json({ message: "invalid id" });
+        return;
+      }
+      const result = deps.deleteLineOfPosition(db, id);
+      if (!result.ok) {
+        if (result.reason === "not_found") {
+          res.status(404).json({ message: `LOP ${id} not found` });
+        } else if (result.reason === "attached") {
+          res.status(409).json({
+            message: `LOP ${id} is attached to fix #${result.fixId} — delete the fix instead (its observations return to pending)`,
+            fix_id: result.fixId,
+          });
+        } else {
+          res.status(400).json({ message: result.reason });
+        }
+        return;
+      }
+      res.json({ ok: true });
+    });
+
+    /**
+     * DELETE /fix/cpl/:id — delete a pending CPL (same guard as LOPs).
+     */
+    router.delete("/fix/cpl/:id", (req, res) => {
+      if (!db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const id = numericId(req.params?.id);
+      if (id == null) {
+        res.status(400).json({ message: "invalid id" });
+        return;
+      }
+      const result = deps.deleteCircularPositionLine(db, id);
+      if (!result.ok) {
+        if (result.reason === "not_found") {
+          res.status(404).json({ message: `CPL ${id} not found` });
+        } else if (result.reason === "attached") {
+          res.status(409).json({
+            message: `CPL ${id} is attached to fix #${result.fixId} — delete the fix instead (its observations return to pending)`,
+            fix_id: result.fixId,
+          });
+        } else {
+          res.status(400).json({ message: result.reason });
+        }
+        return;
+      }
+      res.json({ ok: true });
+    });
+
+    /**
+     * DELETE /fix/:id — un-confirm a fix: its LOP/CPL rows return to
+     * pending, the correction row and any queued logbook entry are
+     * dropped. The DR origin is NOT rewound (data-correction, not a
+     * time machine).
+     */
+    router.delete("/fix/:id", (req, res) => {
+      if (!db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const id = numericId(req.params?.id);
+      if (id == null) {
+        res.status(400).json({ message: "invalid id" });
+        return;
+      }
+      const result = deps.deleteFix(db, id);
+      if (!result.ok) {
+        res.status(404).json({ message: `fix ${id} not found` });
+        return;
+      }
+      res.json({ ok: true });
+    });
+
+    /**
+     * PUT /fix/lop/:id — partial update of a pending LOP's editable
+     * columns (object name, assumed position, azimuth, intercept).
+     */
+    router.put("/fix/lop/:id", (req, res) => {
+      if (!db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const id = numericId(req.params?.id);
+      if (id == null) {
+        res.status(400).json({ message: "invalid id" });
+        return;
+      }
+      const b = parseBody(req.body);
+      const result = deps.updateLineOfPosition(db, id, b);
+      if (!result.ok) {
+        if (result.reason === "not_found") {
+          res.status(404).json({ message: `LOP ${id} not found` });
+        } else if (result.reason === "attached") {
+          res.status(409).json({
+            message: `LOP ${id} is attached to fix #${result.fixId} — delete the fix before editing`,
+            fix_id: result.fixId,
+          });
+        } else {
+          res.status(400).json({ message: "no editable fields in body" });
+        }
+        return;
+      }
+      res.json({ ok: true, lop: result.row });
+    });
+
+    /**
+     * PUT /fix/cpl/:id — partial update of a pending CPL's editable
+     * columns (object, center, radius).
+     */
+    router.put("/fix/cpl/:id", (req, res) => {
+      if (!db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const id = numericId(req.params?.id);
+      if (id == null) {
+        res.status(400).json({ message: "invalid id" });
+        return;
+      }
+      const b = parseBody(req.body);
+      const result = deps.updateCircularPositionLine(db, id, b);
+      if (!result.ok) {
+        if (result.reason === "not_found") {
+          res.status(404).json({ message: `CPL ${id} not found` });
+        } else if (result.reason === "attached") {
+          res.status(409).json({
+            message: `CPL ${id} is attached to fix #${result.fixId} — delete the fix before editing`,
+            fix_id: result.fixId,
+          });
+        } else {
+          res.status(400).json({ message: "no editable fields in body" });
+        }
+        return;
+      }
+      res.json({ ok: true, cpl: result.row });
+    });
+
+    /**
+     * PUT /fix/:id — partial update of a fix's audit metadata (notes,
+     * confirmed_by, estimated error radius). Position/source_type/
+     * timestamp are guarded (409) — repositioning a fix is "delete +
+     * manual entry", not an edit.
+     */
+    router.put("/fix/:id", (req, res) => {
+      if (!db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const id = numericId(req.params?.id);
+      if (id == null) {
+        res.status(400).json({ message: "invalid id" });
+        return;
+      }
+      const b = parseBody(req.body);
+      const result = deps.updateFix(db, id, b);
+      if (!result.ok) {
+        if (result.reason === "not_found") {
+          res.status(404).json({ message: `fix ${id} not found` });
+        } else if (result.reason === "guarded") {
+          res.status(409).json({
+            message: `cannot edit ${result.fields.join(", ")} of a confirmed fix — delete it and re-enter instead`,
+            fields: result.fields,
+          });
+        } else {
+          res.status(400).json({ message: "no editable fields in body" });
+        }
+        return;
+      }
+      res.json({ ok: true, fix: result.row });
     });
   };
 

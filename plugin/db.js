@@ -606,6 +606,254 @@ function listCorrections(db, q = {}) {
     .all(q.limit ?? 20);
 }
 
+// -------------------------------------------------------------------------
+// Observation & fix CRUD (work doc #13 stage D)
+//
+// Guard policy: a LOP/CPL already resolved into a confirmed fix
+// (`used_in_fix_id IS NOT NULL`) is part of the navigational record and
+// must not be silently edited or deleted — the honest path is deleting
+// the fix first, which un-confirms it and returns the observations to
+// pending. The helpers surface refusals as result objects so the REST
+// layer can answer 409 with the attached fix id.
+// -------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} CrudResult
+ * @property {boolean} ok
+ * @property {"not_found"|"attached"|"guarded"|"no_fields"} [reason]
+ * @property {number} [fixId] - the fix blocking an attached observation
+ * @property {Array<string>} [fields] - guarded field names, for the message
+ * @property {object} [row] - the row after a successful update
+ */
+
+/**
+ * Deletes a pending line of position. Refuses when the LOP is attached
+ * to a confirmed fix (delete the fix instead — its observations return
+ * to pending).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @returns {CrudResult}
+ */
+function deleteLineOfPosition(db, id) {
+  const row = getLineOfPosition(db, id);
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.used_in_fix_id != null) {
+    return { ok: false, reason: "attached", fixId: row.used_in_fix_id };
+  }
+  db.prepare("DELETE FROM lines_of_position WHERE lop_id = ?").run(id);
+  return { ok: true };
+}
+
+/**
+ * Deletes a pending circular position line, with the same attached-to-fix
+ * guard as {@link deleteLineOfPosition}.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @returns {CrudResult}
+ */
+function deleteCircularPositionLine(db, id) {
+  const row = getCircularPositionLine(db, id);
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.used_in_fix_id != null) {
+    return { ok: false, reason: "attached", fixId: row.used_in_fix_id };
+  }
+  db.prepare("DELETE FROM circular_position_lines WHERE cpl_id = ?").run(id);
+  return { ok: true };
+}
+
+/**
+ * Deletes a confirmed fix and un-confirms it: the LOP/CPL rows that
+ * resolved into it are returned to pending (`used_in_fix_id` NULL), the
+ * matching `dr_corrections` row and any queued logbook entry are
+ * dropped. The DR origin is NOT rewound — deleting a fix is a
+ * data-correction, not a time machine.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @returns {CrudResult}
+ */
+function deleteFix(db, id) {
+  const row = db.prepare("SELECT fix_id FROM fixes WHERE fix_id = ?").get(id);
+  if (!row) return { ok: false, reason: "not_found" };
+  db.prepare(
+    "UPDATE lines_of_position SET used_in_fix_id = NULL WHERE used_in_fix_id = ?",
+  ).run(id);
+  db.prepare(
+    "UPDATE circular_position_lines SET used_in_fix_id = NULL WHERE used_in_fix_id = ?",
+  ).run(id);
+  db.prepare("DELETE FROM dr_corrections WHERE fix_id = ?").run(id);
+  db.prepare("DELETE FROM logbook_pending WHERE fix_id = ?").run(id);
+  db.prepare("DELETE FROM fixes WHERE fix_id = ?").run(id);
+  return { ok: true };
+}
+
+/**
+ * Fetches a single fix row with the full record (incl. notes) for the
+ * detail popover / edit round-trip.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @returns {object|null}
+ */
+function getFix(db, id) {
+  return db
+    .prepare(
+      `SELECT fix_id, timestamp, source_type, latitude, longitude,
+              estimated_error_radius, confirmed_by, resets_dr_origin,
+              notes, logged_to_logbook, logbook_entry_ref
+       FROM fixes WHERE fix_id = ?`,
+    )
+    .get(id);
+}
+
+/** Columns a pending LOP may be edited on (geometry + object label). */
+const LOP_EDITABLE_COLUMNS = [
+  "body_or_object",
+  "assumed_lat",
+  "assumed_lon",
+  "azimuth_true",
+  "intercept_nm",
+];
+
+/** Columns a pending CPL may be edited on. */
+const CPL_EDITABLE_COLUMNS = [
+  "source_object",
+  "center_lat",
+  "center_lon",
+  "radius_nm",
+];
+
+/**
+ * Partially updates a pending LOP. Refuses attached observations for the
+ * same reason as delete: editing a LOP that already produced a confirmed
+ * fix would silently invalidate the fix.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @param {object} fields - subset of LOP_EDITABLE_COLUMNS; unknown ignored
+ * @returns {CrudResult}
+ */
+function updateLineOfPosition(db, id, fields) {
+  const row = getLineOfPosition(db, id);
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.used_in_fix_id != null) {
+    return { ok: false, reason: "attached", fixId: row.used_in_fix_id };
+  }
+  return updateRow(
+    db,
+    "lines_of_position",
+    "lop_id",
+    id,
+    LOP_EDITABLE_COLUMNS,
+    fields,
+    getLineOfPosition,
+  );
+}
+
+/**
+ * Partially updates a pending CPL (same guard as LOPs).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @param {object} fields - subset of CPL_EDITABLE_COLUMNS; unknown ignored
+ * @returns {CrudResult}
+ */
+function updateCircularPositionLine(db, id, fields) {
+  const row = getCircularPositionLine(db, id);
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.used_in_fix_id != null) {
+    return { ok: false, reason: "attached", fixId: row.used_in_fix_id };
+  }
+  return updateRow(
+    db,
+    "circular_position_lines",
+    "cpl_id",
+    id,
+    CPL_EDITABLE_COLUMNS,
+    fields,
+    getCircularPositionLine,
+  );
+}
+
+/** Columns a fix may be edited on — audit metadata only. */
+const FIX_EDITABLE_COLUMNS = [
+  "notes",
+  "confirmed_by",
+  "estimated_error_radius",
+];
+
+/** Fix columns that must never change after confirmation. */
+const FIX_GUARDED_COLUMNS = [
+  "latitude",
+  "longitude",
+  "source_type",
+  "timestamp",
+];
+
+/**
+ * Partially updates a fix's audit metadata (notes, confirmed_by,
+ * estimated error radius). Position and source_type are guarded: a
+ * fix's position is the output of an observation — repositioning it is
+ * "delete + manual fix entry", not an edit (keeps the fix table
+ * auditable).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @param {object} fields
+ * @returns {CrudResult}
+ */
+function updateFix(db, id, fields) {
+  const row = getFix(db, id);
+  if (!row) return { ok: false, reason: "not_found" };
+  const guarded = FIX_GUARDED_COLUMNS.filter(
+    (c) => fields[c] !== undefined && fields[c] !== row[c],
+  );
+  if (guarded.length > 0) {
+    return { ok: false, reason: "guarded", fields: guarded };
+  }
+  return updateRow(
+    db,
+    "fixes",
+    "fix_id",
+    id,
+    FIX_EDITABLE_COLUMNS,
+    fields,
+    getFix,
+  );
+}
+
+/**
+ * Shared partial-update runner: builds `SET` from the allowed columns
+ * present in `fields`, runs it, and returns the refreshed row.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} table
+ * @param {string} idCol
+ * @param {number} id
+ * @param {Array<string>} allowed
+ * @param {object} fields
+ * @param {(db: object, id: number) => object|null} getter - re-reads the row
+ * @returns {CrudResult}
+ */
+function updateRow(db, table, idCol, id, allowed, fields, getter) {
+  const sets = [];
+  const vals = [];
+  for (const col of allowed) {
+    if (fields[col] !== undefined) {
+      sets.push(`${col} = ?`);
+      vals.push(fields[col]);
+    }
+  }
+  if (sets.length === 0) return { ok: false, reason: "no_fields" };
+  vals.push(id);
+  db.prepare(`UPDATE ${table} SET ${sets.join(", ")} WHERE ${idCol} = ?`).run(
+    ...vals,
+  );
+  return { ok: true, row: getter(db, id) };
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
@@ -628,4 +876,11 @@ module.exports = {
   listLinesOfPosition,
   listCircularPositionLines,
   listCorrections,
+  getFix,
+  deleteLineOfPosition,
+  deleteCircularPositionLine,
+  deleteFix,
+  updateLineOfPosition,
+  updateCircularPositionLine,
+  updateFix,
 };
