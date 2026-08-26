@@ -10,6 +10,7 @@ const {
   formatPosition,
   composeFixEntry,
   composeTackEntry,
+  composeObservationEntry,
   createLogbookClient,
   createAccessRequestClient,
   newClientId,
@@ -249,4 +250,64 @@ test("newClientId returns distinct v4 UUIDs", () => {
     a,
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
   );
+});
+
+test("composeObservationEntry: celestial sight with reduction", () => {
+  const body = composeObservationEntry({
+    kind: "celestial",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "Sun",
+    confirmed_by: "Alice",
+    latitude: 60,
+    longitude: 24,
+    reduction: { azimuth_true: 180, intercept_nm: 2.5 },
+    sea_state: 3,
+  });
+  assert.strictEqual(body.category, "navigation");
+  assert.strictEqual(body.origin, "agent");
+  assert.strictEqual(body.author, "Alice");
+  assert.match(body.text, /Sun sight/);
+  assert.doesNotMatch(
+    body.text,
+    /by Alice/,
+    "author stays in metadata, not text",
+  );
+  assert.match(body.text, /Zn 180\.0/);
+  assert.match(body.text, /intercept 2\.50 nm toward/);
+  assert.strictEqual(body.position.source, "Celestial");
+  assert.strictEqual(body.observations.seaState, 3);
+});
+
+test("composeObservationEntry: bearing LOP names the object", () => {
+  const body = composeObservationEntry({
+    kind: "bearing",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "lighthouse",
+    confirmed_by: null,
+    latitude: 60,
+    longitude: 24,
+  });
+  assert.match(body.text, /lighthouse bearing/);
+  assert.strictEqual(body.author, undefined);
+  assert.strictEqual(body.position.source, "DR");
+});
+
+test("composeObservationEntry: vertical-angle CPL", () => {
+  const body = composeObservationEntry({
+    kind: "vertical",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "lighthouse",
+  });
+  assert.match(body.text, /lighthouse CPL/);
+  assert.strictEqual(body.position, undefined);
+});
+
+test("composeObservationEntry: intercept away when negative", () => {
+  const body = composeObservationEntry({
+    kind: "celestial",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "Polaris",
+    reduction: { azimuth_true: 0, intercept_nm: -1.2 },
+  });
+  assert.match(body.text, /intercept 1\.20 nm away/);
 });

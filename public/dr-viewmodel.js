@@ -34,6 +34,53 @@ const RAD = Math.PI / 180;
 const EARTH_RADIUS_NM = 3440.065;
 
 /**
+ * Parses a `<input type="datetime-local">` value (a naive string like
+ * "2026-06-21T17:00:00") into an ISO-8601 UTC timestamp. `datetime-local`
+ * carries no timezone, so the `tz` argument tells us how to interpret it:
+ * "local" (the browser's zone) or "utc". Returns null for empty/invalid.
+ *
+ * @param {string} s
+ * @param {"local"|"utc"} [tz="local"]
+ * @returns {string|null}
+ */
+export function sightTimeToIso(s, tz = "local") {
+  if (!s) return null;
+  // Append "Z" so the JS engine parses as UTC rather than local.
+  const d = tz === "utc" ? new Date(`${s}Z`) : new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Parses a `datetime-local` value into epoch milliseconds (UTC).
+ * @param {string} s
+ * @param {"local"|"utc"} [tz="local"]
+ * @returns {number|null}
+ */
+export function sightTimeToEpochMs(s, tz = "local") {
+  if (!s) return null;
+  const d = tz === "utc" ? new Date(`${s}Z`) : new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d.getTime();
+}
+
+/**
+ * Formats an ISO timestamp into a `datetime-local` value (naive, in the
+ * chosen timezone) for pre-filling the input on dialog open. Includes
+ * seconds (the input has `step="1"`).
+ *
+ * @param {string} iso
+ * @param {"local"|"utc"} [tz="local"]
+ * @returns {string}
+ */
+export function isoToSightTimeInput(iso, tz = "local") {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  // In UTC mode, use the UTC getters; otherwise the local getters.
+  const get = (fn) => (tz === "utc" ? d[`getUTC${fn}`]() : d[`get${fn}`]());
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${get("FullYear")}-${pad(get("Month") + 1)}-${pad(get("Date"))}T${pad(get("Hours"))}:${pad(get("Minutes"))}:${pad(get("Seconds"))}`;
+}
+
+/**
  * Great-circle destination point from [lat, lon], bearing (deg true),
  * distance (nm). Mirrors plugin/geo.js (kept self-contained so this
  * module loads in the browser without a bundler).
@@ -447,12 +494,12 @@ export function verticalAngleDistanceNm(heightM, angleDeg) {
  * point and rotate the azimuth +90° (the line's normal points
  * across-track). Intercept is 0 — the line passes through the object.
  *
- * @param {object} form - { object, bearing_true, object_lat, object_lon, confirmed_by? }
+ * @param {object} form - { object, bearing_true, object_lat, object_lon, sight_time, confirmed_by? }
  * @returns {object}
  */
 export function bearingLopBody(form) {
   const bearing = Number(form.bearing_true);
-  return {
+  const body = {
     lop_type: "bearing",
     assumed_lat: Number(form.object_lat),
     assumed_lon: Number(form.object_lon),
@@ -462,6 +509,9 @@ export function bearingLopBody(form) {
     body_or_object: form.object || null,
     confirmed_by: form.confirmed_by || null,
   };
+  const ts = sightTimeToIso(form.sight_time, form.sight_tz);
+  if (ts) body.timestamp = ts;
+  return body;
 }
 
 /**
@@ -469,11 +519,11 @@ export function bearingLopBody(form) {
  * centered on the object's charted position with radius = the distance
  * computed from height + angle.
  *
- * @param {object} form - { object, height_m, angle_deg, center_lat, center_lon, confirmed_by? }
+ * @param {object} form - { object, height_m, angle_deg, center_lat, center_lon, sight_time, confirmed_by? }
  * @returns {object}
  */
 export function verticalAngleCplBody(form) {
-  return {
+  const body = {
     cpl_type: "vertical-angle",
     center_lat: Number(form.center_lat),
     center_lon: Number(form.center_lon),
@@ -481,20 +531,23 @@ export function verticalAngleCplBody(form) {
     source_object: form.object || null,
     confirmed_by: form.confirmed_by || null,
   };
+  const ts = sightTimeToIso(form.sight_time, form.sight_tz);
+  if (ts) body.timestamp = ts;
+  return body;
 }
 
 /**
  * Shape a celestial-sight form into a `POST /celestial/sight` body.
  *
  * @param {object} form - { body, hs_deg, index_correction_deg?, eye_height_m?,
- *   limb?, epoch_ms, assumed_position?, confirmed_by? }
+ *   limb?, sight_time, assumed_position?, noon?, confirmed_by? }
  * @returns {object}
  */
 export function celestialSightBody(form) {
   const body = {
     body: form.body,
     hs_deg: Number(form.hs_deg),
-    epoch_ms: Number(form.epoch_ms),
+    epoch_ms: sightTimeToEpochMs(form.sight_time, form.sight_tz),
     confirmed_by: form.confirmed_by || null,
   };
   if (form.index_correction_deg != null && form.index_correction_deg !== "") {
@@ -504,6 +557,7 @@ export function celestialSightBody(form) {
     body.eye_height_m = Number(form.eye_height_m);
   }
   if (form.limb) body.limb = form.limb;
+  if (form.noon) body.noon = true;
   if (form.assumed_lat != null && form.assumed_lon != null) {
     body.assumed_position = {
       latitude: Number(form.assumed_lat),

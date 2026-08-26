@@ -20,11 +20,14 @@ const {
   recordLineOfPosition,
   recordCircularPositionLine,
   attachObservationsToFix,
+  getLineOfPosition,
+  getCircularPositionLine,
 } = require("../plugin/db.js");
 const { distanceNm, bearingDeg } = require("../plugin/geo.js");
 const {
   resolveCandidateFix,
   confirmFix,
+  loadObservationsById,
 } = require("../plugin/fix-pipeline.js");
 
 let tempDir;
@@ -119,6 +122,73 @@ test("resolveCandidateFix: two crossing LOPs resolve to a candidate", () => {
   assert.ok(Math.abs(c.latitude - 60) < 1e-6);
   assert.ok(Math.abs(c.longitude - 24) < 1e-6);
   assert.deepStrictEqual(c.observationIds.lopIds, lopIds);
+  db.close();
+});
+
+test("resolveCandidateFix: hydrates observations from lop_ids when no inline observations", () => {
+  const lopIds = [];
+  const db = openDatabase(join(tempDir, "hydrate.sqlite"));
+  lopIds.push(
+    recordLineOfPosition(db, {
+      timestamp: "2026-01-01T00:00:00Z",
+      lop_type: "bearing",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 0,
+      body_or_object: "Rock A",
+    }),
+  );
+  lopIds.push(
+    recordLineOfPosition(db, {
+      timestamp: "2026-01-01T00:01:00Z",
+      lop_type: "bearing",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 90,
+      body_or_object: "Rock B",
+    }),
+  );
+  // No inline observations — only lop_ids. The pipeline must load them.
+  const c = resolveCandidateFix({
+    source_type: "bearing",
+    observationIds: { lopIds, cplIds: [] },
+    drPosition: { latitude: 60.02, longitude: 24.01 },
+    db,
+    helpers: { getLineOfPosition, getCircularPositionLine },
+  });
+  assert.ok(c, "should resolve from hydrated ids");
+  assert.ok(Math.abs(c.latitude - 60) < 1e-6);
+  assert.ok(Math.abs(c.longitude - 24) < 1e-6);
+  db.close();
+});
+
+test("loadObservationsById: shapes LOP + CPL rows into resolver inputs", () => {
+  const db = openDatabase(join(tempDir, "loadby.sqlite"));
+  const lopId = recordLineOfPosition(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+  });
+  const cplId = recordCircularPositionLine(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    cpl_type: "vertical-angle",
+    center_lat: 60.01,
+    center_lon: 24.01,
+    radius_nm: 2,
+  });
+  const obs = loadObservationsById(
+    db,
+    { getLineOfPosition, getCircularPositionLine },
+    [lopId],
+    [cplId],
+  );
+  assert.strictEqual(obs.length, 2);
+  assert.strictEqual(obs[0].kind, "lop");
+  assert.strictEqual(obs[0].azimuth_true, 45);
+  assert.strictEqual(obs[1].kind, "cpl");
+  assert.strictEqual(obs[1].radius_nm, 2);
   db.close();
 });
 

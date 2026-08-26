@@ -92,8 +92,48 @@ const { resolveFix } = require("./fixes.js");
  * @param {{latitude:number, longitude:number}} [input.drPosition] - DR/assumed position; defaults to engine origin
  * @param {{lopIds?: number[], cplIds?: number[]}} [input.observationIds] - ids of already-persisted LOP/CPL rows
  * @param {DrEngineLike|null} [input.engine] - to default drPosition from origin
+ * @param {import('node:sqlite').DatabaseSync|null} [input.db] - to hydrate observations from ids
+ * @param {{getLineOfPosition?: Function, getCircularPositionLine?: Function}} [input.helpers] - db getters for id-hydration
  * @returns {CandidateFix|null} null if observations can't be resolved (e.g. a single LOP with no point)
  */
+/**
+ * Loads persisted LOP/CPL rows by id and shapes them into the
+ * {@link import('./fixes.js').Observation} array the resolver expects.
+ * Used when a caller (POST /fix/resolve) passes only db ids.
+ *
+ * @param {import('node:sqlite').DatabaseSync|null} db
+ * @param {object} helpers - { getLineOfPosition, getCircularPositionLine }
+ * @param {number[]} lopIds
+ * @param {number[]} cplIds
+ * @returns {Array<{kind:'lop'|'cpl'}>}
+ */
+function loadObservationsById(db, helpers, lopIds, cplIds) {
+  if (!db || !helpers) return [];
+  const out = [];
+  for (const id of lopIds) {
+    const row = helpers.getLineOfPosition(db, id);
+    if (!row) continue;
+    out.push({
+      kind: "lop",
+      assumed_lat: row.assumed_lat,
+      assumed_lon: row.assumed_lon,
+      azimuth_true: row.azimuth_true,
+      intercept_nm: row.intercept_nm ?? 0,
+    });
+  }
+  for (const id of cplIds) {
+    const row = helpers.getCircularPositionLine(db, id);
+    if (!row) continue;
+    out.push({
+      kind: "cpl",
+      center_lat: row.center_lat,
+      center_lon: row.center_lon,
+      radius_nm: row.radius_nm,
+    });
+  }
+  return out;
+}
+
 function resolveCandidateFix(input) {
   const sourceType = input.source_type;
   const lopIds = input.observationIds?.lopIds ?? [];
@@ -111,7 +151,19 @@ function resolveCandidateFix(input) {
     };
   }
 
-  const observations = input.observations ?? [];
+  let observations = input.observations ?? [];
+  // When the caller passes only persisted observation ids (no inline
+  // observations), hydrate them from the db so the resolver has inputs.
+  // This is the common path for the sight panel: POST /fix/resolve with
+  // lop_ids/cpl_ids collected from the pending list.
+  if (observations.length === 0 && (lopIds.length || cplIds.length)) {
+    observations = loadObservationsById(
+      input.db,
+      input.helpers,
+      lopIds,
+      cplIds,
+    );
+  }
   if (observations.length === 0) return null;
 
   const drPosition = input.drPosition ??
@@ -230,4 +282,5 @@ function confirmFix(db, candidate, engine, helpers, opts = {}) {
 module.exports = {
   resolveCandidateFix,
   confirmFix,
+  loadObservationsById,
 };

@@ -77,6 +77,11 @@ template.innerHTML = /* html */ `
     }
     .row { display: flex; gap: 0.5rem; }
     .row > label { flex: 1; }
+    .sight-time { display: flex; gap: 0.5rem; align-items: end; }
+    .sight-time > label { flex: 1; }
+    .sight-time .tz-toggle { flex: 0 0 auto; }
+    .sight-time .tz-toggle select { font: inherit; padding: 0.35rem; }
+    .check { display: flex; align-items: center; gap: 0.4rem; }
     .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; align-items: center; }
     .actions button {
       font: inherit;
@@ -181,6 +186,17 @@ template.innerHTML = /* html */ `
           <input name="bearing_true" type="number" step="0.1" required />
         </label>
       </div>
+      <div class="sight-time">
+        <label>Sight time
+          <input name="sight_time" type="datetime-local" step="1" required />
+        </label>
+        <label class="tz-toggle" title="Switch between local time and UTC">
+          <select name="sight_tz">
+            <option value="local">local</option>
+            <option value="utc">UTC</option>
+          </select>
+        </label>
+      </div>
       <fieldset class="coord" data-prefix="object">
         <legend>Object position (charted)</legend>
         <div class="coord-lat"></div>
@@ -204,6 +220,17 @@ template.innerHTML = /* html */ `
         </label>
         <label>Distance (nm)
           <output name="distance_nm">—</output>
+        </label>
+      </div>
+      <div class="sight-time">
+        <label>Sight time
+          <input name="sight_time" type="datetime-local" step="1" required />
+        </label>
+        <label class="tz-toggle" title="Switch between local time and UTC">
+          <select name="sight_tz">
+            <option value="local">local</option>
+            <option value="utc">UTC</option>
+          </select>
         </label>
       </div>
       <fieldset class="coord" data-prefix="center">
@@ -237,6 +264,21 @@ template.innerHTML = /* html */ `
           <option value="lower">lower</option>
           <option value="upper">upper</option>
         </select>
+      </label>
+      <div class="sight-time">
+        <label>Sight time
+          <input name="sight_time" type="datetime-local" step="1" required />
+        </label>
+        <label class="tz-toggle" title="Switch between local time and UTC">
+          <select name="sight_tz">
+            <option value="local">local</option>
+            <option value="utc">UTC</option>
+          </select>
+        </label>
+      </div>
+      <label class="check" title="Meridian-altitude sight → latitude LOP only. Combine with a longitude source (another LOP/CPL) for a full fix.">
+        <input type="checkbox" name="noon" />
+        Noon sight (meridian latitude — latitude LOP only)
       </label>
       <fieldset class="coord" data-prefix="assumed" data-optional="true">
         <legend>Assumed position (optional — DR used when blank)</legend>
@@ -292,6 +334,39 @@ class DrSightPanel extends HTMLElement {
     const vForm = root.querySelector("#form-vertical");
     vForm.addEventListener("input", () => this.updateVerticalDistance());
 
+    // Timezone toggle: re-express the current sight time in the newly
+    // selected zone (local ↔ UTC) so the displayed digits match the
+    // selected tz instead of silently reinterpreting them. Persists the
+    // choice to localStorage so it's remembered across sessions, and syncs
+    // the other forms' selects + re-seeds any non-user-edited time fields.
+    root.querySelectorAll('select[name="sight_tz"]').forEach((sel) => {
+      sel.value = this.loadSightTz();
+      sel.addEventListener("change", () => {
+        this.saveSightTz(sel.value);
+        // Sync the other two forms' selects to match.
+        root.querySelectorAll(`select[name="sight_tz"]`).forEach((s) => {
+          if (s !== sel) s.value = sel.value;
+        });
+        // Re-seed every non-dirty sight_time field in the new tz. A
+        // dirty field is a user value — convert it to the new zone in
+        // place so the digits keep meaning the same instant.
+        for (const form of root.querySelectorAll(".form")) {
+          const input = form.querySelector('input[name="sight_time"]');
+          if (!input || !input.value) continue;
+          if (input.dataset.dirty === "true") {
+            const other = sel.value === "utc" ? "local" : "utc";
+            const iso = vm.sightTimeToIso(input.value, other);
+            if (iso) input.value = vm.isoToSightTimeInput(iso, sel.value);
+          } else {
+            input.value = vm.isoToSightTimeInput(
+              new Date().toISOString(),
+              sel.value,
+            );
+          }
+        }
+      });
+    });
+
     // Mark assumed-position sub-fields dirty on manual edit so they
     // stop tracking the boat.
     root
@@ -303,6 +378,13 @@ class DrSightPanel extends HTMLElement {
           el.dataset.dirty = "true";
         });
       });
+    // Mark sight-time fields dirty on manual edit so the tz toggle
+    // converts them in place rather than re-seeding to now.
+    root.querySelectorAll('input[name="sight_time"]').forEach((el) => {
+      el.addEventListener("input", () => {
+        el.dataset.dirty = "true";
+      });
+    });
 
     root
       .querySelector("#close-btn")
@@ -538,6 +620,57 @@ class DrSightPanel extends HTMLElement {
   }
 
   /**
+   * Pre-fills each form's `sight_time` field with the current time
+   * when the dialog opens and the field is empty — the common case
+   * (recording a sight just taken on deck) needs no typing, but the
+   * navigator can still edit it for sights taken earlier. Honors the
+   * saved tz choice (local or UTC). Does not overwrite a value the user
+   * has already set.
+   *
+   * @returns {void}
+   */
+  seedSightTime() {
+    const now = new Date().toISOString();
+    const tz = this.loadSightTz();
+    for (const form of this.shadowRoot.querySelectorAll(".form")) {
+      const input = form.querySelector('input[name="sight_time"]');
+      if (!input || input.value) continue;
+      input.value = vm.isoToSightTimeInput(now, tz);
+    }
+  }
+
+  /** localStorage key for the remembered sight-timezone choice. */
+  static get SIGHT_TZ_KEY() {
+    return "dr-sight-tz";
+  }
+
+  /**
+   * Reads the remembered sight-timezone preference from localStorage.
+   * @returns {"local"|"utc"}
+   */
+  loadSightTz() {
+    try {
+      const v = localStorage.getItem(DrSightPanel.SIGHT_TZ_KEY);
+      return v === "utc" ? "utc" : "local";
+    } catch {
+      return "local";
+    }
+  }
+
+  /**
+   * Persists the sight-timezone preference to localStorage.
+   * @param {"local"|"utc"} tz
+   * @returns {void}
+   */
+  saveSightTz(tz) {
+    try {
+      localStorage.setItem(DrSightPanel.SIGHT_TZ_KEY, tz);
+    } catch {
+      /* storage unavailable — keep the session value */
+    }
+  }
+
+  /**
    * Pre-seeds an object-position fieldset from a chart pick (right-click
    * → "Add bearing to here" / "Distance CPL at here"). Switches to the
    * matching tab and fills the object/center coordinates (overwriting any
@@ -647,9 +780,15 @@ class DrSightPanel extends HTMLElement {
       }
 
       if (idKey === "lop_id" && result.lop_id != null) {
-        this.pendingIds.lop.push(result.lop_id);
+        this.pendingIds.lop.push({
+          id: result.lop_id,
+          label: this.describeLop(mode, data),
+        });
       } else if (idKey === "cpl_id" && result.cpl_id != null) {
-        this.pendingIds.cpl.push(result.cpl_id);
+        this.pendingIds.cpl.push({
+          id: result.cpl_id,
+          label: this.describeCpl(data),
+        });
       }
       this.renderPending();
       form.reset();
@@ -657,10 +796,16 @@ class DrSightPanel extends HTMLElement {
       form.querySelectorAll('[data-dirty="true"]').forEach((el) => {
         delete el.dataset.dirty;
       });
+      // form.reset() resets the tz select to its first option ("local");
+      // restore the saved preference so the next sight uses it.
+      const tzSel = form.querySelector('select[name="sight_tz"]');
+      if (tzSel) tzSel.value = this.loadSightTz();
       this.updateVerticalDistance();
       // Re-seed assumed position now that dirty flags are cleared.
       if (this.lastKnownPosition)
         this.setDefaultPosition(this.lastKnownPosition);
+      // Re-seed the sight time to now (reset cleared it).
+      this.seedSightTime();
       this.dispatchEvent(
         new CustomEvent("dr-observations-changed", { bubbles: true }),
       );
@@ -673,6 +818,35 @@ class DrSightPanel extends HTMLElement {
    * @param {HTMLFormElement} form
    * @returns {Record<string, string>}
    */
+  /**
+   * Builds a short human label for a just-added LOP so the pending
+   * list is readable (e.g. "lighthouse bearing 045°").
+   *
+   * @param {string} mode
+   * @param {Record<string,string>} data
+   * @returns {string}
+   */
+  describeLop(mode, data) {
+    if (mode === "celestial") {
+      return `${data.body ?? "celestial"} sight`;
+    }
+    return `${data.object || "object"} brg ${data.bearing_true ?? ""}°`;
+  }
+
+  /**
+   * Builds a short label for a just-added CPL (e.g. "lighthouse 0.46nm").
+   *
+   * @param {Record<string,string>} data
+   * @returns {string}
+   */
+  describeCpl(data) {
+    const nm = vm.verticalAngleDistanceNm(
+      Number(data.height_m),
+      Number(data.angle_deg),
+    );
+    return `${data.object || "object"} ${nm.toFixed(2)}nm`;
+  }
+
   readForm(form) {
     const data = {};
     for (const el of form.querySelectorAll("input, select")) {
@@ -718,6 +892,46 @@ class DrSightPanel extends HTMLElement {
   }
 
   /** @returns {void} */
+  /**
+   * Re-hydrates the pending list from the server: any persisted LOP/CPL
+   * not yet attached to a confirmed fix (`used_in_fix_id IS NULL`) is
+   * work-in-progress and should appear here. Called by dr-app when the
+   * dialog opens so a reload or dialog-close doesn't lose your pending
+   * observations. Idempotent — merges with locally-added ids.
+   *
+   * @returns {Promise<void>}
+   */
+  async hydratePending() {
+    this.seedSightTime();
+    try {
+      const res = await fetch(`${API}/observations?limit=200`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const have = (arr) => new Set(arr.map((o) => o.id));
+      const lopHave = have(this.pendingIds.lop);
+      const cplHave = have(this.pendingIds.cpl);
+      for (const l of data.lops ?? []) {
+        if (l.used_in_fix_id == null && !lopHave.has(l.lop_id)) {
+          this.pendingIds.lop.push({
+            id: l.lop_id,
+            label: `${l.body_or_object ?? l.lop_type} LOP`,
+          });
+        }
+      }
+      for (const c of data.cpls ?? []) {
+        if (c.used_in_fix_id == null && !cplHave.has(c.cpl_id)) {
+          this.pendingIds.cpl.push({
+            id: c.cpl_id,
+            label: `${c.source_object ?? "CPL"} r=${(c.radius_nm ?? 0).toFixed(1)}nm`,
+          });
+        }
+      }
+      this.renderPending();
+    } catch {
+      /* REST unavailable — keep the in-memory list */
+    }
+  }
+
   renderPending() {
     const ul = this.shadowRoot.querySelector("#pending");
     ul.innerHTML = "";
@@ -725,14 +939,14 @@ class DrSightPanel extends HTMLElement {
     if (total === 0) {
       ul.innerHTML = "<li>No pending observations</li>";
     } else {
-      for (const id of this.pendingIds.lop) {
+      for (const o of this.pendingIds.lop) {
         const li = document.createElement("li");
-        li.textContent = `LOP #${id}`;
+        li.textContent = `#${o.id} · ${o.label}`;
         ul.appendChild(li);
       }
-      for (const id of this.pendingIds.cpl) {
+      for (const o of this.pendingIds.cpl) {
         const li = document.createElement("li");
-        li.textContent = `CPL #${id}`;
+        li.textContent = `#${o.id} · ${o.label}`;
         ul.appendChild(li);
       }
     }
@@ -749,8 +963,8 @@ class DrSightPanel extends HTMLElement {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           source_type: "manual",
-          lop_ids: this.pendingIds.lop,
-          cpl_ids: this.pendingIds.cpl,
+          lop_ids: this.pendingIds.lop.map((o) => o.id),
+          cpl_ids: this.pendingIds.cpl.map((o) => o.id),
         }),
       });
       const data = await res.json();

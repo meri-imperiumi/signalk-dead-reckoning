@@ -184,6 +184,68 @@ function composeTackEntry(t) {
 }
 
 /**
+ * Composes a `NewEntry`-shaped body for a standalone observation
+ * (SPEC §9.5): a bearing LOP, a vertical-angle CPL, or a celestial
+ * sight. Logged when the observation is recorded — independent of
+ * whether it ever resolves into a fix — because taking the sight is
+ * itself a navigational event. The `position` is the relevant charted/
+ * assumed/object position; `text` describes what was observed.
+ *
+ * @param {object} o
+ * @param {"bearing"|"vertical"|"celestial"} o.kind
+ * @param {string} [o.body_or_object] - body name (celestial) or object label
+ * @param {string} o.datetime - ISO timestamp
+ * @param {string|null} [o.confirmed_by] - watchkeeper (author)
+ * @param {number} [o.latitude] - position to anchor the entry
+ * @param {number} [o.longitude]
+ * @param {object} [o.reduction] - celestial reduction (Hc/Ho/Zn/intercept)
+ * @param {number|null} [o.sea_state] - WMO sea state code 0-9
+ * @returns {object} POST /logs body
+ */
+function composeObservationEntry(o) {
+  const where =
+    Number.isFinite(o.latitude) && Number.isFinite(o.longitude)
+      ? formatPosition(o.latitude, o.longitude)
+      : null;
+  let text;
+  if (o.kind === "celestial") {
+    const r = o.reduction ?? {};
+    const ic = Number.isFinite(r.intercept_nm)
+      ? `, intercept ${Math.abs(r.intercept_nm).toFixed(2)} nm ${
+          r.intercept_nm >= 0 ? "toward" : "away"
+        }`
+      : "";
+    const zn = Number.isFinite(r.azimuth_true)
+      ? `, Zn ${r.azimuth_true.toFixed(1)}°`
+      : "";
+    text = `${o.body_or_object ?? "Body"} sight${zn}${ic}`;
+  } else if (o.kind === "vertical") {
+    text = `${o.body_or_object ?? "object"} CPL`;
+  } else {
+    text = `${o.body_or_object ?? "object"} bearing`;
+  }
+  if (where) text += ` (${where})`;
+  const body = {
+    datetime: o.datetime,
+    text,
+    category: "navigation",
+    origin: "agent",
+  };
+  if (o.confirmed_by) body.author = o.confirmed_by;
+  if (where) {
+    body.position = {
+      latitude: o.latitude,
+      longitude: o.longitude,
+      source: o.kind === "celestial" ? "Celestial" : "DR",
+    };
+  }
+  if (Number.isFinite(o.sea_state)) {
+    body.observations = { seaState: Math.round(o.sea_state) };
+  }
+  return body;
+}
+
+/**
  * Creates a logbook REST client (the signalk-dsc transport pattern).
  *
  * @param {object} opts
@@ -327,6 +389,7 @@ module.exports = {
   composeFixEntry,
   composeFixText,
   composeTackEntry,
+  composeObservationEntry,
   createLogbookClient,
   createAccessRequestClient,
   newClientId,

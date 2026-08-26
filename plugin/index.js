@@ -26,6 +26,8 @@ const {
   listFixes,
   listLinesOfPosition,
   listCircularPositionLines,
+  getLineOfPosition,
+  getCircularPositionLine,
   listCorrections,
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
@@ -43,7 +45,7 @@ const {
   attachObservationsToFix,
 } = require("./db.js");
 const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
-const { reduceSight } = require("./celestial.js");
+const { reduceSight, reduceNoonSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
 const { computeRadius } = require("./uncertainty.js");
 const {
@@ -56,6 +58,7 @@ const {
 const {
   composeFixEntry,
   composeTackEntry,
+  composeObservationEntry,
   createLogbookClient,
   createAccessRequestClient,
   newClientId,
@@ -226,6 +229,7 @@ const deps = {
   divergenceTick,
   composeFixEntry,
   composeTackEntry,
+  composeObservationEntry,
   createLogbookClient,
   createAccessRequestClient,
   newClientId,
@@ -233,6 +237,8 @@ const deps = {
   listFixes,
   listLinesOfPosition,
   listCircularPositionLines,
+  getLineOfPosition,
+  getCircularPositionLine,
   listCorrections,
   DeadReckoningEngine,
   MatrixStore,
@@ -1177,6 +1183,21 @@ module.exports = (app) => {
         body_or_object: b.body_or_object ?? null,
         confirmed_by: b.confirmed_by ?? null,
       });
+      // §9.5: log the observation as a navigational event (taking the
+      // sight is loggable independent of a later fix). Fire-and-forget.
+      const obsBy = b.confirmed_by || usernameFromCookies(req.cookies) || null;
+      writeLogbookEntry(
+        deps.composeObservationEntry({
+          kind: "bearing",
+          datetime: b.timestamp ?? new Date().toISOString(),
+          body_or_object: b.body_or_object ?? null,
+          confirmed_by: obsBy,
+          latitude: b.assumed_lat,
+          longitude: b.assumed_lon,
+          sea_state:
+            resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
+        }),
+      ).catch(() => {});
       res.json({ lop_id: id });
     });
 
@@ -1214,6 +1235,19 @@ module.exports = (app) => {
         source_object: b.source_object ?? null,
         confirmed_by: b.confirmed_by ?? null,
       });
+      const obsBy = b.confirmed_by || usernameFromCookies(req.cookies) || null;
+      writeLogbookEntry(
+        deps.composeObservationEntry({
+          kind: "vertical",
+          datetime: b.timestamp ?? new Date().toISOString(),
+          body_or_object: b.source_object ?? null,
+          confirmed_by: obsBy,
+          latitude: b.center_lat,
+          longitude: b.center_lon,
+          sea_state:
+            resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
+        }),
+      ).catch(() => {});
       res.json({ cpl_id: id });
     });
 
@@ -1243,10 +1277,13 @@ module.exports = (app) => {
      *
      * Body:
      *   { body, hs_deg, index_correction_deg?, eye_height_m?, epoch_ms,
-     *     assumed_position?, limb?, confirmed_by?, time_sync_staleness_s? }
+     *     assumed_position?, limb?, confirmed_by?, time_sync_staleness_s?,
+     *     noon? }
      * `body` is 'Sun', 'Moon', or a bundled star name. `epoch_ms` is the
      * sight time (UTC ms). The DR position is used as the reduction point
-     * unless `assumed_position` is supplied (design Q4).
+     * unless `assumed_position` is supplied (design Q4). `noon: true` selects
+     * the local-apparent-noon Sun reduction: a meridian-altitude latitude
+     * sight (Lat = Dec ± z), emitted as an east-west LOP with zero intercept.
      */
     router.post("/celestial/sight", (req, res) => {
       if (!engine || !db) {
@@ -1260,7 +1297,8 @@ module.exports = (app) => {
       }
       let result;
       try {
-        result = reduceSight({
+        const reducer = b.noon ? reduceNoonSight : reduceSight;
+        result = reducer({
           body: b.body,
           hs_deg: b.hs_deg,
           index_correction_deg: b.index_correction_deg,
@@ -1286,6 +1324,23 @@ module.exports = (app) => {
         body_or_object: result.body,
         confirmed_by: b.confirmed_by ?? null,
       });
+      const obsBy = b.confirmed_by || usernameFromCookies(req.cookies) || null;
+      writeLogbookEntry(
+        deps.composeObservationEntry({
+          kind: "celestial",
+          datetime: new Date(b.epoch_ms).toISOString(),
+          body_or_object: result.body,
+          confirmed_by: obsBy,
+          latitude: result.assumed_lat,
+          longitude: result.assumed_lon,
+          reduction: {
+            azimuth_true: result.azimuth_true,
+            intercept_nm: result.intercept_nm,
+          },
+          sea_state:
+            resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
+        }),
+      ).catch(() => {});
       res.json({
         lop_id: lopId,
         reduction: {
@@ -1335,6 +1390,11 @@ module.exports = (app) => {
         },
         drPosition: engine.origin ?? undefined,
         engine,
+        db,
+        helpers: {
+          getLineOfPosition: deps.getLineOfPosition,
+          getCircularPositionLine: deps.getCircularPositionLine,
+        },
       });
       if (!candidate) {
         res.status(400).json({ message: "observations not resolvable" });
@@ -1399,6 +1459,11 @@ module.exports = (app) => {
             cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
           },
           engine,
+          db,
+          helpers: {
+            getLineOfPosition: deps.getLineOfPosition,
+            getCircularPositionLine: deps.getCircularPositionLine,
+          },
         });
       } else {
         candidate = deps.resolveCandidateFix({
@@ -1410,6 +1475,11 @@ module.exports = (app) => {
           },
           drPosition: engine.origin ?? undefined,
           engine,
+          db,
+          helpers: {
+            getLineOfPosition: deps.getLineOfPosition,
+            getCircularPositionLine: deps.getCircularPositionLine,
+          },
         });
       }
       if (!candidate) {

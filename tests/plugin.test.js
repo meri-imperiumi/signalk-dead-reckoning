@@ -11,6 +11,7 @@ const { tmpdir } = require("node:os");
 const { DatabaseSync } = require("node:sqlite");
 
 const makePlugin = require("../plugin/index.js");
+const celestial = require("../plugin/celestial.js");
 const { FakeSignalKApp, FakeRouter } = require("./fake-app.js");
 
 let tempDir;
@@ -718,6 +719,52 @@ test("POST /celestial/sight returns 400 for a below-cutoff sight", async () => {
   });
   assert.strictEqual(status, 400);
   assert.ok(/refraction cutoff/.test(body.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /celestial/sight with noon: true reduces a meridian sight to a latitude LOP", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-noon-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 40, longitude: -75 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const t = new Date("2026-06-21T17:00:00Z").getTime();
+  // Ho at 40N meridian transit ≈ 73.4°; back out a lower-limb Hs.
+  const trueHo = 90 - Math.abs(40 - 23.44);
+  const hs = trueHo + celestial.dipArcmin(3) / 60 - 0.2666;
+  const { status, body } = router.invoke("post", "/celestial/sight", {
+    body: "Sun",
+    hs_deg: hs,
+    eye_height_m: 3,
+    epoch_ms: t,
+    limb: "lower",
+    noon: true,
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.lop_id > 0);
+  // The noon reduction recovers a latitude near 40.
+  assert.ok(Math.abs(body.reduction.assumed_lat - 40) < 0.5);
+  assert.strictEqual(body.reduction.intercept_nm, 0);
+  assert.ok(
+    body.reduction.azimuth_true === 0 || body.reduction.azimuth_true === 180,
+  );
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -1561,4 +1608,77 @@ test("POST /fix leaves confirmed_by null when anonymous", () => {
   );
   assert.strictEqual(r.status, 200);
   assert.strictEqual(r.body.confirmed_by, null);
+});
+
+test("logbook: posting a bearing LOP writes an observation entry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-obs-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 201 };
+  };
+  try {
+    plugin.start({ logbook: { enabled: true, token: "tok" } });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const { status } = router.invoke("post", "/fix/lop", {
+      lop_type: "bearing",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 135,
+      body_or_object: "lighthouse",
+    });
+    assert.strictEqual(status, 200);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(posts.length, 1, "observation logbook entry POSTed");
+    const entry = posts[0].body;
+    assert.strictEqual(entry.category, "navigation");
+    assert.match(entry.text, /lighthouse bearing/);
+    assert.strictEqual(entry.position.source, "DR");
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: posting a celestial sight writes a sight entry with reduction", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-sight-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 201 };
+  };
+  try {
+    plugin.start({ logbook: { enabled: true, token: "tok" } });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const { status } = router.invoke("post", "/celestial/sight", {
+      body: "Sun",
+      hs_deg: 45,
+      epoch_ms: Date.UTC(2025, 5, 21, 12, 0, 0),
+      eye_height_m: 2,
+    });
+    assert.strictEqual(status, 200);
+    await new Promise((r) => setTimeout(r, 100));
+    const sightEntries = posts.filter((p) => /sight$|sight,/.test(p.body.text));
+    assert.ok(sightEntries.length >= 1, "celestial sight entry POSTed");
+    const entry = sightEntries[0].body;
+    assert.strictEqual(entry.category, "navigation");
+    assert.strictEqual(entry.position.source, "Celestial");
+    assert.match(entry.text, /Sun sight/);
+    assert.match(entry.text, /intercept/);
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
 });

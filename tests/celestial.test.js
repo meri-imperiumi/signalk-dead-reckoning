@@ -239,3 +239,86 @@ test("reduceSight: unknown star without almanac throws", () => {
     /unknown body/,
   );
 });
+
+test("reduceNoonSight: recovers observer latitude (Sun south of observer)", () => {
+  // Observer at 40N, Sun on the meridian due south. Ho = 90 - (lat - dec).
+  // Pick the June solstice (dec ≈ 23.44) and local noon at 75W.
+  const t = new Date("2026-06-21T17:00:00Z").getTime(); // noon at ~75W
+  const dr = { latitude: 40, longitude: -75 };
+  const gp = celestial.sunGeographicPosition(t);
+  const dec = gp.declination_deg;
+  // Expected meridian altitude (Ho) at 40N with the Sun due south.
+  const trueHo = 90 - Math.abs(40 - dec);
+  // Back out Hs for a lower-limb sight: Hs = Ho + dip + refr - SD.
+  const sd = 0.2666;
+  const dip = celestial.dipArcmin(3) / 60;
+  const refr = celestial.refractionArcmin(trueHo) / 60;
+  const hs = trueHo + dip + refr - sd;
+  const r = celestial.reduceNoonSight({
+    body: "Sun",
+    hs_deg: hs,
+    eye_height_m: 3,
+    epoch_ms: t,
+    dr_position: dr,
+    limb: "lower",
+  });
+  assert.ok(Math.abs(r.assumed_lat - 40) < 0.5, `lat ${r.assumed_lat}`);
+  assert.strictEqual(r.assumed_lon, -75);
+  assert.strictEqual(r.azimuth_true, 180); // Sun due south
+  assert.strictEqual(r.intercept_nm, 0);
+  assert.strictEqual(r.lha_deg, 0);
+});
+
+test("reduceNoonSight: Sun north of observer (southern hemisphere)", () => {
+  // Observer at 40S; at the June solstice the Sun is north of them.
+  const t = new Date("2026-06-21T17:00:00Z").getTime();
+  const dr = { latitude: -40, longitude: -75 };
+  const gp = celestial.sunGeographicPosition(t);
+  const dec = gp.declination_deg;
+  const trueHo = 90 - Math.abs(-40 - dec); // dec≈23.44, so |−40−23.44|=63.44
+  const sd = 0.2666;
+  const dip = celestial.dipArcmin(3) / 60;
+  const refr = celestial.refractionArcmin(trueHo) / 60;
+  const hs = trueHo + dip + refr - sd;
+  const r = celestial.reduceNoonSight({
+    body: "Sun",
+    hs_deg: hs,
+    eye_height_m: 3,
+    epoch_ms: t,
+    dr_position: dr,
+    limb: "lower",
+  });
+  assert.ok(Math.abs(r.assumed_lat - -40) < 0.5, `lat ${r.assumed_lat}`);
+  assert.strictEqual(r.azimuth_true, 0); // Sun due north
+  assert.strictEqual(r.intercept_nm, 0);
+});
+
+test("reduceNoonSight: rejects non-Sun bodies", () => {
+  assert.throws(() =>
+    celestial.reduceNoonSight({
+      body: "Moon",
+      hs_deg: 45,
+      epoch_ms: Date.now(),
+      dr_position: { latitude: 40, longitude: -75 },
+    }),
+  );
+});
+
+test("reduceNoonSight: produces an east-west LOP (azimuth 0 or 180)", () => {
+  // The LOP convention: normal = (sin θ, cos θ). For θ=180° the normal
+  // is (0, -1) → line runs east-west. Either noon azimuth satisfies this.
+  const t = new Date("2026-06-21T17:00:00Z").getTime();
+  const dr = { latitude: 40, longitude: -75 };
+  const gp = celestial.sunGeographicPosition(t);
+  const trueHo = 90 - Math.abs(40 - gp.declination_deg);
+  const hs = trueHo + celestial.dipArcmin(3) / 60 - 0.2666;
+  const r = celestial.reduceNoonSight({
+    body: "Sun",
+    hs_deg: hs,
+    eye_height_m: 3,
+    epoch_ms: t,
+    dr_position: dr,
+    limb: "lower",
+  });
+  assert.ok(r.azimuth_true === 0 || r.azimuth_true === 180);
+});

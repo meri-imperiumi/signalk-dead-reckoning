@@ -371,6 +371,97 @@ function reduceSight(input) {
   };
 }
 
+/**
+ * Reduces a noon (local-apparent-noon) Sun sight to a latitude LOP.
+ *
+ * At LAN the Sun is on the observer's meridian, due north or due south,
+ * so the sight yields latitude directly by the meridian-altitude formula
+ *
+ *   Lat = Dec ± z,  where z = 90° − Ho is the zenith distance.
+ *
+ * The sign is + (Dec + z) when the Sun is south of the observer
+ * (Dec < assumed latitude), − (Dec − z) when the Sun is north. This is
+ * a single-sight latitude fix — no assumed-position dependency, no
+ * intercept — but it still produces an LOP (a parallel of latitude,
+ * azimuth 0°/180° → east-west line, intercept 0) so it flows through the
+ * existing recordLineOfPosition / fix-resolver pipeline unchanged.
+ *
+ * A companion longitude sight (or the DR longitude) then gives a full
+ * fix; the noon latitude LOP crosses any other LOP/CPL normally.
+ *
+ * Note: longitude by equal-altitude averaging (the technique of taking
+ * matching sights before and after culmination to find the exact moment
+ * of LAN, then longitude from GHA + the equation of time) is a separate
+ * procedure and out of scope here — this reduction covers only the
+ * meridian-altitude latitude.
+ *
+ * @param {SightInput} input - `body` must be "Sun"; `assumed_position` or
+ *   `dr_position` supplies the longitude to anchor the LOP and the
+ *   hemisphere test (latitude is computed, not used as assumed).
+ * @returns {SightResult} with `azimuth_true` 0 or 180 and `intercept_nm` 0;
+ *   `assumed_lat` is the computed latitude, `hc_deg` is the computed
+ *   meridian altitude at the DR latitude (for UI diagnostics only).
+ */
+function reduceNoonSight(input) {
+  if (input.body !== "Sun") {
+    throw new Error("noon sight requires the Sun");
+  }
+  const assumed = input.assumed_position ?? input.dr_position;
+  if (!assumed) {
+    throw new Error("noon sight requires an assumed/dr position for longitude");
+  }
+  const epochMs = input.epoch_ms;
+
+  // 1. Sun declination at the sight time.
+  const gp = sunGeographicPosition(epochMs);
+  const dec = gp.declination_deg;
+
+  // 2. Ho from Hs (same corrections as a normal sight; limb sights apply).
+  const sd = 0.2666;
+  const semiDiameterDeg =
+    input.limb === "upper" ? -sd : input.limb === "lower" ? sd : null;
+  const { ho_deg } = correctAltitude({
+    hs_deg: input.hs_deg,
+    index_correction_deg: input.index_correction_deg,
+    eye_height_m: input.eye_height_m,
+    semi_diameter_deg: semiDiameterDeg,
+    parallax_deg: null,
+  });
+
+  // Refuse low sights (same 5° cutoff as the intercept method).
+  if (ho_deg < 5) {
+    throw new Error(
+      `noon sight below the 5° cutoff (Ho=${ho_deg.toFixed(1)}°)`,
+    );
+  }
+
+  // 3. Zenith distance and latitude. Sun south of observer → Lat = Dec + z;
+  // Sun north → Lat = Dec − z. Decide from the DR/assumed latitude.
+  const z = 90 - ho_deg;
+  const sunSouth = dec < assumed.latitude;
+  const latitude = sunSouth ? dec + z : dec - z;
+
+  // Azimuth: 180° (due south) when the Sun is south of the observer,
+  // 0° (due north) when it's north. Either yields an east-west LOP.
+  const azimuth = sunSouth ? 180 : 0;
+
+  // Diagnostic: the meridian altitude computed at the DR latitude.
+  const hc_deg = 90 - Math.abs(assumed.latitude - dec);
+
+  return {
+    body: input.body,
+    assumed_lat: latitude,
+    assumed_lon: assumed.longitude,
+    azimuth_true: azimuth,
+    intercept_nm: 0,
+    intercept_direction: "toward",
+    hc_deg,
+    ho_deg,
+    lha_deg: 0, // by definition on the meridian
+    time_sync_staleness_s: input.time_sync_staleness_s ?? null,
+  };
+}
+
 module.exports = {
   gmstDeg,
   raFromEcliptic,
@@ -383,4 +474,5 @@ module.exports = {
   dipArcmin,
   correctAltitude,
   reduceSight,
+  reduceNoonSight,
 };

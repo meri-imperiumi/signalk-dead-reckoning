@@ -305,6 +305,37 @@ test("verticalAngleDistanceNm: height/tan(angle) converted to nm", async () => {
   assert.strictEqual(vm.verticalAngleDistanceNm(10, 0), Infinity);
 });
 
+test("sightTimeToIso/epochMs: UTC parsing with seconds", async () => {
+  const vm = await loadVm();
+  // 2025-01-01T00:00:30Z
+  const iso = vm.sightTimeToIso("2025-01-01T00:00:30", "utc");
+  assert.strictEqual(iso, "2025-01-01T00:00:30.000Z");
+  const ms = vm.sightTimeToEpochMs("2025-01-01T00:00:30", "utc");
+  assert.strictEqual(ms, 1735689630000);
+  // Empty/invalid → null
+  assert.strictEqual(vm.sightTimeToIso("", "utc"), null);
+  assert.strictEqual(vm.sightTimeToEpochMs("not-a-date", "utc"), null);
+});
+
+test("sightTimeToIso: local tz uses the browser zone", async () => {
+  const vm = await loadVm();
+  // A naive string parsed as local must differ from the UTC-parsed one
+  // by the local offset (whatever it is). Just assert they differ in
+  // zones other than UTC, and match in UTC. Use a known fixed input.
+  const local = vm.sightTimeToIso("2025-06-21T12:00:00", "local");
+  const utc = vm.sightTimeToIso("2025-06-21T12:00:00", "utc");
+  // In the UTC zone they'd be equal; everywhere else they differ.
+  const offsetMin = new Date("2025-06-21T12:00:00").getTimezoneOffset();
+  if (offsetMin !== 0) assert.notStrictEqual(local, utc);
+  else assert.strictEqual(local, utc);
+});
+
+test("isoToSightTimeInput: round-trips with seconds in UTC", async () => {
+  const vm = await loadVm();
+  const s = vm.isoToSightTimeInput("2025-01-01T00:00:30.000Z", "utc");
+  assert.strictEqual(s, "2025-01-01T00:00:30");
+});
+
 test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing line", async () => {
   const vm = await loadVm();
   const body = vm.bearingLopBody({
@@ -323,6 +354,18 @@ test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing 
   assert.strictEqual(body.assumed_lat, 60);
   assert.strictEqual(body.assumed_lon, 24);
   assert.strictEqual(body.body_or_object, "lighthouse");
+  // Sight time flows through as a timestamp (UTC ISO).
+  const tsBody = vm.bearingLopBody({
+    object: "lighthouse",
+    bearing_true: 45,
+    object_lat: 60,
+    object_lon: 24,
+    sight_time: "2025-01-01T00:00:00",
+    sight_tz: "utc",
+  });
+  assert.strictEqual(tsBody.timestamp, "2025-01-01T00:00:00.000Z");
+  // No sight_time → no timestamp field (server defaults to now).
+  assert.ok(!("timestamp" in body));
 });
 
 test("verticalAngleCplBody: center + radius from height/angle", async () => {
@@ -338,6 +381,17 @@ test("verticalAngleCplBody: center + radius from height/angle", async () => {
   assert.strictEqual(body.center_lat, 60.01);
   closeTo(body.radius_nm, 0.4639, 0.001, "radius");
   assert.strictEqual(body.source_object, "lighthouse");
+  // Vertical CPL also carries the sight timestamp.
+  const tsBody = vm.verticalAngleCplBody({
+    object: "lighthouse",
+    height_m: 30,
+    angle_deg: 2,
+    center_lat: 60.01,
+    center_lon: 24.01,
+    sight_time: "2025-01-01T00:00:00",
+    sight_tz: "utc",
+  });
+  assert.strictEqual(tsBody.timestamp, "2025-01-01T00:00:00.000Z");
 });
 
 test("celestialSightBody: required + optional fields, assumed position shape", async () => {
@@ -348,7 +402,9 @@ test("celestialSightBody: required + optional fields, assumed position shape", a
     index_correction_deg: -1.2,
     eye_height_m: 3,
     limb: "lower",
-    epoch_ms: 1735689600000,
+    // 2025-01-01T00:00:00Z → epoch 1735689600000
+    sight_time: "2025-01-01T00:00:00",
+    sight_tz: "utc",
     assumed_lat: 60,
     assumed_lon: 24,
     confirmed_by: "Bob",
@@ -358,6 +414,7 @@ test("celestialSightBody: required + optional fields, assumed position shape", a
   assert.strictEqual(body.index_correction_deg, -1.2);
   assert.strictEqual(body.eye_height_m, 3);
   assert.strictEqual(body.limb, "lower");
+  assert.strictEqual(body.epoch_ms, 1735689600000);
   assert.deepStrictEqual(body.assumed_position, {
     latitude: 60,
     longitude: 24,
@@ -367,10 +424,22 @@ test("celestialSightBody: required + optional fields, assumed position shape", a
   const minimal = vm.celestialSightBody({
     body: "Vega",
     hs_deg: 30,
-    epoch_ms: 1735689600000,
+    sight_time: "2025-01-01T00:00:00",
+    sight_tz: "utc",
   });
   assert.strictEqual(minimal.body, "Vega");
+  assert.strictEqual(minimal.epoch_ms, 1735689600000);
   assert.ok(!("index_correction_deg" in minimal));
   assert.ok(!("limb" in minimal));
   assert.ok(!("assumed_position" in minimal));
+  assert.ok(!("noon" in minimal));
+  // noon flag forwards to the body.
+  const noonBody = vm.celestialSightBody({
+    body: "Sun",
+    hs_deg: 73,
+    sight_time: "2025-06-21T17:00:00",
+    sight_tz: "utc",
+    noon: true,
+  });
+  assert.strictEqual(noonBody.noon, true);
 });

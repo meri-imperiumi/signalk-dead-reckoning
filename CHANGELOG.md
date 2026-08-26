@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `POST /fix/resolve` and `POST /fix` no longer return `observations not
+  resolvable` when called with only `lop_ids`/`cpl_ids` (the common sight
+  panel path). The pipeline now hydrates the observation bodies from the
+  database via the new `getLineOfPosition`/`getCircularPositionLine` db
+  helpers, then runs the geometric resolver on them.
+
 ### Added
+- Noon Sun sight reduction (SPEC §13): `POST /celestial/sight` with
+  `noon: true` reduces a local-apparent-noon meridian-altitude sight to
+  latitude directly (Lat = Dec ± z) via `reduceNoonSight`, emitted as an
+  east-west LOP with zero intercept — a single-sight latitude fix that
+  crosses any other LOP/CPL normally through the existing pipeline.
+- Observations logged to the logbook on creation (SPEC §9.5): a bearing
+  LOP, vertical-angle CPL, or celestial sight writes a `navigation` entry
+  via `composeObservationEntry` — taking the sight is itself a navigational
+  event, independent of whether it later resolves into a fix. The entry's
+  `position` is the assumed/object/charted position; `text` describes what
+  was observed (body name, Zn, intercept for celestial).
 - Initial project scaffold: package metadata, CI workflows, plugin entry
   point with subscription/start/stop structure, SQLite schema layer,
   dead-reckoning vector-integration engine, EMA matrix store, unified fix
@@ -47,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Chart pick**: right-click (or long-press) a charted object to get
     a context menu ("Add bearing to here" / "Distance CPL at here") that
     opens the sight dialog with the object position pre-seeded.
+  - **Pending list survives reload**: observations are persisted
+    server-side; reopening the dialog re-hydrates the pending list from
+    any unattached LOPs/CPLs (`used_in_fix_id IS NULL`), so a page
+    reload or dialog close doesn't lose work-in-progress. Each item
+    shows a readable label (e.g. "#5 · lighthouse brg 045°",
+    "#3 · lighthouse 0.46nm"). The candidate itself is a computed preview
+    (not persisted) but can be re-derived with "Resolve candidate".
   - **Bearing LOP semantics corrected**: a bearing is taken to a known
     charted object, so the form collects the *object's* position (not the
     observer's assumed position). The view-model shaper rotates the

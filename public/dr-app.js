@@ -171,15 +171,18 @@ class DrApp extends HTMLElement {
     // dialog with the object position pre-seeded.
     this.map?.addEventListener("dr-pick-position", (e) => {
       const { lat, lng, mode } = e.detail;
-      this.sightDialog?.showModal();
+      openSight();
       this.sight?.seedObjectPosition(lat, lng, mode);
     });
 
     /** @type {HTMLDialogElement|null} */
     this.sightDialog = root.querySelector("#sight-dialog");
-    root
-      .querySelector("#btn-sight")
-      ?.addEventListener("click", () => this.sightDialog?.showModal());
+    /** Open the sight dialog and re-hydrate pending observations. */
+    const openSight = () => {
+      this.sightDialog?.showModal();
+      this.sight?.hydratePending();
+    };
+    root.querySelector("#btn-sight")?.addEventListener("click", openSight);
 
     /** @type {import("./dr-sight-panel.js").default|null} */
     this.sight = root.querySelector("#dr-sight");

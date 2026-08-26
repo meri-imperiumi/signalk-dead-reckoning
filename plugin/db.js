@@ -452,6 +452,42 @@ function listFixes(db, q = {}) {
 }
 
 /**
+ * Fetches a single line of position by id (for resolving a fix from
+ * persisted observation ids without the client re-sending the
+ * observation bodies).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @returns {object|null}
+ */
+function getLineOfPosition(db, id) {
+  return db
+    .prepare(
+      `SELECT lop_id, timestamp, lop_type, assumed_lat, assumed_lon,
+              azimuth_true, intercept_nm, body_or_object, used_in_fix_id
+       FROM lines_of_position WHERE lop_id = ?`,
+    )
+    .get(id);
+}
+
+/**
+ * Fetches a single circular position line by id.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} id
+ * @returns {object|null}
+ */
+function getCircularPositionLine(db, id) {
+  return db
+    .prepare(
+      `SELECT cpl_id, timestamp, cpl_type, center_lat, center_lon,
+              radius_nm, source_object, used_in_fix_id
+       FROM circular_position_lines WHERE cpl_id = ?`,
+    )
+    .get(id);
+}
+
+/**
  * Lists persisted lines of position for the UI (SPEC §14.1 LOP overlay).
  *
  * @param {import("node:sqlite").DatabaseSync} db
@@ -522,6 +558,8 @@ module.exports = {
   getDeviationRateStats,
   markFixLogged,
   listFixes,
+  getLineOfPosition,
+  getCircularPositionLine,
   listLinesOfPosition,
   listCircularPositionLines,
   listCorrections,
