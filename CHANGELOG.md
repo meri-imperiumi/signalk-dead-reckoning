@@ -70,3 +70,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stop if live. Also publishes
   `navigation.deadReckoning.divergence` `{distance_nm, bearing_true}`
   each tick — the §14.1 live divergence readout input.
+- Logbook integration (SPEC §9.4, §9.5): `plugin/logbook.js` with
+  §9.5 field-mapped fix-entry composition (explicit `datetime`,
+  DR-log for `log` per §10.3, per-source_type text templates,
+  `origin: agent`, closed-schema observations), auto tack/gybe
+  entries, and a REST client sending auth as both Bearer header and
+  JAUTHENTICATION cookie (the signalk-dsc pattern; no `app.fetch` —
+  verified against signalk-server 2.29.0). Token acquisition via
+  the server's Access Requests flow: stable persisted clientId,
+  `permissions: "admin"` requested explicitly (plugin routes are
+  admin-gated — verified), 30s approval polling, DENIED stops
+  polling, 401/403 drops the token and re-requests; a config token
+  short-circuits and 501/404 falls back to unauthenticated writes.
+  Confirmed fixes write through fire-and-forget and mark
+  `logged_to_logbook`/`logbook_entry_ref` on success (`db.markFixLogged`);
+  the GPS auto-seed snap does not (not human-confirmed). Maneuver
+  classification from the AWA change across the §6.4 transient
+  window (pre-maneuver AWA captured at window open; tack = bow
+  through the wind within ±90°, gybe = stern through within ±60° of
+  downwind), debounced (default 120s) so a beat doesn't flood the
+  log; the window now also requires the heading itself to
+  re-stabilize (±5°) before closing, so the logged course is the
+  settled one. `environment.seaState` (and the logbook's actual
+  `environment.water.swell.state`) now feed `sea_state` everywhere —
+  bins, dr_corrections, and polygon rates become condition-specific
+  for real.

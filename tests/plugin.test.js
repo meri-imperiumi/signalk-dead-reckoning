@@ -1022,3 +1022,247 @@ function latestNotification(app, path) {
     .filter((v) => v.path === path);
   return vals.length ? vals[vals.length - 1].value : undefined;
 }
+
+test("logbook: confirmed fix writes entry and marks the fixes row", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-fix-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  // Injectable fetch recorder via deps override isn't available here;
+  // the logbook client is created by initLogbook with default fetch.
+  // Instead: enable with a config token and stub globalThis.fetch.
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 201 };
+  };
+  try {
+    plugin.start({ logbook: { enabled: true, token: "tok" } });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    const { status, body } = router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    assert.strictEqual(status, 200);
+    // The POST is async fire-and-forget; give it a beat.
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(posts.length, 1, "one logbook entry POSTed");
+    assert.ok(posts[0].url.includes("/plugins/signalk-logbook/logs"));
+    const entry = posts[0].body;
+    assert.strictEqual(entry.origin, "agent");
+    assert.strictEqual(entry.category, "navigation");
+    assert.strictEqual(entry.author, "Alice");
+    assert.strictEqual(entry.position.source, "GPS");
+    assert.ok(/GPS fix confirmed by Alice/.test(entry.text));
+    assert.ok(entry.datetime); // explicit, never `ago`
+
+    // fixes row marked with the entry ref
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    const row = db
+      .prepare(
+        "SELECT logged_to_logbook, logbook_entry_ref FROM fixes WHERE fix_id = ?",
+      )
+      .get(body.fix_id);
+    assert.strictEqual(row.logged_to_logbook, 1);
+    assert.strictEqual(row.logbook_entry_ref, entry.datetime);
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: disabled by default — no entry, fix still confirmed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-off-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 201 };
+  };
+  try {
+    plugin.start({});
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    const { status, body } = router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+    });
+    assert.strictEqual(status, 200);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(posts.length, 0);
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    const row = db
+      .prepare("SELECT logged_to_logbook FROM fixes WHERE fix_id = ?")
+      .get(body.fix_id);
+    assert.strictEqual(row.logged_to_logbook, 0);
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("sea state from environment.water.swell.state flows into dr_corrections", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-sea-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "environment.water.swell.state", value: 3 },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  const { status, body } = router.invoke("post", "/fix", {
+    latitude: 60.001,
+    longitude: 24.001,
+    source_type: "gps",
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.correction_id != null);
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const row = db
+    .prepare("SELECT sea_state FROM dr_corrections WHERE correction_id = ?")
+    .get(body.correction_id);
+  assert.strictEqual(row.sea_state, "3");
+  db.close();
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: completed tack writes one entry, debounced for a second maneuver", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-tack-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 201 };
+  };
+  try {
+    // Short settle + debounce so the test runs fast; fast tick so ROT
+    // accumulates over seconds, not ticks. Settle (1s) must elapse after
+    // the turn before the entry fires, and the debounce (10s) keeps the
+    // second maneuver suppressed for the remainder of the test.
+    plugin.start({
+      tickIntervalMs: 100,
+      logbook: { enabled: true, token: "tok", tackDebounceS: 10 },
+      training: { settleSustainS: 1 },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const emit = (heading, awaRad) =>
+      app.emitDelta({
+        context: "vessels.self",
+        updates: [
+          {
+            values: [
+              {
+                path: "navigation.position",
+                value: { latitude: 60, longitude: 24 },
+              },
+              { path: "navigation.speedThroughWater", value: 5 },
+              { path: "navigation.headingTrue", value: heading },
+              { path: "environment.wind.angleApparent", value: awaRad },
+            ],
+          },
+        ],
+      });
+    // Steady starboard close-hauled for a few ticks (AWA 30° starboard).
+    for (let i = 0; i < 5; i++) emit(350, (30 * Math.PI) / 180);
+    await new Promise((r) => setTimeout(r, 150));
+    // Snap onto port (heading 30, AWA 330°) — ROT spike opens the window.
+    for (let i = 0; i < 5; i++) emit(30, (330 * Math.PI) / 180);
+    // Settle: heel+AWA+heading must hold for settleSustainS after the turn
+    // stops, then the entry fires. 2.5s ≫ 1s settle + fetch margin.
+    await new Promise((r) => setTimeout(r, 2500));
+    const tacks = posts.filter((p) => /Tack to/.test(p.body.text));
+    assert.strictEqual(
+      tacks.length,
+      1,
+      `expected exactly one tack entry, got ${posts.map((p) => p.body.text)}`,
+    );
+    assert.strictEqual(tacks[0].body.origin, "agent");
+    assert.ok(tacks[0].body.datetime);
+
+    // An immediate second maneuver inside the debounce window logs nothing.
+    for (let i = 0; i < 5; i++) emit(350, (30 * Math.PI) / 180);
+    await new Promise((r) => setTimeout(r, 2500));
+    const tacks2 = posts.filter((p) => /Tack to/.test(p.body.text));
+    assert.strictEqual(
+      tacks2.length,
+      1,
+      "debounce should suppress the second tack",
+    );
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});

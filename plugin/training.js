@@ -70,6 +70,14 @@ const STABILIZE_HEEL_DEG = 2.0;
 const STABILIZE_AWA_DEG = 10.0;
 
 /**
+ * Heading (deg) tolerance for the §6.4 re-stabilization test: the settle
+ * clock runs only when the heading is holding within this of its
+ * turn-stop reference — a maneuver is complete when the boat is settled
+ * on its new course, not merely when heel/wind have steadied.
+ */
+const STABILIZE_HEADING_DEG = 5.0;
+
+/**
  * Minimum elapsed seconds between two GPS fixes for a SOG/COG derivation
  * to be trusted (avoids divide-by-tiny-dt blowups at high report rates).
  */
@@ -94,7 +102,14 @@ const GROUND_TRUTH_ALPHA = 0.3;
  * Training state. Held across ticks; the plugin owns one instance.
  */
 class TrainingState {
-  constructor() {
+  /**
+   * @param {object} [opts] - tunable overrides (mainly for fast tests;
+   *   production uses the module constants)
+   * @param {number} [opts.settleSustainS] - §6.4 re-stabilization window
+   */
+  constructor(opts = {}) {
+    /** @type {number} §6.4 settle window (s), overridable */
+    this.settleSustainS = opts.settleSustainS ?? SETTLE_SUSTAIN_S;
     /** @type {{latitude:number, longitude:number, timestampS:number}|null} last accepted GPS fix */
     this.lastGps = null;
     /** @type {number|null} smoothed ground-truth SOG (kn) */
@@ -115,6 +130,16 @@ class TrainingState {
     this.transientHeelDeg = null;
     /** @type {number|null} AWA (deg) at transient open, to test re-stabilize */
     this.transientAwaDeg = null;
+    /** @type {number|null} heading (deg) at transient open, for §9.4
+     * tack/gybe classification at the close edge */
+    this.transientHeadingDeg = null;
+    /** @type {number|null} AWA (deg) from the tick *before* the window
+     * opened — the pre-maneuver wind side, for §9.4 classification
+     * (transientAwaDeg is captured mid-maneuver, after the flip) */
+    this.maneuverAwaDeg = null;
+    /** @type {number|null} AWA (deg) of the previous tick (non-transient),
+     * feeding maneuverAwaDeg at window open */
+    this.lastAwaDeg = null;
     /** @type {number|null} seconds of sustained re-stabilization so far */
     this.stabilizedS = 0;
   }
@@ -216,6 +241,11 @@ function updateTransient(st, s) {
       st.transientOpenAtS = s.timestampS;
       st.transientHeelDeg = s.heelDeg;
       st.transientAwaDeg = s.awaDeg;
+      st.transientHeadingDeg = s.headingDeg;
+      // §9.4: the pre-maneuver wind side is the previous tick's AWA —
+      // by the time the rate-of-turn gate trips, the bow may already be
+      // through the wind.
+      st.maneuverAwaDeg = st.lastAwaDeg ?? s.awaDeg;
       st.stabilizedS = 0;
     }
   } else {
@@ -223,22 +253,34 @@ function updateTransient(st, s) {
       Math.abs(s.heelDeg - st.transientHeelDeg) <= STABILIZE_HEEL_DEG;
     const awaOk =
       Math.abs(angleDelta(s.awaDeg, st.transientAwaDeg)) <= STABILIZE_AWA_DEG;
+    // §9.4: the heading must also have stopped swinging — heel and wind
+    // can steady before the boat has finished bearing away onto its final
+    // course, and the logged "new heading" must be the settled course, not
+    // a mid-settle snapshot.
+    const headingOk =
+      st.transientHeadingDeg != null &&
+      Math.abs(angleDelta(s.headingDeg, st.transientHeadingDeg)) <=
+        STABILIZE_HEADING_DEG;
     // A new high rate-of-turn resets the settle clock (it's still transient).
     if (rot > ROT_TRANSIENT_DEG_S) {
       st.transientHeelDeg = s.heelDeg;
       st.transientAwaDeg = s.awaDeg;
+      st.transientHeadingDeg = s.headingDeg;
       st.stabilizedS = 0;
-    } else if (heelOk && awaOk) {
+    } else if (heelOk && awaOk && headingOk) {
       st.stabilizedS +=
         s.timestampS > (st.lastHeadingAtS ?? s.timestampS)
           ? s.timestampS - st.lastHeadingAtS
           : 0;
-      if (st.stabilizedS >= SETTLE_SUSTAIN_S) {
+      if (st.stabilizedS >= st.settleSustainS) {
         st.transient = false;
         st.transientOpenAtS = null;
-        st.transientHeelDeg = null;
-        st.transientAwaDeg = null;
         st.stabilizedS = 0;
+        // NOTE: transientHeelDeg/transientAwaDeg/transientHeadingDeg and
+        // maneuverAwaDeg are deliberately RETAINED on close —
+        // detectManeuver (§9.4) reads them at this falling edge to
+        // classify the completed maneuver. They are overwritten when the
+        // next window opens.
       }
     } else {
       st.stabilizedS = 0;
@@ -247,7 +289,79 @@ function updateTransient(st, s) {
 
   st.lastHeadingDeg = s.headingDeg;
   st.lastHeadingAtS = s.timestampS;
+  if (!st.transient) st.lastAwaDeg = s.awaDeg;
   return st.transient;
+}
+
+/**
+ * AWA (deg) from the wind below which a side is "upwind": close-hauled to
+ * close reaching (a typical tack starts/ends here). A tack's endpoints sit
+ * on opposite sides within this half.
+ */
+const TACK_AWA_MAX_DEG = 90;
+
+/**
+ * AWA (deg) from dead downwind within which both endpoints of a gybe sit
+ * (broad reach to run, either side of 180°).
+ */
+const GYBE_AWA_MAX_DEG = 60;
+
+/**
+ * Classifies a completed maneuver from the AWA change across a transient
+ * window (SPEC §9.4): a tack puts the bow through the wind (AWA crosses
+ * from one side of ~0°/360° to the other), a gybe puts the stern through
+ * it (AWA crosses from one side of ~180° to the other).
+ *
+ * `awaBefore`/`awaAfter` are 0-360 true-wind-relative (starboard tack
+ * 0-180, port 180-360). Returns null when neither band was crossed
+ * (e.g. a course change that merely tripped the rate-of-turn gate).
+ *
+ * @param {number} awaBefore - AWA (deg, 0-360) when the window opened
+ * @param {number} awaAfter - AWA (deg, 0-360) at stabilization
+ * @returns {"tack"|"gybe"|null}
+ */
+function classifyManeuver(awaBefore, awaAfter) {
+  // Upwind distance: near 0 (starboard) or near 360 (port).
+  const beforeUp = Math.min(awaBefore, 360 - awaBefore);
+  const afterUp = Math.min(awaAfter, 360 - awaAfter);
+  const beforeDown = Math.abs(awaBefore - 180);
+  const afterDown = Math.abs(awaAfter - 180);
+  // Sides: starboard (0-180) vs port (180-360).
+  const sideFlip = awaBefore < 180 !== awaAfter < 180;
+  if (!sideFlip) return null;
+  if (beforeUp <= TACK_AWA_MAX_DEG && afterUp <= TACK_AWA_MAX_DEG) {
+    return "tack";
+  }
+  if (beforeDown <= GYBE_AWA_MAX_DEG && afterDown <= GYBE_AWA_MAX_DEG) {
+    return "gybe";
+  }
+  return null;
+}
+
+/**
+ * Maneuver detection for logbook auto-entries (SPEC §9.4). Consumes the
+ * transient window's *close* edge: when `updateTransient` just closed a
+ * window, the open-time AWA/heading are still available on the state
+ * (they are cleared before returning, so this reads them first).
+ *
+ * Not a pure function of a snapshot — it tracks the previous transient
+ * flag on `st._prevTransient` to detect the falling edge. Returns null
+ * unless a window just closed and the AWA crossing classifies cleanly.
+ *
+ * @param {TrainingState} st
+ * @param {{awaDeg: number, headingDeg: number}} s - current snapshot
+ * @returns {{direction: "tack"|"gybe", newHeadingDeg: number}|null}
+ */
+function detectManeuver(st, s) {
+  const was = st._prevTransient ?? false;
+  st._prevTransient = st.transient;
+  if (!was || st.transient) return null;
+  // Falling edge: the window just closed. The pre-maneuver AWA is
+  // retained on the state by updateTransient for exactly this read.
+  if (st.maneuverAwaDeg == null) return null;
+  const direction = classifyManeuver(st.maneuverAwaDeg, s.awaDeg);
+  if (!direction) return null;
+  return { direction, newHeadingDeg: s.headingDeg };
 }
 
 /**
@@ -458,6 +572,8 @@ module.exports = {
   resolveCurrent,
   detectFouling,
   updateTransient,
+  classifyManeuver,
+  detectManeuver,
   isGpsReliable,
   computeObservation,
   tick,
@@ -469,6 +585,9 @@ module.exports = {
   SETTLE_SUSTAIN_S,
   STABILIZE_HEEL_DEG,
   STABILIZE_AWA_DEG,
+  STABILIZE_HEADING_DEG,
   GROSS_JUMP_NM,
   GROUND_TRUTH_ALPHA,
+  TACK_AWA_MAX_DEG,
+  GYBE_AWA_MAX_DEG,
 };

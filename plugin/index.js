@@ -21,6 +21,7 @@ const {
   recordFix,
   recordCorrection,
   getDeviationRateStats,
+  markFixLogged,
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
@@ -28,6 +29,7 @@ const {
   TrainingState,
   resolveCurrent,
   tick: trainingTick,
+  detectManeuver,
 } = require("./training.js");
 const { distanceNm, bearingDeg } = require("./geo.js");
 const {
@@ -46,6 +48,13 @@ const {
   createDivergenceState,
   divergenceTick,
 } = require("./divergence.js");
+const {
+  composeFixEntry,
+  composeTackEntry,
+  createLogbookClient,
+  createAccessRequestClient,
+  newClientId,
+} = require("./logbook.js");
 
 /**
  * Plugin identifier (matches package name without the scope).
@@ -87,6 +96,11 @@ const SUBSCRIPTION_PATHS = [
   "environment.wind.speedApparent",
   "navigation.state",
   "propulsion.main.state",
+  // Sea state: SPEC §3.2 subscribes environment.seaState; the logbook
+  // actually publishes environment.water.swell.state (verified in its
+  // source). Subscribe both, prefer whichever carries a value.
+  "environment.seaState",
+  "environment.water.swell.state",
 ];
 
 /**
@@ -99,6 +113,17 @@ const DEFAULT_CONFIG = {
     factor: DEFAULT_FACTOR,
     sustainS: DEFAULT_SUSTAIN_S,
     clearS: DEFAULT_CLEAR_S,
+  },
+  logbook: {
+    enabled: false,
+    url: "http://localhost:3000/plugins/signalk-logbook/logs",
+    baseUrl: "http://localhost:3000",
+    pollIntervalMs: 30000,
+    tackDebounceS: 120,
+    token: "",
+  },
+  training: {
+    settleSustainS: null, // null → module default (10s)
   },
 };
 
@@ -121,11 +146,18 @@ const deps = {
   computeRadius,
   createDivergenceState,
   divergenceTick,
+  composeFixEntry,
+  composeTackEntry,
+  createLogbookClient,
+  createAccessRequestClient,
+  newClientId,
+  markFixLogged,
   DeadReckoningEngine,
   MatrixStore,
   TrainingState,
   resolveCurrent,
   trainingTick,
+  detectManeuver,
   distanceNm,
   bearingDeg,
 };
@@ -162,6 +194,15 @@ module.exports = (app) => {
   /** @type {ReturnType<typeof createDivergenceState>|null} §7.3 divergence monitor */
   let divergence = null;
 
+  /** @type {object|null} §9.5 logbook write-through client */
+  let logbook = null;
+
+  /** @type {object|null} §7-access-request lifecycle (poll interval + state) */
+  let accessPoll = null;
+
+  /** @type {number|null} timestamp (ms) of the last logged maneuver, §9.4 debounce */
+  let lastTackLoggedMs = null;
+
   /** @type {number|null} */
   let tickInterval = null;
 
@@ -193,6 +234,22 @@ module.exports = (app) => {
           title: "State Save Interval (ms)",
           default: DEFAULT_CONFIG.saveIntervalMs,
         },
+        "logbook.enabled": {
+          type: "boolean",
+          title: "Write fixes and maneuvers to signalk-logbook",
+          default: DEFAULT_CONFIG.logbook.enabled,
+        },
+        "logbook.url": {
+          type: "string",
+          title: "signalk-logbook URL",
+          default: DEFAULT_CONFIG.logbook.url,
+        },
+        "logbook.token": {
+          type: "string",
+          title:
+            "Access token (optional — when empty, obtained via the server's access-request flow on first write)",
+          default: DEFAULT_CONFIG.logbook.token,
+        },
       },
     },
 
@@ -203,12 +260,22 @@ module.exports = (app) => {
         ...DEFAULT_CONFIG.divergence,
         ...(options?.divergence ?? {}),
       };
+      config.logbook = {
+        ...DEFAULT_CONFIG.logbook,
+        ...(options?.logbook ?? {}),
+      };
+      config.training = {
+        ...DEFAULT_CONFIG.training,
+        ...(options?.training ?? {}),
+      };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
-      training = new deps.TrainingState();
+      training = new deps.TrainingState({
+        settleSustainS: config.training.settleSustainS,
+      });
       divergence = deps.createDivergenceState();
       clockS = 0;
 
@@ -229,6 +296,8 @@ module.exports = (app) => {
       // continues the uncertainty polygon rather than resetting it.
       const logSinceOrigin = deps.getState(db, "dr_log_since_origin");
       if (logSinceOrigin) engine.logNmSinceOrigin = Number(logSinceOrigin) || 0;
+
+      initLogbook();
 
       // Subscribe to the sensor inputs the engine needs.
       const subscription = {
@@ -302,6 +371,12 @@ module.exports = (app) => {
         });
       }
       divergence = null;
+      if (accessPoll) {
+        clearInterval(accessPoll);
+        accessPoll = null;
+      }
+      logbook = null;
+      lastTackLoggedMs = null;
       clockS = 0;
       setStatus("Dead reckoning stopped");
     },
@@ -349,7 +424,7 @@ module.exports = (app) => {
     const priorOrigin = engine.origin;
     const elapsed = engine.elapsedSinceOriginS;
     const sailState = resolveSailState();
-    const seaState = "unknown";
+    const seaState = resolveSeaState();
     const ts = new Date().toISOString();
 
     const fixId = deps.recordFix(db, {
@@ -413,7 +488,7 @@ module.exports = (app) => {
     // come from the logbook peer when available; absent here they fall to
     // 'unknown' (SPEC §4.1).
     const sailState = resolveSailState();
-    const seaState = "unknown";
+    const seaState = resolveSeaState();
     const awaDeg = awaRad != null ? (awaRad * 180) / Math.PI : 0;
     const corrections = matrix.lookup({
       sail_state: sailState,
@@ -467,6 +542,31 @@ module.exports = (app) => {
         tr.observation,
         { source: "live" },
       );
+    }
+
+    // §9.4: auto tack/gybe logbook entries. The transient window's close
+    // edge is a completed maneuver; classify from the AWA change across
+    // the window. Debounced so a beat's rapid back-to-back maneuvers
+    // (or a botched tack immediately redone) log as one event.
+    const maneuver = deps.detectManeuver(training, {
+      awaDeg,
+      headingDeg: headingTrueDeg,
+    });
+    if (maneuver) {
+      const now = Date.now();
+      const debounceMs = (config.logbook?.tackDebounceS ?? 120) * 1000;
+      if (lastTackLoggedMs == null || now - lastTackLoggedMs >= debounceMs) {
+        lastTackLoggedMs = now;
+        const entry = deps.composeTackEntry({
+          direction: maneuver.direction,
+          newHeadingDeg: maneuver.newHeadingDeg,
+          datetime: new Date().toISOString(),
+          sea_state: seaState !== "unknown" ? Number(seaState) : null,
+        });
+        writeLogbookEntry(entry)
+          .then(() => {})
+          .catch(() => {});
+      }
     }
 
     if (pos) {
@@ -539,6 +639,28 @@ module.exports = (app) => {
   }
 
   /**
+   * Resolves the current sea state for bin/correction context (SPEC
+   * §3.2). The logbook publishes WMO sea-state codes via
+   * `environment.water.swell.state`; `environment.seaState` is the SPEC's
+   * spelling and other sources may publish it. Either is accepted —
+   * numeric string form ("3") keeps matrix bins and dr_corrections
+   * directly comparable with the logbook schema without a translation
+   * table.
+   *
+   * @returns {string}
+   */
+  function resolveSeaState() {
+    const swell = deltaState.get("environment.water.swell.state");
+    if (Number.isFinite(Number(swell)))
+      return String(Math.round(Number(swell)));
+    const seaState = deltaState.get("environment.seaState");
+    if (Number.isFinite(Number(seaState))) {
+      return String(Math.round(Number(seaState)));
+    }
+    return "unknown";
+  }
+
+  /**
    * Resolves the current sail state. SPEC §4.1 excludes motoring intervals
    * from matrix writes via `propulsion.main.state = started` — that gate is
    * applied at training time, not here; this returns a coarse label for
@@ -585,6 +707,124 @@ module.exports = (app) => {
    * @param {{state: string, message: string}} n
    * @returns {void}
    */
+  // --- Logbook write-through (SPEC §9.4, §9.5) ----------------------------
+
+  /**
+   * Initializes the logbook client when enabled. Token acquisition via
+   * the server's Access Requests flow: a config token short-circuits it;
+   * otherwise a stable clientId (persisted) requests access, an admin
+   * approves in the server UI, and a poll interval picks up the granted
+   * token. A DENIED verdict stops polling until the next start. Writes
+   * are simply skipped while no token is available.
+   *
+   * @returns {void}
+   */
+  function initLogbook() {
+    if (!config.logbook?.enabled) return;
+
+    // Persistent client identity (spec: same clientId for every request).
+    let clientId = deps.getState(db, "logbook_client_id");
+    if (!clientId) {
+      clientId = deps.newClientId();
+      deps.setState(db, "logbook_client_id", clientId);
+    }
+
+    const storedToken =
+      config.logbook.token || deps.getState(db, "logbook_token");
+    const expiresRaw = deps.getState(db, "logbook_token_expires");
+    const expired = expiresRaw != null && Date.parse(expiresRaw) <= Date.now();
+
+    if (storedToken && !expired) {
+      logbook = deps.createLogbookClient({
+        url: config.logbook.url,
+        token: storedToken,
+      });
+      setStatus("Logbook write-through enabled");
+      return;
+    }
+
+    // No usable token: submit an access request and poll for approval.
+    const access = deps.createAccessRequestClient({
+      baseUrl: config.logbook.baseUrl,
+    });
+    access
+      .request({
+        clientId,
+        description:
+          "signalk-dead-reckoning: fix & maneuver logbook writes (requires admin: plugin routes are admin-gated)",
+        // Plugin REST routes are admin-gated (verified: the server wraps
+        // /plugins in adminAuthenticationMiddleware), so the token must be
+        // admin-level. Requesting it explicitly means the administrator
+        // approves exactly that — and the server grants the requested
+        // level verbatim on approval.
+        permissions: "admin",
+      })
+      .then((href) => {
+        if (!href) {
+          // 501 / failure: open server (no auth) or unreachable. Write
+          // unauthenticated — works on open installs, fails gracefully
+          // elsewhere.
+          logbook = deps.createLogbookClient({
+            url: config.logbook.url,
+          });
+          setStatus("Logbook write-through enabled (unauthenticated)");
+          return;
+        }
+        setStatus("Logbook access requested — approve in the server UI");
+        accessPoll = setInterval(async () => {
+          try {
+            const verdict = await access.poll(href);
+            if (verdict === "DENIED") {
+              clearInterval(accessPoll);
+              accessPoll = null;
+              setStatus("Logbook access denied — no logbook writes");
+              return;
+            }
+            if (verdict?.token) {
+              clearInterval(accessPoll);
+              accessPoll = null;
+              deps.setState(db, "logbook_token", verdict.token);
+              if (verdict.expirationTime) {
+                deps.setState(
+                  db,
+                  "logbook_token_expires",
+                  verdict.expirationTime,
+                );
+              }
+              logbook = deps.createLogbookClient({
+                url: config.logbook.url,
+                token: verdict.token,
+              });
+              setStatus("Logbook write-through enabled");
+            }
+          } catch {
+            // Poll failure: keep polling; the next interval retries.
+          }
+        }, config.logbook.pollIntervalMs);
+      });
+  }
+
+  /**
+   * Writes a logbook entry, handling the unauthorized case by dropping the
+   * stored token and re-requesting access (the spec's 403 handling). Never
+   * throws — logbook failures never block the fix/matrix/polygon paths.
+   *
+   * @param {object} body - NewEntry-shaped
+   * @returns {Promise<string|null>} the entry ref on success
+   */
+  async function writeLogbookEntry(body) {
+    if (!logbook) return null;
+    const ref = await logbook.createEntry(body);
+    if (ref === "unauthorized") {
+      // Token expired/revoked: drop and re-request (start of next write).
+      logbook = null;
+      deps.setState(db, "logbook_token", "");
+      initLogbook();
+      return null;
+    }
+    return ref;
+  }
+
   function publishNotification(path, n) {
     app.handleMessage(PLUGIN_ID, {
       context: "vessels.self",
@@ -928,7 +1168,7 @@ module.exports = (app) => {
       const resets = b.resets !== false;
       const confirmedBy = b.confirmed_by ?? null;
       const sailState = resolveSailState();
-      const seaState = "unknown";
+      const seaState = resolveSeaState();
       const helpers = {
         recordFix: deps.recordFix,
         recordCorrection: deps.recordCorrection,
@@ -980,6 +1220,38 @@ module.exports = (app) => {
         sailState,
         seaState,
       });
+
+      // §9.5: write-through to signalk-logbook (optional peer). `fixes`
+      // stays canonical; the entry is a formatted export. Fire-and-forget
+      // — a failure never blocks the confirm, and leaves the row
+      // unmarked (`logged_to_logbook = 0`, visible in `fixes`).
+      writeLogbookEntry(
+        deps.composeFixEntry({
+          datetime: new Date().toISOString(),
+          source_type: candidate.source_type,
+          latitude: candidate.latitude,
+          longitude: candidate.longitude,
+          confirmed_by: confirmedBy,
+          deviation_nm: result.deviation_nm,
+          dr_log_nm: engine.logNmSinceOrigin,
+          residual_nm: candidate.residual_nm ?? null,
+          observation_count:
+            (candidate.observationIds?.lopIds?.length ?? 0) +
+            (candidate.observationIds?.cplIds?.length ?? 0),
+          stw_kn: unwrapNumber(deltaState.get("navigation.speedThroughWater")),
+          sog_kn: unwrapNumber(deltaState.get("navigation.speedOverGround")),
+          heading_deg: unwrapNumber(deltaState.get("navigation.headingTrue")),
+          course_deg: unwrapNumber(
+            deltaState.get("navigation.courseOverGround"),
+          ),
+          sea_state: seaState !== "unknown" ? Number(seaState) : null,
+        }),
+      )
+        .then((ref) => {
+          if (ref) deps.markFixLogged(db, result.fix_id, ref);
+        })
+        .catch(() => {});
+
       res.json({
         fix_id: result.fix_id,
         correction_id: result.correction_id,

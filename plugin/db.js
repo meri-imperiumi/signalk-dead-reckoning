@@ -417,6 +417,22 @@ function getDeviationRateStats(db, q = {}) {
   );
 }
 
+/**
+ * Marks a `fixes` row as written to the signalk-logbook, storing the
+ * entry reference (its datetime key). A failed write leaves the row
+ * unmarked — visible in `fixes`, never blocking the fix flow.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} fixId
+ * @param {string|null} logbookRef - entry datetime key
+ * @returns {void}
+ */
+function markFixLogged(db, fixId, logbookRef) {
+  db.prepare(
+    "UPDATE fixes SET logged_to_logbook = 1, logbook_entry_ref = ? WHERE fix_id = ?",
+  ).run(logbookRef ?? null, fixId);
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
@@ -429,4 +445,5 @@ module.exports = {
   attachObservationsToFix,
   recordCorrection,
   getDeviationRateStats,
+  markFixLogged,
 };
