@@ -148,6 +148,20 @@ const SCHEMA_DDL = [
     corroborated_by_ais_adsb BOOLEAN DEFAULT 0,
     severity TEXT NOT NULL
   )`,
+
+  // §9.5: entries awaiting a logbook token (access-request approval
+  // window, or token expiry mid-write). Persisted so a plugin restart
+  // doesn't lose the approval-window entries; bounded by MAX_PENDING.
+  // `fix_id` links a queued fix entry back to its `fixes` row so the
+  // delayed flush can mark it logged (the confirm route's own .then
+  // only fires when the write is immediate, not queued).
+  `CREATE TABLE IF NOT EXISTS logbook_pending (
+    pending_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    fix_id INTEGER,
+    payload TEXT NOT NULL
+  )`,
 ];
 
 /**
@@ -433,6 +447,54 @@ function markFixLogged(db, fixId, logbookRef) {
   ).run(logbookRef ?? null, fixId);
 }
 
+/** Max queued logbook entries (approval window + retry storms). */
+const MAX_PENDING = 200;
+
+/**
+ * Queues a logbook entry for later delivery (tokenless window). Oldest
+ * entries are dropped beyond MAX_PENDING — bounded storage, newest data
+ * wins; the plugin DB remains the source of truth for anything numeric.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {string} kind - 'fix' | 'tack' | 'observation'
+ * @param {object} payload - NewEntry-shaped body
+ * @returns {void}
+ */
+function enqueueLogbookPending(db, kind, payload, fixId = null) {
+  db.prepare(
+    "INSERT INTO logbook_pending (created_at, kind, fix_id, payload) VALUES (?, ?, ?, ?)",
+  ).run(new Date().toISOString(), kind, fixId, JSON.stringify(payload));
+  db.prepare(
+    "DELETE FROM logbook_pending WHERE pending_id <= (SELECT MAX(pending_id) FROM logbook_pending) - ?",
+  ).run(MAX_PENDING);
+}
+
+/**
+ * Lists queued logbook entries, oldest first, for the flush.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @returns {Array<{pending_id: number, created_at: string, kind: string, payload: object}>}
+ */
+function listLogbookPending(db) {
+  return db
+    .prepare(
+      "SELECT pending_id, created_at, kind, fix_id, payload FROM logbook_pending ORDER BY pending_id",
+    )
+    .all()
+    .map((r) => ({ ...r, payload: JSON.parse(r.payload) }));
+}
+
+/**
+ * Drops a queued entry after successful delivery.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} pendingId
+ * @returns {void}
+ */
+function dequeueLogbookPending(db, pendingId) {
+  db.prepare("DELETE FROM logbook_pending WHERE pending_id = ?").run(pendingId);
+}
+
 /**
  * Lists recent confirmed fixes for the UI (SPEC §14.1 fix points).
  *
@@ -557,6 +619,9 @@ module.exports = {
   recordCorrection,
   getDeviationRateStats,
   markFixLogged,
+  enqueueLogbookPending,
+  listLogbookPending,
+  dequeueLogbookPending,
   listFixes,
   getLineOfPosition,
   getCircularPositionLine,

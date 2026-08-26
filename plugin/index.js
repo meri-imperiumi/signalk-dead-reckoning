@@ -23,6 +23,9 @@ const {
   recordCorrection,
   getDeviationRateStats,
   markFixLogged,
+  enqueueLogbookPending,
+  listLogbookPending,
+  dequeueLogbookPending,
   listFixes,
   listLinesOfPosition,
   listCircularPositionLines,
@@ -243,6 +246,9 @@ const deps = {
   createAccessRequestClient,
   newClientId,
   markFixLogged,
+  enqueueLogbookPending,
+  listLogbookPending,
+  dequeueLogbookPending,
   listFixes,
   listLinesOfPosition,
   listCircularPositionLines,
@@ -591,6 +597,7 @@ module.exports = (app) => {
         accessPoll = null;
       }
       logbook = null;
+      logbookPhase = null;
       lastTackLoggedMs = null;
       clockS = 0;
       setStatus("Dead reckoning stopped");
@@ -867,7 +874,7 @@ module.exports = (app) => {
           datetime: new Date().toISOString(),
           sea_state: seaState !== "unknown" ? Number(seaState) : null,
         });
-        writeLogbookEntry(entry)
+        writeLogbookEntry(entry, "tack")
           .then(() => {})
           .catch(() => {});
       }
@@ -1032,6 +1039,14 @@ module.exports = (app) => {
    *
    * @returns {void}
    */
+  /**
+   * Current access-flow phase, for status + write-time re-request
+   * decisions: "granted" (token working), "pending" (request submitted,
+   * admin approval awaited), "open" (no auth needed — writes verified
+   * live), "denied", "unreachable". @type {string|null}
+   */
+  let logbookPhase = null;
+
   function initLogbook() {
     if (!config.logbook?.enabled) return;
 
@@ -1052,14 +1067,21 @@ module.exports = (app) => {
         url: config.logbook.url,
         token: storedToken,
       });
+      logbookPhase = "granted";
       setStatus("Logbook write-through enabled");
+      // Any entries queued before a restart land here.
+      flushLogbookPending();
       return;
     }
 
     // No usable token: submit an access request and poll for approval.
+    // Entries written while waiting are queued (SQLite) and flushed on
+    // grant — nothing is lost in the approval window.
     const access = deps.createAccessRequestClient({
       baseUrl: config.logbook.baseUrl,
     });
+    logbookPhase = "pending";
+    setStatus("Logbook access requested — approve in the server UI");
     access
       .request({
         clientId,
@@ -1073,23 +1095,34 @@ module.exports = (app) => {
         permissions: "admin",
       })
       .then((href) => {
+        if (href === "unreachable") {
+          // Transport failure: don't pretend it's an open server, don't
+          // poll a bogus href. Writes queue; the next write re-runs
+          // initLogbook() to retry once the server is reachable again.
+          logbookPhase = "unreachable";
+          setStatus("Logbook unreachable — entries queued");
+          return;
+        }
         if (!href) {
-          // 501 / failure: open server (no auth) or unreachable. Write
-          // unauthenticated — works on open installs, fails gracefully
-          // elsewhere.
+          // 501/404 = the server advertises no access-request flow
+          // (open server). Try an unauthenticated write; if it lands,
+          // we're in business. Anything else (incl. network refusal)
+          // stays queued and retries on the next write.
           logbook = deps.createLogbookClient({
             url: config.logbook.url,
           });
-          setStatus("Logbook write-through enabled (unauthenticated)");
+          logbookPhase = "open";
+          flushLogbookPending();
           return;
         }
-        setStatus("Logbook access requested — approve in the server UI");
         accessPoll = setInterval(async () => {
           try {
             const verdict = await access.poll(href);
             if (verdict === "DENIED") {
               clearInterval(accessPoll);
               accessPoll = null;
+              logbookPhase = "denied";
+              logbook = null;
               setStatus("Logbook access denied — no logbook writes");
               return;
             }
@@ -1108,12 +1141,19 @@ module.exports = (app) => {
                 url: config.logbook.url,
                 token: verdict.token,
               });
+              logbookPhase = "granted";
               setStatus("Logbook write-through enabled");
+              flushLogbookPending();
             }
           } catch {
             // Poll failure: keep polling; the next interval retries.
           }
         }, config.logbook.pollIntervalMs);
+      })
+      .catch(() => {
+        // Network refusal at request time: unreachable — writes queue.
+        logbookPhase = "unreachable";
+        setStatus("Logbook unreachable — entries queued");
       });
   }
 
@@ -1125,15 +1165,82 @@ module.exports = (app) => {
    * @param {object} body - NewEntry-shaped
    * @returns {Promise<string|null>} the entry ref on success
    */
-  async function writeLogbookEntry(body) {
-    if (!logbook) return null;
+  /**
+   * Flushes queued logbook entries oldest-first once a client exists
+   * (token granted / open server verified live). Stops at the first
+   * failure so ordering is preserved and the queue stays intact.
+   * @returns {Promise<void>}
+   */
+  async function flushLogbookPending() {
+    if (!logbook || !db) return;
+    for (const row of deps.listLogbookPending(db)) {
+      const ref = await logbook.createEntry(row.payload);
+      if (ref === "unauthorized" || ref == null) {
+        if (ref === "unauthorized") {
+          // Token rejected mid-flush: re-request, keep the queue.
+          logbook = null;
+          deps.setState(db, "logbook_token", "");
+          logbookPhase = "pending";
+          initLogbook();
+        }
+        return; // transient failure — retry on next trigger
+      }
+      deps.dequeueLogbookPending(db, row.pending_id);
+      // A delayed fix delivery: mark the `fixes` row now that the entry
+      // actually landed (the confirm route only marks on immediate writes).
+      if (row.fix_id != null && ref != null) {
+        deps.markFixLogged(db, row.fix_id, ref);
+      }
+    }
+    const remaining = deps.listLogbookPending(db).length;
+    if (remaining === 0 && logbookPhase === "granted") {
+      setStatus("Logbook write-through enabled");
+    }
+  }
+
+  /**
+   * Writes a logbook entry. While no client is available (tokenless /
+   * unreachable) the entry is queued (SQLite) and delivered when the
+   * access flow lands; on 401/403 the token is dropped and access
+   * re-requested — the entry re-queues, so expiry mid-passage loses
+   * nothing. Never throws — logbook failures never block the fix /
+   * matrix / polygon paths.
+   *
+   * @param {object} body - NewEntry-shaped
+   * @param {object} body - NewEntry-shaped
+   * @param {string} [kind="entry"] - 'fix' | 'tack' | 'bearing' | 'observation'
+   * @param {number|null} [fixId=null] - links a fix entry to its `fixes` row
+   *   so the delayed flush can mark it logged.
+   * @returns {Promise<string|null>} the entry ref on success
+   */
+  async function writeLogbookEntry(body, kind = "entry", fixId = null) {
+    if (!db) return null;
+    if (!logbook) {
+      // Tokenless: queue for the approval window. Also re-kick the
+      // access flow — covers expiry/loss after start() already ran it.
+      deps.enqueueLogbookPending(db, kind, body, fixId);
+      if (logbookPhase !== "pending" && logbookPhase !== "denied") {
+        initLogbook();
+      }
+      return null;
+    }
     const ref = await logbook.createEntry(body);
     if (ref === "unauthorized") {
-      // Token expired/revoked: drop and re-request (start of next write).
+      // Token expired/revoked: queue this entry, drop the token,
+      // re-request. Delivery resumes when re-approved.
+      deps.enqueueLogbookPending(db, kind, body, fixId);
       logbook = null;
       deps.setState(db, "logbook_token", "");
+      logbookPhase = "pending";
       initLogbook();
       return null;
+    }
+    if (ref == null) {
+      // Transient failure (network, 5xx): queue so a later success
+      // (or restart) delivers it. Bounded, ordered, source-of-truth
+      // stays the plugin DB.
+      deps.enqueueLogbookPending(db, kind, body, fixId);
+      setStatus("Logbook write failed — entry queued");
     }
     return ref;
   }
@@ -1436,6 +1543,7 @@ module.exports = (app) => {
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
+        "bearing",
       ).catch(() => {});
       res.json({ lop_id: id });
     });
@@ -1486,6 +1594,7 @@ module.exports = (app) => {
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
+        "observation",
       ).catch(() => {});
       res.json({ cpl_id: id });
     });
@@ -1579,6 +1688,7 @@ module.exports = (app) => {
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
+        "observation",
       ).catch(() => {});
       res.json({
         lop_id: lopId,
@@ -1761,6 +1871,8 @@ module.exports = (app) => {
           ),
           sea_state: seaState !== "unknown" ? Number(seaState) : null,
         }),
+        "fix",
+        result.fix_id,
       )
         .then((ref) => {
           if (ref) deps.markFixLogged(db, result.fix_id, ref);

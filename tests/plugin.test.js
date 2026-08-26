@@ -1279,6 +1279,321 @@ test("logbook: disabled by default — no entry, fix still confirmed", async () 
   await rm(dir, { recursive: true, force: true });
 });
 
+test("logbook: tokenless start queues the fix entry, access approval flushes it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-queue-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  let approved = false;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      return {
+        ok: true,
+        status: 202,
+        json: async () => ({
+          state: "PENDING",
+          href: "/signalk/v1/requests/abc",
+        }),
+      };
+    }
+    if (u.includes("/signalk/v1/requests/abc")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          approved
+            ? {
+                state: "COMPLETED",
+                accessRequest: {
+                  permission: "APPROVED",
+                  token: "granted-tok",
+                  expirationTime: null,
+                },
+              }
+            : { state: "PENDING" },
+      };
+    }
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      posts.push({
+        url: u,
+        body: JSON.parse(opts.body),
+        auth: opts.headers?.Authorization,
+      });
+      return { ok: true, status: 201 };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    // Confirm a fix BEFORE approval — entry must be queued, not lost.
+    const { status, body } = router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    assert.strictEqual(status, 200);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(posts.length, 0, "nothing written while tokenless");
+    const { DatabaseSync } = require("node:sqlite");
+    let db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    let pending = db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c;
+    assert.strictEqual(pending, 1, "fix entry queued during approval window");
+    let row = db
+      .prepare("SELECT logged_to_logbook FROM fixes WHERE fix_id = ?")
+      .get(body.fix_id);
+    assert.strictEqual(
+      row.logged_to_logbook,
+      0,
+      "fix row unmarked until write lands",
+    );
+    db.close();
+    // Admin approves — the queued entry flushes with the granted token.
+    approved = true;
+    await new Promise((r) => setTimeout(r, 150));
+    assert.strictEqual(posts.length, 1, "queued entry delivered on approval");
+    assert.strictEqual(posts[0].auth, "Bearer granted-tok");
+    db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    pending = db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c;
+    assert.strictEqual(pending, 0, "queue drained after flush");
+    row = db
+      .prepare("SELECT logged_to_logbook FROM fixes WHERE fix_id = ?")
+      .get(body.fix_id);
+    assert.strictEqual(row.logged_to_logbook, 1, "fix row marked after flush");
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: unreachable server queues writes and retries on next write", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-unreach-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  let reach = false;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (!reach) throw new Error("connect ECONNREFUSED");
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      return {
+        ok: true,
+        status: 202,
+        json: async () => ({
+          state: "PENDING",
+          href: "/signalk/v1/requests/abc",
+        }),
+      };
+    }
+    if (u.includes("/signalk/v1/requests/abc")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "COMPLETED",
+          accessRequest: {
+            permission: "APPROVED",
+            token: "tok2",
+            expirationTime: null,
+          },
+        }),
+      };
+    }
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      posts.push({ url: u });
+      return { ok: true, status: 201 };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+          ],
+        },
+        { values: [{ path: "navigation.speedThroughWater", value: 5 }] },
+        { values: [{ path: "navigation.headingTrue", value: 0 }] },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    // Confirm while the server is unreachable — entry queues, no false
+    // "unauthenticated" mode, status honest.
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(posts.length, 0, "no write attempted while unreachable");
+    const { DatabaseSync } = require("node:sqlite");
+    let db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    let pending = db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c;
+    assert.strictEqual(pending, 1, "entry queued while unreachable");
+    db.close();
+    // Server comes back — the next write re-kicks initLogbook, the access
+    // request now succeeds, approval flushes the queued entry.
+    reach = true;
+    router.invoke("post", "/fix", {
+      latitude: 60.002,
+      longitude: 24.002,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(posts.length >= 1, "queued entry delivered once reachable");
+    db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    pending = db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c;
+    assert.strictEqual(pending, 0, "queue drained after recovery");
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: denied access — writes dropped, no re-request spam", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-denied-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const accessReqs = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      accessReqs.push(u);
+      return {
+        ok: true,
+        status: 202,
+        json: async () => ({
+          state: "PENDING",
+          href: "/signalk/v1/requests/abc",
+        }),
+      };
+    }
+    if (u.includes("/signalk/v1/requests/abc")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          state: "COMPLETED",
+          accessRequest: { permission: "DENIED" },
+        }),
+      };
+    }
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      posts.push({ url: u });
+      return { ok: true, status: 201 };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+          ],
+        },
+        { values: [{ path: "navigation.speedThroughWater", value: 5 }] },
+        { values: [{ path: "navigation.headingTrue", value: 0 }] },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 120)); // let DENIED verdict land
+    const beforeReqs = accessReqs.length;
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.strictEqual(posts.length, 0, "denied → no logbook writes");
+    assert.strictEqual(
+      accessReqs.length,
+      beforeReqs,
+      "denied → no re-request spam on write",
+    );
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("sea state from environment.water.swell.state flows into dr_corrections", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-lb-sea-"));
   const app = new FakeSignalKApp();

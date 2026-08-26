@@ -96,6 +96,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event, independent of whether it later resolves into a fix. The entry's
   `position` is the assumed/object/charted position; `text` describes what
   was observed (body name, Zn, intercept for celestial).
+- Logbook write-through no longer loses entries in the approval window:
+  while no admin token is granted (access request pending, server
+  unreachable, or token expired mid-passage), every fix / tack /
+  observation entry is queued in a new `logbook_pending` SQLite table
+  (bounded to 200, ordered) and flushed oldest-first once a token lands —
+  nothing written during the approval window is dropped. The access flow
+  now distinguishes an open server (501/404 → unauthenticated writes) from
+  a transport failure (`unreachable` → queue + honest status, retry on
+  the next write instead of falsely claiming an open server), and a
+  tokenless write re-kicks `initLogbook()` so a lost/expired grant is
+  re-requested at write time, not only at startup. A denied access request
+  stops writes without re-request spam. Delayed fix deliveries mark their
+  `fixes` row logged (the confirm route only marks immediate writes).
 - Initial project scaffold: package metadata, CI workflows, plugin entry
   point with subscription/start/stop structure, SQLite schema layer,
   dead-reckoning vector-integration engine, EMA matrix store, unified fix

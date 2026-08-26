@@ -318,12 +318,13 @@ function createAccessRequestClient(opts) {
      * logbook writes need 'admin'. The requested level is surfaced to the
      * approving administrator and granted verbatim on approval.
      *
-     * Resolves the poll href, or null when the server doesn't implement
-     * access requests (501/404 — open server, writes need no token) or on
-     * transport failure.
+     * Resolves the poll href, null when the server doesn't implement
+     * access requests (501/404 — open server, writes need no token), or
+     * 'unreachable' on transport failure (distinguished so the caller
+     * retries instead of falsely claiming an open server).
      *
      * @param {{clientId: string, description: string, permissions?: string}} req
-     * @returns {Promise<string|null>}
+     * @returns {Promise<string|null|"unreachable">}
      */
     async request(req) {
       try {
@@ -340,7 +341,7 @@ function createAccessRequestClient(opts) {
         const body = await res.json();
         return body?.href ?? null;
       } catch {
-        return null;
+        return "unreachable";
       }
     },
 

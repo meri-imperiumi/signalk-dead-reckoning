@@ -209,6 +209,19 @@ test("access request client: 501/404 → null (open server)", async () => {
   }
 });
 
+test("access request client: transport failure → 'unreachable' (distinct from open server)", async () => {
+  const access = createAccessRequestClient({
+    baseUrl: "http://x",
+    fetchImpl: async () => {
+      throw new Error("connect ECONNREFUSED");
+    },
+  });
+  assert.strictEqual(
+    await access.request({ clientId: "u", description: "d" }),
+    "unreachable",
+  );
+});
+
 test("access request client: poll states — pending null, approved token, denied", async () => {
   const mk = (body) =>
     createAccessRequestClient({
