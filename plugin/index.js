@@ -35,10 +35,10 @@ const { DeadReckoningEngine } = require("./engine.js");
 const { GroundTrack } = require("./ground-track.js");
 const {
   TrainingState,
-  resolveCurrent,
   tick: trainingTick,
   detectManeuver,
 } = require("./training.js");
+const { resolveCurrent, WeatherCurrentClient } = require("./current.js");
 const { distanceNm, bearingDeg } = require("./geo.js");
 const {
   recordLineOfPosition,
@@ -205,6 +205,11 @@ const DEFAULT_CONFIG = {
   training: {
     settleSustainS: null, // null → module default (10s)
   },
+  weatherCurrent: {
+    enabled: true,
+    baseUrl: "", // empty → http://localhost:<server port>
+    intervalMs: 1800000,
+  },
 };
 
 /**
@@ -244,6 +249,7 @@ const deps = {
   GroundTrack,
   TrainingState,
   resolveCurrent,
+  WeatherCurrentClient,
   trainingTick,
   detectManeuver,
   distanceNm,
@@ -275,6 +281,9 @@ module.exports = (app) => {
 
   /** @type {import("./ground-track.js").GroundTrack|null} */
   let groundTrack = null;
+
+  /** @type {WeatherCurrentClient|null} §6.2 tier-3 weather current poller */
+  let weatherClient = null;
 
   /** @type {TrainingState|null} */
   let training = null;
@@ -347,6 +356,18 @@ module.exports = (app) => {
             "Access token (optional — when empty, obtained via the server's access-request flow on first write)",
           default: DEFAULT_CONFIG.logbook.token,
         },
+        "weatherCurrent.enabled": {
+          type: "boolean",
+          title: "Use Signal K Weather API current (set/drift) for DR",
+          description:
+            "Polls the server's weather provider (typically a GRIB another process downloaded) for the point-forecast current at the vessel position and integrates it into the DR solution (SPEC §6.2 tier 3). Falls back to the zero vector when unavailable.",
+          default: DEFAULT_CONFIG.weatherCurrent.enabled,
+        },
+        "weatherCurrent.intervalMs": {
+          type: "integer",
+          title: "Weather current poll interval (ms)",
+          default: DEFAULT_CONFIG.weatherCurrent.intervalMs,
+        },
       },
     },
 
@@ -365,12 +386,37 @@ module.exports = (app) => {
         ...DEFAULT_CONFIG.training,
         ...(options?.training ?? {}),
       };
+      config.weatherCurrent = {
+        ...DEFAULT_CONFIG.weatherCurrent,
+        ...(options?.weatherCurrent ?? {}),
+      };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
       groundTrack = new deps.GroundTrack();
+
+      // §6.2 tier 3: poll the Signal K Weather API for the point-forecast
+      // current at the vessel position (typically a GRIB another process
+      // downloaded). Off the 1 Hz hot path: slow interval, cached read.
+      if (config.weatherCurrent.enabled) {
+        // Mirror signalk-energy-predictor's base-URL resolution.
+        const port = app.config?.port ?? 3000;
+        const baseUrl =
+          config.weatherCurrent.baseUrl || `http://localhost:${port}`;
+        weatherClient = new deps.WeatherCurrentClient({
+          baseUrl,
+          intervalMs: config.weatherCurrent.intervalMs,
+          getPosition: () => {
+            const gps = unwrapPosition(deltaState.get("navigation.position"));
+            if (gps) return gps;
+            return engine?.origin ?? null;
+          },
+          onStatus: (msg) => setStatus(msg),
+        });
+        weatherClient.start();
+      }
       training = new deps.TrainingState({
         settleSustainS: config.training.settleSustainS,
       });
@@ -485,6 +531,8 @@ module.exports = (app) => {
       matrix = null;
       engine = null;
       groundTrack = null;
+      weatherClient?.stop();
+      weatherClient = null;
       training = null;
       // Hygiene: clear a live advisory so it doesn't linger after the
       // plugin stops monitoring.
@@ -646,7 +694,14 @@ module.exports = (app) => {
 
     // Resolve the best available current vector (SPEC §6.2). v1 ships
     // tier 5 (zero); the resolver has a hook for tier 4 pilot charts.
-    const current = deps.resolveCurrent({}, undefined);
+    // Resolve the best available current vector (SPEC §6.2): tier 3
+    // (Weather API GRIB via the poller cache) → tier 4 pilot charts
+    // (reserved) → tier 5 zero. Synchronous cache read, no network on
+    // the tick path.
+    const current = deps.resolveCurrent({
+      weather: weatherClient?.currentAt(Date.now()),
+      nowMs: Date.now(),
+    });
 
     const pos = engine.tick(
       {

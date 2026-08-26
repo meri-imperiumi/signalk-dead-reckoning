@@ -146,26 +146,6 @@ class TrainingState {
 }
 
 /**
- * Resolves the best available current vector (SPEC §6.2). v1 implements
- * tier 5 (zero vector) as the default and a hook for tier 4 (offline pilot
- * charts). Higher tiers (manual override, Starlink NetCDF, GRIB) are
- * later work docs; the call site is stable as those are added.
- *
- * The resolver is a plain function of the current state plus a `db`-bound
- * pilot-chart lookup; it returns the highest tier that has data.
- *
- * @param {object} _ctx - reserved for future manual-override TTL state
- * @param {object} [pilotLookup] - optional (month,lat,lon)->{u,v} function
- * @returns {{setTrue: number, drift: number, tier: number}}
- */
-function resolveCurrent(_ctx, _pilotLookup) {
-  // v1: tier 5 (zero vector) only. The `_pilotLookup` hook is reserved for
-  // tier 4 (offline pilot charts, SPEC §6.2); left unused until that work
-  // doc lands, so the call-site signature stays stable.
-  return { setTrue: 0, drift: 0, tier: 5 };
-}
-
-/**
  * Angular difference in degrees, normalized to [-180, 180).
  *
  * @param {number} aDeg
@@ -569,7 +549,6 @@ function tick(st, s) {
 
 module.exports = {
   TrainingState,
-  resolveCurrent,
   detectFouling,
   updateTransient,
   classifyManeuver,

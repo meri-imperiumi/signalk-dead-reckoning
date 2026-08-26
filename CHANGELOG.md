@@ -7,14 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Signal K Weather API current (SPEC §6.2 tier 3): a new
+  `plugin/current.js` subsystem polls
+  `/signalk/v2/api/weather/forecasts/point` at the vessel position
+  (default every 30 min, off the 1 Hz hot path) and integrates the
+  point-forecast `current` — `set` (rad) / `drift` (m/s), converted and
+  u/v-interpolated between bracketing forecast entries — into the DR
+  solution as set/drift. Offshore this is typically backed by a GRIB
+  another process already downloaded, so it works without the plugin
+  itself having connectivity. `resolveCurrent` (moved from
+  `training.js`) resolves the full hierarchy: manual override (tier 1,
+  not yet wired to an input) → weather API (tier 3) → offline pilot
+  charts (tier 4, reserved hook) → zero vector (tier 5). A failed
+  fetch keeps the previous cache until its TTL lapses; the resolved
+  tier + source is published with `environment.current`. Config:
+  `weatherCurrent.enabled` (default on), `.intervalMs`. The endpoint
+  requires no authentication (verified against a live server), so no
+  token plumbing is needed.
+
 ### Fixed
 - `POST /fix/resolve` and `POST /fix` no longer return `observations not
   resolvable` when called with only `lop_ids`/`cpl_ids` (the common sight
   panel path). The pipeline now hydrates the observation bodies from the
   database via the new `getLineOfPosition`/`getCircularPositionLine` db
   helpers, then runs the geometric resolver on them.
-
-### Fixed
 - Bearing LOP no longer "runs through and past the object to the
   opposite bearing." A bearing LOP is now drawn as a ray from the
   charted object toward the navigator's side (the reciprocal of the
@@ -22,8 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symmetric infinite line through the object. Celestial LOPs stay
   symmetric infinite lines. `lopLineSpec` now exposes `lopType`, and
   `extendLineSpec` renders bearing vs celestial LOPs differently.
-
-### Added
 - Sun-run-sun / running fix (SPEC §9.1): `resolveCandidateFix` now
   advances earlier observations to the timestamp of the latest one along
   the vessel's DR track before resolving, turning two LOPs taken at

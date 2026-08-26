@@ -1727,3 +1727,61 @@ test("POST /fix with source_type gps confirms a fix at the given position", asyn
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("tick integrates the Weather API current into the DR solution (tier 3)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-weather-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const realFetch = globalThis.fetch;
+  // Point forecast: 1 m/s due east → set 90° true, drift ≈ 1.944 kn.
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => [
+      {
+        date: new Date().toISOString(),
+        current: { set: Math.PI / 2, drift: 1 },
+      },
+    ],
+  });
+  try {
+    plugin.start({
+      tickIntervalMs: 20,
+      saveIntervalMs: 60000,
+      weatherCurrent: { enabled: true, intervalMs: 50 },
+    });
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    // Wait for the weather poll to land (interval 50 ms) and a DR tick.
+    await new Promise((r) => setTimeout(r, 1200));
+    const currentVals = app.handledMessages.flatMap((m) =>
+      m.message?.updates?.flatMap((u) =>
+        (u.values ?? []).filter((v) => v.path === "environment.current"),
+      ),
+    );
+    assert.ok(currentVals.length > 0, "no environment.current published");
+    const last = currentVals[currentVals.length - 1].value;
+    assert.strictEqual(last.tier, 3);
+    assert.strictEqual(last.source, "weather-api");
+    assert.ok(Math.abs(last.setTrue - 90) < 1e-6, `setTrue ${last.setTrue}`);
+    assert.ok(Math.abs(last.drift - 3600 / 1852) < 1e-6, `drift ${last.drift}`);
+  } finally {
+    globalThis.fetch = realFetch;
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});

@@ -1,6 +1,7 @@
 /**
- * Tests for Training Mode (SPEC §6.1, §6.3, §6.4) and current resolution
- * (§6.2). Pure-logic tests over TrainingState; no Signal K plumbing.
+ * Tests for Training Mode (SPEC §6.1, §6.3, §6.4). Pure-logic tests over
+ * TrainingState; no Signal K plumbing. Current resolution (§6.2) is
+ * tested in current.test.js.
  * @file training.test.js
  */
 
@@ -9,7 +10,6 @@ const assert = require("node:assert/strict");
 
 const {
   TrainingState,
-  resolveCurrent,
   detectFouling,
   updateTransient,
   isGpsReliable,
@@ -42,11 +42,6 @@ function snap(overrides = {}) {
     ...overrides,
   };
 }
-
-test("resolveCurrent returns the tier-5 zero vector when nothing better exists", () => {
-  const c = resolveCurrent({}, undefined);
-  assert.deepStrictEqual(c, { setTrue: 0, drift: 0, tier: 5 });
-});
 
 test("detectFouling is false when STW reads motion", () => {
   assert.strictEqual(
