@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database via the new `getLineOfPosition`/`getCircularPositionLine` db
   helpers, then runs the geometric resolver on them.
 
+### Fixed
+- Bearing LOP no longer "runs through and past the object to the
+  opposite bearing." A bearing LOP is now drawn as a ray from the
+  charted object toward the navigator's side (the reciprocal of the
+  measured bearing), with a short stub past the object, instead of a
+  symmetric infinite line through the object. Celestial LOPs stay
+  symmetric infinite lines. `lopLineSpec` now exposes `lopType`, and
+  `extendLineSpec` renders bearing vs celestial LOPs differently.
+
 ### Added
 - Sun-run-sun / running fix (SPEC §9.1): `resolveCandidateFix` now
   advances earlier observations to the timestamp of the latest one along

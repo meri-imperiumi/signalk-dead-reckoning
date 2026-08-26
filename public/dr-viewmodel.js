@@ -177,20 +177,42 @@ export function lopLineSpec(lop) {
   return {
     anchor,
     azimuthDeg: lop.azimuth_true,
+    lopType: lop.lop_type ?? "celestial",
     used: lop.used_in_fix_id != null,
   };
 }
 
 /**
- * Extends a line spec to two far endpoints ±lengthNm along the
- * perpendicular, for drawing as a polyline (renderer clips to view).
+ * Extends a line spec to two far endpoints for drawing as a polyline.
  *
- * @param {{anchor: [number, number], azimuthDeg: number}} spec
+ * - **Celestial LOP**: an infinite line perpendicular to the azimuth
+ *   through the intercept point — drawn symmetric ±lengthNm, since the
+ *   navigator's position could be on either side.
+ * - **Bearing LOP**: the line through the charted object along the
+ *   measured bearing. The navigator lies on the *reciprocal* side of
+ *   the object (bearing + 180°), so we draw a ray from the object toward
+ *   the navigator rather than a symmetric line through the object — a
+ *   symmetric line visually "runs through and past the object to the
+ *   opposite bearing," which reads as wrong even though the infinite
+ *   line is mathematically correct. The near endpoint sits a short
+ *   distance past the object so the line still visibly touches it.
+ *
+ * @param {{anchor: [number, number], azimuthDeg: number, lopType?: string}} spec
  * @param {number} [lengthNm=60]
  * @returns {[[number, number], [number, number]]}
  */
 export function extendLineSpec(spec, lengthNm = 60) {
   const perp = (spec.azimuthDeg + 90) % 360;
+  if (spec.lopType === "bearing") {
+    // perp already points toward the navigator (reciprocal of the
+    // measured bearing). Draw a ray from just past the object (the
+    // short stub on the away side) toward the navigator's side.
+    const away = (perp + 180) % 360;
+    return [
+      destinationPoint(spec.anchor, away, 1),
+      destinationPoint(spec.anchor, perp, lengthNm),
+    ];
+  }
   return [
     destinationPoint(spec.anchor, perp, lengthNm),
     destinationPoint(spec.anchor, (perp + 180) % 360, lengthNm),
