@@ -852,3 +852,173 @@ function latestUncertainty(app) {
   if (vals.length === 0) throw new Error("no uncertainty delta published");
   return vals[vals.length - 1].value;
 }
+
+test("divergence advisory raises on sustained DR-GPS divergence and publishes the readout", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-dvg-raise-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  // Fast tick + fast hysteresis so the 30s default doesn't slow the test.
+  plugin.start({
+    tickIntervalMs: 100,
+    divergence: { sustainS: 0.3, clearS: 0.3 },
+  });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // GPS held fixed at (60, 24) while the boat sails north at 6 kn from it
+  // — divergence grows far faster than the fallback polygon radius.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 6 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  // Divergence readout published and growing.
+  const dvg = latestDivergence(app);
+  assert.ok(dvg.distance_nm > 0, "divergence readout should be non-zero");
+  // Advisory raised at alert severity, visual method.
+  const notif = latestNotification(
+    app,
+    "notifications.navigation.deadReckoning.divergenceAdvisory",
+  );
+  assert.ok(notif, "advisory notification not published");
+  assert.strictEqual(notif.state, "alert");
+  assert.ok(Array.isArray(notif.method) && notif.method.includes("visual"));
+  assert.ok(/consider taking a fix/.test(notif.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("divergence advisory clears after a confirmed fix snaps DR back to GPS", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-dvg-clear-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 100,
+    divergence: { sustainS: 0.3, clearS: 0.3 },
+  });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 6 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 900));
+  const raised = latestNotification(
+    app,
+    "notifications.navigation.deadReckoning.divergenceAdvisory",
+  );
+  assert.strictEqual(raised.state, "alert");
+
+  // Stop the boat and confirm a fix at the GPS position: DR snaps to it,
+  // divergence → 0, sustained recovery clears the advisory.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [{ values: [{ path: "navigation.speedThroughWater", value: 0 }] }],
+  });
+  router.invoke("post", "/fix", {
+    latitude: 60,
+    longitude: 24,
+    source_type: "gps",
+  });
+  await new Promise((r) => setTimeout(r, 900));
+  const cleared = latestNotification(
+    app,
+    "notifications.navigation.deadReckoning.divergenceAdvisory",
+  );
+  assert.strictEqual(cleared.state, "normal");
+  assert.ok(/back within expected uncertainty/.test(cleared.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("divergence monitor is suppressed at anchor", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-dvg-anchor-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 100,
+    divergence: { sustainS: 0.3, clearS: 0.3 },
+  });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // Same divergent geometry, but anchored: no divergence readout, no advisory.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 6 },
+          { path: "navigation.headingTrue", value: 0 },
+          { path: "navigation.state", value: "anchored" },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 900));
+  const vals = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === "navigation.deadReckoning.divergence");
+  assert.strictEqual(
+    vals.length,
+    0,
+    "divergence readout should be suppressed at anchor",
+  );
+  const notif = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .find(
+      (v) =>
+        v.path === "notifications.navigation.deadReckoning.divergenceAdvisory",
+    );
+  assert.ok(!notif, "advisory should not fire at anchor");
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+/** Returns the latest published divergence readout, or throws. */
+function latestDivergence(app) {
+  const vals = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === "navigation.deadReckoning.divergence");
+  if (vals.length === 0) throw new Error("no divergence delta published");
+  return vals[vals.length - 1].value;
+}
+
+/** Returns the latest value of a notification path, or undefined. */
+function latestNotification(app, path) {
+  const vals = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === path);
+  return vals.length ? vals[vals.length - 1].value : undefined;
+}

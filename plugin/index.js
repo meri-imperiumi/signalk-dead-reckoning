@@ -39,6 +39,13 @@ const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
 const { reduceSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
 const { computeRadius } = require("./uncertainty.js");
+const {
+  DEFAULT_FACTOR,
+  DEFAULT_SUSTAIN_S,
+  DEFAULT_CLEAR_S,
+  createDivergenceState,
+  divergenceTick,
+} = require("./divergence.js");
 
 /**
  * Plugin identifier (matches package name without the scope).
@@ -58,6 +65,7 @@ const PATHS = {
   headingTrue: "navigation.headingTrue",
   current: "environment.current",
   uncertainty: "navigation.deadReckoning.uncertainty",
+  divergence: "navigation.deadReckoning.divergence",
   gpsSpoofed: "notifications.navigation.gpsSpoofed",
   divergenceAdvisory:
     "notifications.navigation.deadReckoning.divergenceAdvisory",
@@ -87,6 +95,11 @@ const SUBSCRIPTION_PATHS = [
 const DEFAULT_CONFIG = {
   tickIntervalMs: 1000,
   saveIntervalMs: 60000,
+  divergence: {
+    factor: DEFAULT_FACTOR,
+    sustainS: DEFAULT_SUSTAIN_S,
+    clearS: DEFAULT_CLEAR_S,
+  },
 };
 
 /**
@@ -106,6 +119,8 @@ const deps = {
   resolveCandidateFix,
   confirmFix,
   computeRadius,
+  createDivergenceState,
+  divergenceTick,
   DeadReckoningEngine,
   MatrixStore,
   TrainingState,
@@ -144,6 +159,9 @@ module.exports = (app) => {
   /** @type {number|null} monotonic seconds counter for the training loop */
   let clockS = 0;
 
+  /** @type {ReturnType<typeof createDivergenceState>|null} §7.3 divergence monitor */
+  let divergence = null;
+
   /** @type {number|null} */
   let tickInterval = null;
 
@@ -180,12 +198,18 @@ module.exports = (app) => {
 
     start: (options) => {
       config = { ...DEFAULT_CONFIG, ...(options || {}) };
+      // Allow partial divergence overrides without losing the defaults.
+      config.divergence = {
+        ...DEFAULT_CONFIG.divergence,
+        ...(options?.divergence ?? {}),
+      };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
       training = new deps.TrainingState();
+      divergence = deps.createDivergenceState();
       clockS = 0;
 
       // Seed the engine origin from the last known good position, if any.
@@ -269,6 +293,15 @@ module.exports = (app) => {
       matrix = null;
       engine = null;
       training = null;
+      // Hygiene: clear a live advisory so it doesn't linger after the
+      // plugin stops monitoring.
+      if (divergence?.active) {
+        publishNotification(PATHS.divergenceAdvisory, {
+          state: "normal",
+          message: "DR monitoring stopped",
+        });
+      }
+      divergence = null;
       clockS = 0;
       setStatus("Dead reckoning stopped");
     },
@@ -452,6 +485,41 @@ module.exports = (app) => {
         deviationRows: devRows,
         stwKn: rawStw,
       });
+
+      // §7.3 band 2: gradual DR-vs-GPS divergence vs the polygon's
+      // expected growth (§8), with sustained-interval hysteresis so a
+      // single jittery fix neither raises nor flaps the advisory.
+      // §14.1's live divergence readout (distance + bearing) is published
+      // alongside. Suppressed at anchor/moored (different regime, §7.1–2).
+      const navState = deltaState.get("navigation.state");
+      const underway = navState !== "anchored" && navState !== "moored";
+      let dvg = null;
+      if (gps && underway) {
+        const distNm = deps.distanceNm(pos, gps);
+        const brg = deps.bearingDeg(pos, gps);
+        dvg = { distance_nm: distNm, bearing_true: brg };
+        const d = deps.divergenceTick(
+          divergence,
+          {
+            divergenceNm: distNm,
+            radiusNm: u.radius_nm,
+            dtS: config.tickIntervalMs / 1000,
+          },
+          config.divergence,
+        );
+        if (d.transition === "raise") {
+          publishNotification(PATHS.divergenceAdvisory, {
+            state: "alert",
+            message: `DR-GPS divergence ${d.divergenceNm.toFixed(2)} nm exceeds expected ${d.expectedNm.toFixed(2)} nm (uncertainty × ${config.divergence.factor}) — consider taking a fix`,
+          });
+        } else if (d.transition === "clear") {
+          publishNotification(PATHS.divergenceAdvisory, {
+            state: "normal",
+            message: `DR-GPS divergence back within expected uncertainty (${d.divergenceNm.toFixed(2)} nm)`,
+          });
+        }
+      }
+
       publish({
         [PATHS.position]: pos,
         [PATHS.active]: engine.active,
@@ -465,6 +533,7 @@ module.exports = (app) => {
           radius_nm: u.radius_nm,
           method: u.method,
         },
+        ...(dvg ? { [PATHS.divergence]: dvg } : {}),
       });
     }
   }
@@ -502,6 +571,36 @@ module.exports = (app) => {
             path,
             value,
           })),
+        },
+      ],
+    });
+  }
+
+  /**
+   * Publishes (or clears, via state "normal") a Signal K notification
+   * (SPEC §3.1). Visual method only — these are low-severity nudges, not
+   * sound alarms.
+   *
+   * @param {string} path
+   * @param {{state: string, message: string}} n
+   * @returns {void}
+   */
+  function publishNotification(path, n) {
+    app.handleMessage(PLUGIN_ID, {
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path,
+              value: {
+                message: n.message,
+                state: n.state,
+                method: ["visual"],
+                timestamp: new Date().toISOString(),
+              },
+            },
+          ],
         },
       ],
     });
@@ -547,6 +646,14 @@ module.exports = (app) => {
                 displayName: "DR uncertainty polygon",
                 description:
                   "Confidence-weighted circular error region around the DR position; radius scales with distance run and tightens as the matching matrix bin accumulates hits.",
+              },
+            },
+            {
+              path: PATHS.divergence,
+              value: {
+                displayName: "DR-GPS divergence",
+                description:
+                  "Live distance and true bearing from the shadow-boat DR position to the last GPS fix — the at-a-glance model-quality diagnostic.",
               },
             },
           ],

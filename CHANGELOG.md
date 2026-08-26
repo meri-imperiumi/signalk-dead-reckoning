@@ -57,3 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meta; recomputed per tick from the current bin so bin transitions
   (tack, sail change) re-evaluate it. New `db.getDeviationRateStats`
   reads recent per-condition correction rows for the model.
+- Divergence advisory (SPEC §7.3, gradual band): pure
+  `plugin/divergence.js` monitor with sustained-interval hysteresis
+  (raises when DR-vs-GPS divergence exceeds 1.5× the uncertainty
+  polygon radius for 30s, clears on 30s sustained recovery; both
+  tunable via `start({divergence: {...}})`) — the "get a fix" nudge
+  the polygon was built to threshold. Publishes/clears
+  `notifications.navigation.deadReckoning.divergenceAdvisory` at
+  `alert` severity (visual method) with the divergence/expected
+  numbers in the message, suppressed at anchor/moored, held (not
+  progressed) when either position is missing, and cleared on plugin
+  stop if live. Also publishes
+  `navigation.deadReckoning.divergence` `{distance_nm, bearing_true}`
+  each tick — the §14.1 live divergence readout input.
