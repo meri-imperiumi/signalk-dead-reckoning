@@ -22,6 +22,10 @@ const {
   recordCorrection,
   getDeviationRateStats,
   markFixLogged,
+  listFixes,
+  listLinesOfPosition,
+  listCircularPositionLines,
+  listCorrections,
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
@@ -75,6 +79,7 @@ const PATHS = {
   current: "environment.current",
   uncertainty: "navigation.deadReckoning.uncertainty",
   divergence: "navigation.deadReckoning.divergence",
+  state: "navigation.deadReckoning.state",
   gpsSpoofed: "notifications.navigation.gpsSpoofed",
   divergenceAdvisory:
     "notifications.navigation.deadReckoning.divergenceAdvisory",
@@ -152,6 +157,10 @@ const deps = {
   createAccessRequestClient,
   newClientId,
   markFixLogged,
+  listFixes,
+  listLinesOfPosition,
+  listCircularPositionLines,
+  listCorrections,
   DeadReckoningEngine,
   MatrixStore,
   TrainingState,
@@ -482,7 +491,26 @@ module.exports = (app) => {
     // Heading: prefer true heading; fall back to magnetic (WMM correction
     // applied upstream in v1 — see SPEC §12). If neither, hold position.
     const headingTrueDeg = headingTrue ?? headingMag;
-    if (headingTrueDeg == null || rawStw == null) return;
+    if (headingTrueDeg == null || rawStw == null) {
+      // Publish why DR is idle so the UI (SPEC §14.1) can explain the empty
+      // readout instead of leaving the user to guess. The vessel isn't
+      // necessarily broken — moored/anchored with no STW/heading is normal.
+      const navState = deltaState.get("navigation.state");
+      let reason;
+      if (navState === "moored" || navState === "anchored") {
+        reason = navState;
+      } else if (rawStw == null && headingTrueDeg == null) {
+        reason = "no speed or heading";
+      } else if (rawStw == null) {
+        reason = "no speed through water";
+      } else {
+        reason = "no heading";
+      }
+      publish({
+        [PATHS.state]: { status: "idle", reason },
+      });
+      return;
+    }
 
     // Look up learned corrections for the current condition. Sail/sea state
     // come from the logbook peer when available; absent here they fall to
@@ -633,6 +661,7 @@ module.exports = (app) => {
           radius_nm: u.radius_nm,
           method: u.method,
         },
+        [PATHS.state]: { status: "underway" },
         ...(dvg ? { [PATHS.divergence]: dvg } : {}),
       });
     }
@@ -942,6 +971,55 @@ module.exports = (app) => {
         elapsedSinceOriginS: engine.elapsedSinceOriginS,
         binCount: matrix.count(),
       });
+    });
+
+    /**
+     * GET /fixes — recent confirmed fixes for the map overlay (SPEC
+     * §14.1 fix points). `limit` caps the result (default 100).
+     */
+    router.get("/fixes", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const limit = Math.max(
+        1,
+        Math.min(1000, Number(req.query?.limit) || 100),
+      );
+      res.json({ fixes: deps.listFixes(db, { limit }) });
+    });
+
+    /**
+     * GET /observations — persisted LOPs and CPLs for the map overlay
+     * (SPEC §14.1 geometric primitives). Unused/unresolved observations
+     * (used_in_fix_id IS NULL) are marked so the UI can emphasize them.
+     */
+    router.get("/observations", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const limit = Math.max(
+        1,
+        Math.min(1000, Number(req.query?.limit) || 100),
+      );
+      res.json({
+        lops: deps.listLinesOfPosition(db, { limit }),
+        cpls: deps.listCircularPositionLines(db, { limit }),
+      });
+    });
+
+    /**
+     * GET /corrections — recent snap-to-fix corrections for the dashed
+     * vector overlay (SPEC §9.3, §14.1).
+     */
+    router.get("/corrections", (req, res) => {
+      if (!engine || !db) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 20));
+      res.json({ corrections: deps.listCorrections(db, { limit }) });
     });
 
     /**

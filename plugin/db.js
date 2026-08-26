@@ -433,6 +433,81 @@ function markFixLogged(db, fixId, logbookRef) {
   ).run(logbookRef ?? null, fixId);
 }
 
+/**
+ * Lists recent confirmed fixes for the UI (SPEC §14.1 fix points).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} [q]
+ * @param {number} [q.limit=100]
+ * @returns {Array<object>} newest-first
+ */
+function listFixes(db, q = {}) {
+  return db
+    .prepare(
+      `SELECT fix_id, timestamp, source_type, latitude, longitude,
+              estimated_error_radius, confirmed_by, resets_dr_origin
+       FROM fixes ORDER BY fix_id DESC LIMIT ?`,
+    )
+    .all(q.limit ?? 100);
+}
+
+/**
+ * Lists persisted lines of position for the UI (SPEC §14.1 LOP overlay).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} [q]
+ * @param {number} [q.limit=100]
+ * @returns {Array<object>} newest-first
+ */
+function listLinesOfPosition(db, q = {}) {
+  return db
+    .prepare(
+      `SELECT lop_id, timestamp, lop_type, assumed_lat, assumed_lon,
+              azimuth_true, intercept_nm, body_or_object, used_in_fix_id
+       FROM lines_of_position ORDER BY lop_id DESC LIMIT ?`,
+    )
+    .all(q.limit ?? 100);
+}
+
+/**
+ * Lists persisted circular position lines for the UI (SPEC §14.1 CPL
+ * overlay — distinct primitive from LOPs).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} [q]
+ * @param {number} [q.limit=100]
+ * @returns {Array<object>} newest-first
+ */
+function listCircularPositionLines(db, q = {}) {
+  return db
+    .prepare(
+      `SELECT cpl_id, timestamp, center_lat, center_lon, radius_nm,
+              source_object, used_in_fix_id
+       FROM circular_position_lines ORDER BY cpl_id DESC LIMIT ?`,
+    )
+    .all(q.limit ?? 100);
+}
+
+/**
+ * Lists recent snap-to-fix corrections for the UI (SPEC §9.3/§14.1 —
+ * dashed vector from pre-snap ghost position to confirmed fix).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} [q]
+ * @param {number} [q.limit=20]
+ * @returns {Array<object>} newest-first
+ */
+function listCorrections(db, q = {}) {
+  return db
+    .prepare(
+      `SELECT correction_id, timestamp, dr_lat, dr_lon, fix_lat, fix_lon,
+              deviation_nm, deviation_bearing, dr_elapsed_seconds,
+              sail_state, sea_state
+       FROM dr_corrections ORDER BY correction_id DESC LIMIT ?`,
+    )
+    .all(q.limit ?? 20);
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
@@ -446,4 +521,8 @@ module.exports = {
   recordCorrection,
   getDeviationRateStats,
   markFixLogged,
+  listFixes,
+  listLinesOfPosition,
+  listCircularPositionLines,
+  listCorrections,
 };

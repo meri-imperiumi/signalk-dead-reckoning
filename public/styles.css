@@ -81,10 +81,3 @@ dr-app {
   background: var(--dr-accent);
   border-color: var(--dr-accent);
 }
-
-dr-map-view {
-  display: block;
-  height: 60vh;
-  border-radius: 8px;
-  overflow: hidden;
-}

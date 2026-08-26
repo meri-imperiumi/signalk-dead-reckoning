@@ -1,56 +1,134 @@
 /**
  * Signal K WebSocket stream subscription helper for the DR webapp.
  *
- * Opens a subscription to the dead-reckoning delta paths and forwards
- * updates to any registered listeners. v1 stub: connects but the app shell
- * renders from REST polling for now.
+ * Follows the established pattern from signalk-status-tiles' st-stream.js:
+ * connects to `/signalk/v1/stream?subscribe=none&sendMeta=all`, sends an
+ * explicit subscribe message with `policy: "instant"` + `minPeriod: 1000`
+ * (1 Hz throttle), auto-reconnects on link loss, and forwards only delta
+ * frames (skipping hello/ack). Link-state transitions are reported so the
+ * UI can show "link lost" immediately.
  *
  * @file dr-signalk-stream.js
  */
+
+/** Reconnect retry interval (ms) — fixed, not backed off. */
+const RETRY_MS = 5000;
 
 class DrSignalkStream {
   constructor() {
     /** @type {WebSocket|null} */
     this.ws = null;
+    /** @type {Array<string>} */
+    this.paths = [
+      "navigation.deadReckoning.position",
+      "navigation.deadReckoning.active",
+      "navigation.deadReckoning.log",
+      "navigation.position",
+    ];
     /** @type {Set<(data: object) => void>} */
     this.listeners = new Set();
+    /** @type {Set<(status: {state: string}) => void>} */
+    this.statusListeners = new Set();
+    /** @type {number|null} */
+    this.reconnectTimer = null;
+    /** @type {boolean} */
+    this.closed = false;
+    /** @type {number} delay before next reconnect */
+    this.retryMs = RETRY_MS;
   }
 
   /**
-   * Connects to the Signal K WebSocket endpoint.
+   * Builds the stream URL from window.location.
    *
-   * @param {string} [url]
+   * @returns {string}
+   */
+  url() {
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${window.location.host}/signalk/v1/stream?subscribe=none&sendMeta=all`;
+  }
+
+  /**
+   * Connects to the Signal K WebSocket endpoint. Auto-reconnects on
+   * close unless `close()` was called.
+   *
    * @returns {void}
    */
-  connect(url) {
-    const wsUrl =
-      url ||
-      `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/signalk/v1/stream`;
-    this.ws = new WebSocket(wsUrl);
-    this.ws.onopen = () => {
-      this.ws?.send(
-        JSON.stringify({
-          context: "vessels.self",
-          subscribe: [
-            { path: "navigation.deadReckoning.position", policy: "instant" },
-            { path: "navigation.deadReckoning.active", policy: "instant" },
-            { path: "navigation.deadReckoning.log", policy: "instant" },
-          ],
-        }),
-      );
-    };
-    this.ws.onmessage = (ev) => {
+  connect() {
+    if (this.closed) return;
+    this.retryMs = RETRY_MS;
+    this.emitStatus("connecting");
+    const ws = new WebSocket(this.url());
+    this.ws = ws;
+
+    ws.addEventListener("open", () => {
+      this.emitStatus("open");
+      this.sendSubscription();
+    });
+
+    ws.addEventListener("message", (ev) => {
+      let data;
       try {
-        const data = JSON.parse(ev.data);
-        for (const fn of this.listeners) fn(data);
+        data = JSON.parse(ev.data);
       } catch {
-        // Ignore non-JSON frames (heartbeats etc.)
+        return;
       }
-    };
+      if (data.errorMessage) {
+        console.error("[dr] stream error:", data.errorMessage);
+      }
+      // Forward only delta frames (hello/ack have no updates).
+      if (data.updates) {
+        for (const fn of this.listeners) fn(data);
+      }
+    });
+
+    ws.addEventListener("close", () => {
+      if (this.closed) return;
+      this.emitStatus("retrying");
+      this.reconnectTimer = setTimeout(() => this.connect(), this.retryMs);
+    });
+
+    ws.addEventListener("error", () => {
+      // error carries no actionable detail; close() drives the reconnect.
+      ws.close();
+    });
   }
 
   /**
-   * Registers a listener for stream updates.
+   * Sends the subscription for the current path set (no-op when the
+   * socket isn't open).
+   *
+   * @returns {void}
+   */
+  sendSubscription() {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.paths.length === 0) return;
+    this.ws.send(
+      JSON.stringify({
+        context: "vessels.self",
+        subscribe: this.paths.map((path) => ({
+          path,
+          policy: "instant",
+          minPeriod: 1000,
+        })),
+      }),
+    );
+  }
+
+  /**
+   * Sets the subscription path set and reconnects immediately so the new
+   * paths take effect at once (a deliberate re-subscribe, not a failure).
+   *
+   * @param {Array<string>} paths
+   * @returns {void}
+   */
+  subscribe(paths) {
+    this.paths = paths;
+    this.retryMs = 0;
+    this.ws?.close();
+  }
+
+  /**
+   * Registers a listener for stream delta updates.
    *
    * @param {(data: object) => void} fn
    * @returns {() => void} unsubscribe
@@ -61,14 +139,49 @@ class DrSignalkStream {
   }
 
   /**
-   * Closes the stream.
+   * Registers a listener for link-state transitions.
+   *
+   * @param {(status: {state: "connecting"|"open"|"retrying"}) => void} fn
+   * @returns {() => void}
+   */
+  onStatus(fn) {
+    this.statusListeners.add(fn);
+    return () => this.statusListeners.delete(fn);
+  }
+
+  /**
+   * @param {"connecting"|"open"|"retrying"} state
+   * @returns {void}
+   */
+  emitStatus(state) {
+    for (const fn of this.statusListeners) fn({ state });
+  }
+
+  /**
+   * Connects on first page load when running in a browser.
+   *
+   * @returns {void}
+   */
+  start() {
+    if (typeof window !== "undefined" && !this.ws && !this.closed) {
+      this.connect();
+    }
+  }
+
+  /**
+   * Permanently closes the stream; no further reconnects are scheduled.
    *
    * @returns {void}
    */
   close() {
+    this.closed = true;
+    if (this.reconnectTimer != null) clearTimeout(this.reconnectTimer);
     this.ws?.close();
     this.ws = null;
   }
 }
 
 window.drSignalkStream = new DrSignalkStream();
+window.addEventListener("DOMContentLoaded", () => {
+  window.drSignalkStream.start();
+});

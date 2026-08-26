@@ -129,6 +129,81 @@ test("tick publishes a deadReckoning.position delta with the origin", async () =
   plugin.stop();
 });
 
+test("tick publishes an idle state reason when moored (no speed/heading)", async () => {
+  const { app, plugin } = makeStarted();
+  // Moored, no STW or heading → step() can't compute DR.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          { path: "navigation.state", value: "moored" },
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1100));
+  const stateDeltas = app.handledMessages
+    .filter((m) =>
+      m.message?.updates?.some((u) =>
+        u.values?.some((v) => v.path === "navigation.deadReckoning.state"),
+      ),
+    )
+    .flatMap((m) =>
+      m.message.updates.flatMap((u) =>
+        u.values.filter((v) => v.path === "navigation.deadReckoning.state"),
+      ),
+    );
+  assert.ok(stateDeltas.length > 0, "no idle state delta published");
+  assert.strictEqual(stateDeltas[stateDeltas.length - 1].value.status, "idle");
+  assert.strictEqual(
+    stateDeltas[stateDeltas.length - 1].value.reason,
+    "moored",
+  );
+  plugin.stop();
+});
+
+test("tick publishes underway state when DR is running", async () => {
+  const { app, plugin } = makeStarted();
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1100));
+  const stateDeltas = app.handledMessages
+    .filter((m) =>
+      m.message?.updates?.some((u) =>
+        u.values?.some((v) => v.path === "navigation.deadReckoning.state"),
+      ),
+    )
+    .flatMap((m) =>
+      m.message.updates.flatMap((u) =>
+        u.values.filter((v) => v.path === "navigation.deadReckoning.state"),
+      ),
+    );
+  assert.ok(stateDeltas.length > 0, "no underway state delta published");
+  assert.strictEqual(
+    stateDeltas[stateDeltas.length - 1].value.status,
+    "underway",
+  );
+  plugin.stop();
+});
+
 test("GET /status returns engine snapshot", () => {
   const { app, plugin, router } = makeStarted();
   app.emitDelta({
@@ -1264,5 +1339,130 @@ test("logbook: completed tack writes one entry, debounced for a second maneuver"
   } finally {
     globalThis.fetch = realFetch;
   }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("GET /fixes, /observations, /corrections expose the UI overlay shapes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-ui-rest-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  // Seed: one LOP, one CPL, one confirmed fix (with correction).
+  const lop = router.invoke("post", "/fix/lop", {
+    timestamp: new Date().toISOString(),
+    azimuth_true: 45,
+    assumed_lat: 60.02,
+    assumed_lon: 24.02,
+    intercept_nm: 1.2,
+    lop_type: "celestial",
+    body_or_object: "Sun",
+  });
+  const cpl = router.invoke("post", "/fix/cpl", {
+    timestamp: new Date().toISOString(),
+    center_lat: 60.05,
+    center_lon: 24.05,
+    radius_nm: 3.5,
+    source_object: "lighthouse",
+  });
+  router.invoke("post", "/fix", {
+    latitude: 60.001,
+    longitude: 24.001,
+    source_type: "gps",
+    confirmed_by: "Alice",
+  });
+
+  const fixes = router.invoke("get", "/fixes", undefined);
+  assert.strictEqual(fixes.status, 200);
+  assert.ok(Array.isArray(fixes.body.fixes));
+  const fixRow = fixes.body.fixes[0];
+  for (const k of [
+    "fix_id",
+    "timestamp",
+    "source_type",
+    "latitude",
+    "longitude",
+    "confirmed_by",
+  ]) {
+    assert.ok(k in fixRow, `fixes row missing ${k}`);
+  }
+
+  const obs = router.invoke("get", "/observations", undefined);
+  assert.strictEqual(obs.status, 200);
+  assert.strictEqual(obs.body.lops.length, 1);
+  const lopRow = obs.body.lops[0];
+  for (const k of [
+    "lop_id",
+    "assumed_lat",
+    "assumed_lon",
+    "azimuth_true",
+    "intercept_nm",
+    "used_in_fix_id",
+  ]) {
+    assert.ok(k in lopRow, `lop row missing ${k}`);
+  }
+  assert.strictEqual(obs.body.cpls.length, 1);
+  const cplRow = obs.body.cpls[0];
+  for (const k of [
+    "cpl_id",
+    "center_lat",
+    "center_lon",
+    "radius_nm",
+    "used_in_fix_id",
+  ]) {
+    assert.ok(k in cplRow, `cpl row missing ${k}`);
+  }
+
+  const corr = router.invoke("get", "/corrections", undefined);
+  assert.strictEqual(corr.status, 200);
+  assert.ok(corr.body.corrections.length >= 1);
+  const corrRow = corr.body.corrections[0];
+  for (const k of [
+    "dr_lat",
+    "dr_lon",
+    "fix_lat",
+    "fix_lon",
+    "deviation_nm",
+    "deviation_bearing",
+  ]) {
+    assert.ok(k in corrRow, `correction row missing ${k}`);
+  }
+
+  // Contract: the view-model consumes these exact shapes without error.
+  const vm = await import("../public/dr-viewmodel.js");
+  const lopSpec = vm.lopLineSpec(obs.body.lops[0]);
+  assert.ok(Array.isArray(lopSpec.anchor));
+  const cplSpec = vm.cplCircleSpec(obs.body.cpls[0]);
+  assert.strictEqual(cplSpec.radiusNm, 3.5);
+  const fixSpec = vm.fixPointSpec(
+    fixes.body.fixes[fixes.body.fixes.length - 1],
+  );
+  assert.ok(fixSpec.color);
+  const seg = vm.correctionSegmentSpec(corrRow);
+  assert.ok(Array.isArray(seg.from) && Array.isArray(seg.to));
+
+  // Limits are honored.
+  const limited = router.invoke("get", "/fixes?limit=1", undefined);
+  assert.strictEqual(limited.body.fixes.length, 1);
+
+  plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });

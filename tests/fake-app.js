@@ -96,15 +96,21 @@ class FakeRouter {
    * Finds a registered route and invokes it with stub req/res.
    *
    * @param {string} method
-   * @param {string} path
+   * @param {string} path - may carry a query string, parsed into req.query
    * @param {object} [reqBody]
+   * @param {object} [reqQuery] - explicit query overrides the path's
    * @returns {{status: number, body: unknown}}
    */
-  invoke(method, path, reqBody) {
+  invoke(method, path, reqBody, reqQuery) {
+    const [pathname, search] = path.split("?");
     const route = this.routes.find(
-      (r) => r.method === method && r.path === path,
+      (r) => r.method === method && r.path === pathname,
     );
     if (!route) throw new Error(`no ${method.toUpperCase()} ${path} route`);
+    const query = {};
+    if (search) {
+      for (const [k, v] of new URLSearchParams(search)) query[k] = v;
+    }
     const res = {
       statusCode: 200,
       status(code) {
@@ -115,7 +121,7 @@ class FakeRouter {
         this.body = body;
       },
     };
-    route.handler({ body: reqBody }, res);
+    route.handler({ body: reqBody, query: reqQuery ?? query }, res);
     return { status: res.statusCode, body: res.body };
   }
 }

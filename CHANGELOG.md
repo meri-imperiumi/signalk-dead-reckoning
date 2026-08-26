@@ -12,6 +12,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   point with subscription/start/stop structure, SQLite schema layer,
   dead-reckoning vector-integration engine, EMA matrix store, unified fix
   model, and `<dr-map-view>` web component stub.
+- DR web UI (SPEC §14.1): a pure, dependency-free view-model
+  (`public/dr-viewmodel.js` — TrackLog ring buffers, LOP/CPL/fix/correction
+  render specs, uncertainty + divergence helpers, sparkline reduction, and
+  a Signal K `resources/charts` tile-layer parser) backed by unit tests, and
+  a vendored-Leaflet `<dr-map-view>` adapter plus `<dr-app>` layout with
+  headline figures, dual Ghost/GPS track rendering, uncertainty polygon,
+  LOP/CPL/snap-vector overlays, the divergence chip + sparkline, and the
+  always-human-initiated Failover Override control. Tile-less by default
+  (offline-first); basemaps come from the server's configured charts
+  (`/signalk/v1/api/resources/charts`) via a Leaflet layers control, never
+  hardcoded OSM. New `GET /fixes`, `GET /observations`, `GET /corrections`
+  routes feed the persisted overlays.
+- DR engine idle-state reporting: the plugin publishes
+  `navigation.deadReckoning.state` (`{status: "idle"|"underway", reason}`)
+  so the UI can explain why the readout is empty when moored/anchored or
+  lacking speed/heading, instead of leaving the user to guess. The
+  webapp shows a status banner (amber idle, green underway, red link-lost)
+  and the GPS boat marker is always drawn when a fix is available.
+- Stream subscription hardened after signalk-status-tiles' st-stream.js:
+  `/signalk/v1/stream?subscribe=none&sendMeta=all` URL, `minPeriod: 1000`
+  throttle, auto-reconnect on link loss with immediate re-subscribe,
+  hello/ack filtering, and link-state reporting to the UI.
 - Unified fix pipeline (SPEC §4.4, §9.1, §9.3): DB helpers for inserting
   lines of position and circular position lines and attaching them to a
   confirmed fix; a pure local-planar geometric resolver (Line×Line,
