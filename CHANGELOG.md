@@ -30,6 +30,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lacking speed/heading, instead of leaving the user to guess. The
   webapp shows a status banner (amber idle, green underway, red link-lost)
   and the GPS boat marker is always drawn when a fix is available.
+- Historical GPS track from the Signal K history API
+  (`/signalk/v1/history/values`, same pattern as signalk-logbook's Map):
+  fetched once on load to seed the track, then extended by live deltas —
+  shows where the boat has actually been, the baseline against which DR
+  divergence is measured. Falls back to the live-session track when no
+  history provider is configured (route 404s).
+- Sight & LOP input panel (SPEC §14.1 "Manual LOP & Sight Input"):
+  a new `<dr-sight-panel>` web component (in a `<dialog>` opened from the
+  headline toolbar) with three modes — compass bearing (→ LOP through the
+  observer), vertical-angle sight (→ CPL by height/tan(angle) distance),
+  and celestial sight (→ LOP via Marcq St. Hilaire, with reduction
+  feedback: Hc/Ho/Zn/intercept/LHA). Observations collect in a pending
+  list; "Resolve" previews a candidate fix on the map (hollow yellow
+  ring); "Confirm" snaps the DR origin via the unified fix pipeline.
+  - **Chart pick**: right-click (or long-press) a charted object to get
+    a context menu ("Add bearing to here" / "Distance CPL at here") that
+    opens the sight dialog with the object position pre-seeded.
+  - **Bearing LOP semantics corrected**: a bearing is taken to a known
+    charted object, so the form collects the *object's* position (not the
+    observer's assumed position). The view-model shaper rotates the
+    azimuth +90° so the engine's perpendicular-line convention yields a
+    line running along the bearing through the object (you are somewhere
+    on it), matching traditional nav practice.
+  - **Configurable position format** (`decimal` / `dm` / `dms`, default
+    DMS) set in the plugin config and served to the UI via a public
+    `GET /signalk/v2/api/signalk-dead-reckoning/configuration` endpoint
+    (mirrors signalk-status-tiles' pattern); a config-hash delta triggers
+    a live reload on server-side edits. Coordinate entry uses structured
+    deg/min/sec/hemisphere fields (not a single error-prone text field)
+    that show/hide based on the configured format. Assumed-position
+    defaults track the live DR (or GPS when moored) and re-seed on format
+    change.
+  - **Server-derived `confirmed_by`**: the watchkeeper is taken from the
+    `JAUTHENTICATION` cookie JWT (mirrors signalk-logbook), so there is
+    no manual "confirmed by" form field.
+  Pure view-model form→REST-body shapers (`bearingLopBody`,
+  `verticalAngleCplBody`, `celestialSightBody`, `bearingToTrue`,
+  `verticalAngleDistanceNm`) and the position formatter
+  (`formatCoord`/`parseCoord`/`coordParts`/`parseParts` + `setFormat`/
+  `fmt`/`fmtPos`) are unit-tested. New `GET /celestial/bodies` route
+  lists Sun/Moon/bundled stars + almanac validity for the body selector.
 - Stream subscription hardened after signalk-status-tiles' st-stream.js:
   `/signalk/v1/stream?subscribe=none&sendMeta=all` URL, `minPeriod: 1000`
   throttle, auto-reconnect on link loss with immediate re-subscribe,

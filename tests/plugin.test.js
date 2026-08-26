@@ -1466,3 +1466,99 @@ test("GET /fixes, /observations, /corrections expose the UI overlay shapes", asy
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("GET /celestial/bodies lists Sun, Moon, and bundled stars with validity", () => {
+  const { plugin } = makeStarted();
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+
+  const r = router.invoke("get", "/celestial/bodies", undefined);
+  assert.strictEqual(r.status, 200);
+  assert.ok(Array.isArray(r.body.bodies));
+  assert.ok(r.body.bodies.includes("Sun"));
+  assert.ok(r.body.bodies.includes("Moon"));
+  assert.ok(r.body.bodies.includes("Polaris"));
+  assert.ok(typeof r.body.valid_from === "string");
+  assert.ok(typeof r.body.valid_until === "string");
+  assert.strictEqual(typeof r.body.expired, "boolean");
+});
+
+test("app.get config endpoint serves the plugin config with a hash", () => {
+  const { app } = makeStarted();
+  // The public config endpoint is mounted on app.get (not the router).
+  assert.ok(app.appRoutes.length >= 1);
+  const cfg = app.appRoutes.find((r) =>
+    r.path.includes("/signalk-dead-reckoning/configuration"),
+  );
+  assert.ok(cfg, "config endpoint registered");
+  const res = {
+    set() {},
+    json(obj) {
+      this._body = obj;
+    },
+    status(code) {
+      this._status = code;
+    },
+  };
+  cfg.handler({}, res);
+  assert.strictEqual(res._status, undefined); // 200 path doesn't set status
+  assert.ok(res._body.config, "config served");
+  assert.strictEqual(res._body.config.positionFormat, "dms");
+  assert.ok(typeof res._body.configHash === "string");
+  assert.ok(res._body.configHash.length > 0);
+});
+
+test("schema exposes the positionFormat option with DMS default", () => {
+  const app = new FakeSignalKApp();
+  const plugin = makePlugin(app);
+  assert.ok(plugin.schema.properties.positionFormat);
+  assert.strictEqual(plugin.schema.properties.positionFormat.default, "dms");
+  assert.deepStrictEqual(plugin.schema.properties.positionFormat.enum, [
+    "decimal",
+    "dm",
+    "dms",
+  ]);
+});
+
+test("POST /fix populates confirmed_by from the JAUTHENTICATION cookie", () => {
+  const { plugin } = makeStarted();
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // JWT payload { id: "watchkeeper" }, base64url of the JSON.
+  const payload = Buffer.from(JSON.stringify({ id: "watchkeeper" })).toString(
+    "base64url",
+  );
+  const cookie = `header.${payload}.sig`;
+  const r = router.invoke(
+    "post",
+    "/fix",
+    {
+      latitude: 60.1,
+      longitude: 24.9,
+      source_type: "manual",
+    },
+    {},
+    { cookies: { JAUTHENTICATION: cookie } },
+  );
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body.confirmed_by, "watchkeeper");
+});
+
+test("POST /fix leaves confirmed_by null when anonymous", () => {
+  const { plugin } = makeStarted();
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const r = router.invoke(
+    "post",
+    "/fix",
+    {
+      latitude: 60.1,
+      longitude: 24.9,
+      source_type: "manual",
+    },
+    {},
+    { cookies: {} },
+  );
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body.confirmed_by, null);
+});

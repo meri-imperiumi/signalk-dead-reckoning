@@ -10,8 +10,10 @@
  * @file dr-app.js
  */
 
+import * as posfmt from "./dr-position-format.js";
 import * as vm from "./dr-viewmodel.js";
 import "./dr-map-view.js";
+import "./dr-sight-panel.js";
 
 /** Signal K mounts plugin REST routes under /plugins/<name>/. */
 const API = "/plugins/signalk-dead-reckoning";
@@ -78,6 +80,33 @@ template.innerHTML = /* html */ `
     .dr-status.retrying {
       color: #f85149;
     }
+    .dr-toolbar {
+      display: flex;
+      gap: 0.5rem;
+      margin-left: auto;
+      align-items: center;
+    }
+    .dr-toolbar button {
+      font: inherit;
+      padding: 0.4rem 0.8rem;
+      border-radius: 6px;
+      border: 1px solid #2d3748;
+      background: #1a202c;
+      color: var(--dr-fg, #e6edf3);
+      cursor: pointer;
+    }
+    dialog {
+      max-width: 32rem;
+      width: 90vw;
+      border: 1px solid #2d3748;
+      border-radius: 8px;
+      background: var(--dr-panel, #111827);
+      color: var(--dr-fg, #e6edf3);
+      padding: 0;
+    }
+    dialog::backdrop {
+      background: rgba(0, 0, 0, 0.6);
+    }
   </style>
   <section class="dr-panel dr-headline">
     <div class="dr-figure">
@@ -96,6 +125,9 @@ template.innerHTML = /* html */ `
       <span class="value" id="dr-method">—</span>
       <span class="label">Active method</span>
     </div>
+    <div class="dr-toolbar">
+      <button id="btn-sight">⊕ Sight / LOP</button>
+    </div>
   </section>
 
   <section class="dr-panel dr-status" id="dr-status-panel">
@@ -106,6 +138,10 @@ template.innerHTML = /* html */ `
     <h2>Ghost Track <button id="dr-recenter" title="Follow DR position">◎</button></h2>
     <dr-map-view id="dr-map"></dr-map-view>
   </section>
+
+  <dialog id="sight-dialog">
+    <dr-sight-panel id="dr-sight"></dr-sight-panel>
+  </dialog>
 
   <section class="dr-panel dr-override">
     <h2>Failover Control</h2>
@@ -131,6 +167,34 @@ class DrApp extends HTMLElement {
     root
       .querySelector("#dr-recenter")
       ?.addEventListener("click", () => this.map?.recenter());
+    // Chart pick: right-click an object on the map → open the sight
+    // dialog with the object position pre-seeded.
+    this.map?.addEventListener("dr-pick-position", (e) => {
+      const { lat, lng, mode } = e.detail;
+      this.sightDialog?.showModal();
+      this.sight?.seedObjectPosition(lat, lng, mode);
+    });
+
+    /** @type {HTMLDialogElement|null} */
+    this.sightDialog = root.querySelector("#sight-dialog");
+    root
+      .querySelector("#btn-sight")
+      ?.addEventListener("click", () => this.sightDialog?.showModal());
+
+    /** @type {import("./dr-sight-panel.js").default|null} */
+    this.sight = root.querySelector("#dr-sight");
+    this.sight?.loadBodies();
+    this.sight?.addEventListener("dr-observations-changed", () =>
+      this.refreshOverlays(),
+    );
+    this.sight?.addEventListener("dr-candidate-resolved", (e) =>
+      this.showCandidate(e.detail),
+    );
+    this.sight?.addEventListener("dr-fix-confirmed", () => {
+      this.snap.candidate = null;
+      this.refreshOverlays();
+    });
+    this.sight?.addEventListener("dr-close", () => this.sightDialog?.close());
 
     // View-model state
     this.ghost = new vm.TrackLog(3600);
@@ -146,14 +210,17 @@ class DrApp extends HTMLElement {
       lops: [],
       cpls: [],
       corrections: [],
+      candidate: null,
       ghostTrack: [],
       gpsTrack: [],
       sparkStats: null,
     };
 
     this.connectStream();
+    this.loadPluginConfig();
     this.bootstrapSelf();
     this.refreshOverlays();
+    this.refreshGpsHistory();
     // Slow REST refresh for persisted overlays; stream drives the live parts.
     setInterval(() => this.refreshOverlays(), 30000);
   }
@@ -188,6 +255,33 @@ class DrApp extends HTMLElement {
    *
    * @returns {Promise<void>}
    */
+  /**
+   * Fetches the plugin config (mount `/signalk/v2/api/<id>/configuration`)
+   * and applies the server-configured position format so the sight
+   * panel, map tooltips, and fix labels all match the charts in use.
+   * Mirrors the signalk-status-tiles config-load pattern. Falls back
+   * to the default (DMS) when the endpoint is unavailable.
+   *
+   * @returns {Promise<void>>
+   */
+  async loadPluginConfig() {
+    try {
+      const res = await fetch(
+        `/signalk/v2/api/signalk-dead-reckoning/configuration`,
+      );
+      if (!res.ok) return;
+      const body = await res.json();
+      const fmt = body?.config?.positionFormat;
+      if (fmt === "decimal" || fmt === "dm" || fmt === "dms") {
+        posfmt.setFormat(fmt);
+        this.sight?.applyFormat(fmt);
+      }
+      this.lastConfigHash = body?.configHash ?? null;
+    } catch {
+      /* REST unavailable — keep the default format */
+    }
+  }
+
   async bootstrapSelf() {
     try {
       const res = await fetch("/signalk/v1/api/vessels/self");
@@ -256,13 +350,22 @@ class DrApp extends HTMLElement {
           this.snap.drPosition = [value.latitude, value.longitude];
           this.ghost.push(value.latitude, value.longitude);
           this.snap.ghostTrack = this.ghost.points();
+          this.sight?.setDefaultPosition(value);
         }
         break;
       case "navigation.position":
         if (value?.latitude != null) {
           this.snap.gpsPosition = [value.latitude, value.longitude];
           this.gps.push(value.latitude, value.longitude);
-          this.snap.gpsTrack = this.gps.points();
+          // Merge the live point onto the history track if we have one,
+          // else use the live-session ring buffer alone.
+          this.updateGpsTrack();
+          // Default the sight panel's assumed position to GPS when DR
+          // isn't running (moored). DR position takes priority when it
+          // arrives (applied in its own case below).
+          if (!this.snap.drPosition) {
+            this.sight?.setDefaultPosition(value);
+          }
         }
         break;
       case "navigation.deadReckoning.uncertainty":
@@ -288,6 +391,15 @@ class DrApp extends HTMLElement {
       case "navigation.deadReckoning.state":
         this.renderDrState(value);
         break;
+      case "navigation.deadReckoning.configHash": {
+        // Server-side config edit → re-fetch the plugin config so the
+        // position format and other settings update live.
+        if (typeof value === "string" && value !== this.lastConfigHash) {
+          this.lastConfigHash = value;
+          this.loadPluginConfig();
+        }
+        break;
+      }
       default:
         break;
     }
@@ -318,12 +430,70 @@ class DrApp extends HTMLElement {
     }
   }
 
+  /**
+   * Merges the historical GPS track with the live-session ring buffer
+   * so the polyline is continuous (history → live continuation).
+   *
+   * @returns {void}
+   */
+  updateGpsTrack() {
+    const live = this.gps.points();
+    if (this.gpsHistory && this.gpsHistory.length > 0) {
+      const last = this.gpsHistory[this.gpsHistory.length - 1];
+      const extending = live.filter(
+        (p) =>
+          Math.abs(p[0] - last[0]) > 0.001 || Math.abs(p[1] - last[1]) > 0.001,
+      );
+      this.snap.gpsTrack = [...this.gpsHistory, ...extending];
+    } else {
+      this.snap.gpsTrack = live;
+    }
+  }
+
+  /**
+   * Fetches the historical GPS track from the Signal K history API (see
+   * ../signalk-logbook's Map.jsx) and merges it with the live-session
+   * track so the map shows where the boat has actually been — the
+   * baseline against which DR divergence is measured. Falls back
+   * silently to the live-session track when no history provider is
+   * configured (the route 404s).
+   *
+   * @returns {Promise<void>}
+   */
+  async refreshGpsHistory() {
+    try {
+      const res = await fetch(vm.historyUrl());
+      if (!res.ok) return;
+      const data = await res.json();
+      const history = vm.historyToTrack(data);
+      if (history.length === 0) return;
+      this.gpsHistory = history;
+      this.updateGpsTrack();
+      this.snap.gpsPosition = history[history.length - 1];
+      this.render();
+    } catch {
+      /* no history provider — live stream track is the fallback */
+    }
+  }
+
   /** @returns {void} */
   render() {
     // Headline: divergence + elapsed since last fix.
     this.shadowRoot.querySelector("#dr-divergence").textContent =
       vm.divergenceText(this.snap.divergence);
     this.map?.render(this.snap);
+  }
+
+  /**
+   * Shows a resolved candidate fix on the map (distinct from confirmed
+   * fixes) so the watchkeeper can sanity-check before confirming.
+   *
+   * @param {object} candidate - from POST /fix/resolve
+   * @returns {void}
+   */
+  showCandidate(candidate) {
+    this.snap.candidate = candidate;
+    this.render();
   }
 
   /**

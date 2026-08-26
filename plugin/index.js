@@ -14,6 +14,7 @@
 /** @typedef {import("@signalk/server-api").Plugin} Plugin */
 
 const { join } = require("node:path");
+const crypto = require("node:crypto");
 const {
   openDatabase,
   getState,
@@ -66,6 +67,77 @@ const {
 const PLUGIN_ID = "signalk-dead-reckoning";
 
 /**
+ * Public REST path the plugin config (incl. position format) is served
+ * at. Mounted on the app (not the plugin router) so anonymous / read-only
+ * clients — a helm display hitting the page without logging in — can
+ * load it. Routes registered through `registerWithRouter` are
+ * admin-only; an app-mounted route under the public `/signalk/v2/api/`
+ * namespace is the established Signal K pattern (see signalk-status-tiles).
+ */
+const CONFIG_PATH = `/signalk/v2/api/${PLUGIN_ID}/configuration`;
+
+/** Delta path (relative to `vessels.self`) carrying the current config hash. */
+const CONFIG_HASH_PATH = "navigation.deadReckoning.configHash";
+
+/**
+ * Canonical JSON serialization: object keys sorted recursively, arrays
+ * order-preserving. Two configs that differ only in key order hash
+ * identically, so the hash only changes when contents change.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function canonicalJson(value) {
+  if (value === undefined) return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const keys = Object.keys(value).sort();
+    return `{${keys
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * Stable hash of the config contents (sha256 over canonical JSON). A
+ * change token, not a checksum the webapp verifies: only needs to be
+ * stable for identical content and different for different content.
+ *
+ * @param {object} config
+ * @returns {string}
+ */
+function configHash(config) {
+  return crypto
+    .createHash("sha256")
+    .update(canonicalJson(config ?? {}))
+    .digest("hex");
+}
+
+/**
+ * Extracts the username from the Signal K authentication cookie
+ * (mirrors signalk-logbook's `parseJwt`). Used so the server populates
+ * `confirmed_by` from the logged-in watchkeeper instead of trusting a
+ * client-supplied field.
+ *
+ * @param {object} [cookies]
+ * @returns {string} username, or "" when not authenticated
+ */
+function usernameFromCookies(cookies) {
+  const token = cookies?.JAUTHENTICATION;
+  if (!token) return "";
+  try {
+    return (
+      JSON.parse(Buffer.from(token.split(".")[1], "base64").toString()).id || ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Signal K paths published by this plugin (SPEC §3.1).
  */
 const PATHS = {
@@ -114,6 +186,7 @@ const SUBSCRIPTION_PATHS = [
 const DEFAULT_CONFIG = {
   tickIntervalMs: 1000,
   saveIntervalMs: 60000,
+  positionFormat: "dms",
   divergence: {
     factor: DEFAULT_FACTOR,
     sustainS: DEFAULT_SUSTAIN_S,
@@ -243,6 +316,12 @@ module.exports = (app) => {
           title: "State Save Interval (ms)",
           default: DEFAULT_CONFIG.saveIntervalMs,
         },
+        positionFormat: {
+          type: "string",
+          title: "Position format shown in the UI",
+          enum: ["decimal", "dm", "dms"],
+          default: DEFAULT_CONFIG.positionFormat,
+        },
         "logbook.enabled": {
           type: "boolean",
           title: "Write fixes and maneuvers to signalk-logbook",
@@ -343,6 +422,31 @@ module.exports = (app) => {
 
       publishMeta();
       setStatus("Dead reckoning started");
+
+      // Public config endpoint (CONFIG_PATH): mounted on the app so
+      // anonymous / read-only clients can read the plugin config
+      // (incl. positionFormat) without admin auth. Mirrors
+      // signalk-status-tiles' pattern.
+      app.get(CONFIG_PATH, (_req, res) => {
+        if (!config) {
+          res.status(503).json({ message: "Plugin not started" });
+          return;
+        }
+        res.set("Cache-Control", "no-store");
+        res.json({ config, configHash: configHash(config) });
+      });
+      // Signal config changes to connected webapps: publish the hash as
+      // a delta on the same stream the webapp already consumes, so a
+      // server-side config edit (restart) triggers a client re-fetch.
+      app.handleMessage(PLUGIN_ID, {
+        context: "vessels.self",
+        updates: [
+          {
+            timestamp: new Date().toISOString(),
+            values: [{ path: CONFIG_HASH_PATH, value: configHash(config) }],
+          },
+        ],
+      });
       // §13: star almanac expiry check — warn (not fail) the same way WMM
       // does (§12). A warning here surfaces via the plugin status message;
       // a full notification delta is left to the integrity/notification
@@ -1114,6 +1218,23 @@ module.exports = (app) => {
     });
 
     /**
+     * GET /celestial/bodies — list the celestial bodies available for sight
+     * reduction (Sun, Moon, and the bundled navigational stars), plus the
+     * almanac validity window so the UI can warn when sights may be
+     * inaccurate (SPEC §12/§13). Lets the sight panel populate its body
+     * selector without hardcoding a list that can drift from the almanac.
+     */
+    router.get("/celestial/bodies", (_req, res) => {
+      const stars = Object.keys(starAlmanac.STARS);
+      res.json({
+        bodies: ["Sun", "Moon", ...stars],
+        valid_from: starAlmanac.VALID_FROM,
+        valid_until: starAlmanac.VALID_UNTIL,
+        expired: starAlmanac.isExpired(new Date()),
+      });
+    });
+
+    /**
      * POST /celestial/sight — reduce a raw sextant sight (SPEC §13) and
      * persist the resulting line of position. Returns the LOP id plus the
      * reduction details (Hc, Ho, intercept, Zn, LHA) for UI feedback. The
@@ -1244,7 +1365,11 @@ module.exports = (app) => {
       }
       const b = parseBody(req.body);
       const resets = b.resets !== false;
-      const confirmedBy = b.confirmed_by ?? null;
+      // `confirmed_by`: prefer an explicit client value, else the
+      // logged-in watchkeeper from the auth cookie (mirrors
+      // signalk-logbook). Falls back to null for anonymous clients.
+      const confirmedBy =
+        b.confirmed_by || usernameFromCookies(req.cookies) || null;
       const sailState = resolveSailState();
       const seaState = resolveSeaState();
       const helpers = {
@@ -1333,6 +1458,7 @@ module.exports = (app) => {
       res.json({
         fix_id: result.fix_id,
         correction_id: result.correction_id,
+        confirmed_by: confirmedBy,
         deviation_nm: result.deviation_nm,
         deviation_bearing: result.deviation_bearing,
         recorded_correction: result.correction_id != null,

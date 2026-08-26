@@ -252,3 +252,125 @@ test("chartLayersWithFallback: OSM fallback when nothing configured (404/empty)"
     assert.ok(layers[0].url.includes("{z}/{x}/{y}"));
   }
 });
+
+test("historyToTrack: converts SK history [lon,lat] to [lat,lon], dedupes", async () => {
+  const vm = await loadVm();
+  const track = vm.historyToTrack({
+    data: [
+      ["2026-01-01T00:00:00Z", [-159.8, -18.86]],
+      ["2026-01-01T00:01:00Z", [-159.81, -18.87]],
+      ["2026-01-01T00:02:00Z", null],
+      ["2026-01-01T00:03:00Z", [-159.82, -18.88]],
+      ["2026-01-01T00:04:00Z", [-159.82, -18.88]], // dup → dropped
+    ],
+  });
+  assert.deepStrictEqual(track, [
+    [-18.86, -159.8],
+    [-18.87, -159.81],
+    [-18.88, -159.82],
+  ]);
+});
+
+test("historyToTrack: empty/null/non-data → empty array", async () => {
+  const vm = await loadVm();
+  assert.deepStrictEqual(vm.historyToTrack(null), []);
+  assert.deepStrictEqual(vm.historyToTrack({}), []);
+  assert.deepStrictEqual(vm.historyToTrack({ data: [] }), []);
+});
+
+test("historyUrl: builds the SK history path with from/to/resolution", async () => {
+  const vm = await loadVm();
+  const url = vm.historyUrl(6, 60);
+  assert.ok(url.startsWith("/signalk/v1/history/values?"));
+  assert.ok(url.includes("paths=navigation.position"));
+  assert.ok(url.includes("resolution=60"));
+  assert.ok(url.includes("from="));
+  assert.ok(url.includes("to="));
+});
+
+test("bearingToTrue: east variation adds, west subtracts, wraps 360", async () => {
+  const vm = await loadVm();
+  closeTo(vm.bearingToTrue(350, 15), 5, 0.001, "east var wraps");
+  closeTo(vm.bearingToTrue(10, -20), 350, 0.001, "west var subtracts");
+  closeTo(vm.bearingToTrue(180, 0), 180, 0.001, "zero var");
+});
+
+test("verticalAngleDistanceNm: height/tan(angle) converted to nm", async () => {
+  const vm = await loadVm();
+  // 10m height, 1° angle → 10/tan(1°)/1852 = 0.3094 nm
+  closeTo(vm.verticalAngleDistanceNm(10, 1), 0.3094, 0.001, "1° angle");
+  // 30m height, 2° angle
+  closeTo(vm.verticalAngleDistanceNm(30, 2), 0.4639, 0.001, "2° angle");
+  // Zero/negative angle → infinity (object below eye)
+  assert.strictEqual(vm.verticalAngleDistanceNm(10, 0), Infinity);
+});
+
+test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing line", async () => {
+  const vm = await loadVm();
+  const body = vm.bearingLopBody({
+    object: "lighthouse",
+    bearing_true: 45,
+    object_lat: 60,
+    object_lon: 24,
+    confirmed_by: "Alice",
+  });
+  assert.strictEqual(body.lop_type, "bearing");
+  // +90° so the engine's perpendicular-line convention yields a line
+  // running along the bearing.
+  assert.strictEqual(body.azimuth_true, 135);
+  assert.strictEqual(body.intercept_nm, 0);
+  // Object position is the assumed (line passes through the object).
+  assert.strictEqual(body.assumed_lat, 60);
+  assert.strictEqual(body.assumed_lon, 24);
+  assert.strictEqual(body.body_or_object, "lighthouse");
+});
+
+test("verticalAngleCplBody: center + radius from height/angle", async () => {
+  const vm = await loadVm();
+  const body = vm.verticalAngleCplBody({
+    object: "lighthouse",
+    height_m: 30,
+    angle_deg: 2,
+    center_lat: 60.01,
+    center_lon: 24.01,
+  });
+  assert.strictEqual(body.cpl_type, "vertical-angle");
+  assert.strictEqual(body.center_lat, 60.01);
+  closeTo(body.radius_nm, 0.4639, 0.001, "radius");
+  assert.strictEqual(body.source_object, "lighthouse");
+});
+
+test("celestialSightBody: required + optional fields, assumed position shape", async () => {
+  const vm = await loadVm();
+  const body = vm.celestialSightBody({
+    body: "Sun",
+    hs_deg: 45.5,
+    index_correction_deg: -1.2,
+    eye_height_m: 3,
+    limb: "lower",
+    epoch_ms: 1735689600000,
+    assumed_lat: 60,
+    assumed_lon: 24,
+    confirmed_by: "Bob",
+  });
+  assert.strictEqual(body.body, "Sun");
+  assert.strictEqual(body.hs_deg, 45.5);
+  assert.strictEqual(body.index_correction_deg, -1.2);
+  assert.strictEqual(body.eye_height_m, 3);
+  assert.strictEqual(body.limb, "lower");
+  assert.deepStrictEqual(body.assumed_position, {
+    latitude: 60,
+    longitude: 24,
+  });
+  assert.strictEqual(body.confirmed_by, "Bob");
+  // Minimal form (no optionals) — fields omitted, not null.
+  const minimal = vm.celestialSightBody({
+    body: "Vega",
+    hs_deg: 30,
+    epoch_ms: 1735689600000,
+  });
+  assert.strictEqual(minimal.body, "Vega");
+  assert.ok(!("index_correction_deg" in minimal));
+  assert.ok(!("limb" in minimal));
+  assert.ok(!("assumed_position" in minimal));
+});

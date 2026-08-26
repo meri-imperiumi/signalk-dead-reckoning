@@ -30,6 +30,32 @@ class DrMapView extends HTMLElement {
       :host { display: block; height: 60vh; border-radius: 8px; overflow: hidden; }
       .map-host { position: relative; width: 100%; height: 100%; }
       .map-wrap { width: 100%; height: 100%; background: #0d1117; }
+      .dr-pick-menu {
+        position: absolute;
+        z-index: 1000;
+        background: var(--dr-panel, #111827);
+        border: 1px solid #2d3748;
+        border-radius: 6px;
+        padding: 0.25rem;
+        font-size: 0.8rem;
+        color: var(--dr-muted, #8b949e);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        display: flex;
+        flex-direction: column;
+        gap: 0.2rem;
+        min-width: 12rem;
+      }
+      .dr-pick-menu button {
+        font: inherit;
+        text-align: left;
+        padding: 0.3rem 0.5rem;
+        border: 1px solid #1f2937;
+        border-radius: 4px;
+        background: #1a202c;
+        color: var(--dr-fg, #e6edf3);
+        cursor: pointer;
+      }
+      .dr-pick-menu button:hover { background: #2d3748; }
     `;
     root.appendChild(style);
     // Leaflet's CSS must live INSIDE the shadow root — a document-level
@@ -91,6 +117,7 @@ class DrMapView extends HTMLElement {
       cpls: null,
       snaps: null,
       drMarker: null,
+      candidate: null,
     };
     this.tileLayers = {};
     this.follow = true;
@@ -131,6 +158,9 @@ class DrMapView extends HTMLElement {
     this.map.on("dragstart", () => {
       this.follow = false;
     });
+    // Chart pick: right-click / long-press opens a small context menu
+    // to pre-seed a sight form with the picked object position.
+    this.map.on("contextmenu", (e) => this.showPickMenu(e.latlng));
     // Shadow DOM layout settles asynchronously after connectedCallback;
     // force Leaflet to recompute the container size on every resize or
     // tiles render jumbled and markers land off-screen.
@@ -183,6 +213,58 @@ class DrMapView extends HTMLElement {
     if (this.lastDrPosition && this.map) {
       this.map.panTo(this.lastDrPosition);
     }
+  }
+
+  /**
+   * Shows a small context menu at a chart point offering to pre-seed a
+   * sight form with that position as the object. Dispatches
+   * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode }`.
+   *
+   * @param {L.LatLng} latlng
+   * @returns {void}
+   */
+  showPickMenu(latlng) {
+    // Remove any prior menu.
+    this.hidePickMenu();
+    const menu = document.createElement("div");
+    menu.className = "dr-pick-menu";
+    menu.textContent = "Add observation at this point…";
+    const items = [
+      { label: " Bearing to here", mode: "bearing" },
+      { label: " Distance CPL at here", mode: "vertical" },
+    ];
+    for (const it of items) {
+      const btn = document.createElement("button");
+      btn.textContent = it.label;
+      btn.addEventListener("click", () => {
+        this.hidePickMenu();
+        this.dispatchEvent(
+          new CustomEvent("dr-pick-position", {
+            bubbles: true,
+            composed: true,
+            detail: { lat: latlng.lat, lng: latlng.lng, mode: it.mode },
+          }),
+        );
+      });
+      menu.appendChild(btn);
+    }
+    // Position the menu at the screen point of the click.
+    const point = this.map.latLngToContainerPoint(latlng);
+    menu.style.left = `${point.x}px`;
+    menu.style.top = `${point.y}px`;
+    this.mapEl.appendChild(menu);
+    this._pickMenu = menu;
+    // Dismiss on the next map click / pan / zoom.
+    const dismiss = () => this.hidePickMenu();
+    this.map.once("click", dismiss);
+    this.map.once("zoomstart", dismiss);
+    this.map.once("dragstart", dismiss);
+  }
+
+  /** @returns {void} */
+  hidePickMenu() {
+    this._pickMenu?.remove();
+    this._pickMenu = null;
   }
 
   /**
@@ -271,9 +353,35 @@ class DrMapView extends HTMLElement {
     this.renderLops(snap.lops ?? [], vm);
     this.renderCpls(snap.cpls ?? [], vm);
     this.renderSnaps(snap.corrections ?? [], vm);
+    this.renderCandidate(snap.candidate);
 
     // Divergence readout + sparkline.
     this.renderDivergence(snap.divergence, snap.sparkStats);
+  }
+
+  /**
+   * Renders a resolved-but-unconfirmed candidate fix distinctly from
+   * confirmed fixes (hollow ring) so the watchkeeper can sanity-check
+   * before confirming.
+   *
+   * @param {object|null} candidate
+   * @returns {void}
+   */
+  renderCandidate(candidate) {
+    this.layers.candidate?.clearLayers();
+    if (!candidate || candidate.latitude == null) return;
+    L.circleMarker([candidate.latitude, candidate.longitude], {
+      radius: 8,
+      color: "#ffcc00",
+      fill: false,
+      weight: 2,
+      dashArray: "3 3",
+    })
+      .bindTooltip(
+        `candidate${candidate.residual_nm != null ? ` (residual ${candidate.residual_nm.toFixed(2)} nm)` : ""} — confirm?`,
+        { direction: "top" },
+      )
+      .addTo(this.layers.candidate);
   }
 
   /**

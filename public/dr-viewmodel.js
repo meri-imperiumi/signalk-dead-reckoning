@@ -344,3 +344,171 @@ export function bearingBetween(from, to) {
     Math.sin(φ1) * Math.cos(φ2) * Math.cos(λ2 - λ1);
   return (((Math.atan2(y, x) / RAD) % 360) + 360) % 360;
 }
+
+/**
+ * Reduces a Signal K `/signalk/v1/history/values` response for
+ * `navigation.position` into a Leaflet-style [lat, lon] track.
+ *
+ * The history API returns `{ data: [[timestamp, [lon, lat]], ...] }`
+ * (GeoJSON [lon, lat] order inside the value). Points with no value or
+ * duplicating the previous point (within ~0.001°, ~6 m) are dropped —
+ * the server may store a static position every tick when moored.
+ *
+ * @param {object|null|undefined} response
+ * @returns {Array<[number, number]>} [lat, lon] pairs
+ */
+export function historyToTrack(response) {
+  if (!response?.data || !Array.isArray(response.data)) return [];
+  const pts = [];
+  let prevLat = null;
+  let prevLon = null;
+  for (const entry of response.data) {
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const value = entry[1];
+    if (!Array.isArray(value) || value.length < 2) continue;
+    // SK history stores [longitude, latitude] (GeoJSON order).
+    const lon = value[0];
+    const lat = value[1];
+    if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon)) {
+      continue;
+    }
+    // Dedupe near-identical points (moored vessel holds a static fix).
+    if (
+      prevLat !== null &&
+      Math.abs(lat - prevLat) < 0.001 &&
+      Math.abs(lon - prevLon) < 0.001
+    ) {
+      continue;
+    }
+    pts.push([lat, lon]);
+    prevLat = lat;
+    prevLon = lon;
+  }
+  return pts;
+}
+
+/**
+ * Builds the history-values URL for the GPS track. `hours` defaults to
+ * 6 (enough to see a recent passage without pulling the whole season).
+ *
+ * @param {number} [hours=6]
+ * @param {number} [resolutionSec=60]
+ * @returns {string} absolute path under /signalk/v1
+ */
+export function historyUrl(hours = 6, resolutionSec = 60) {
+  const to = new Date();
+  const from = new Date(to.getTime() - hours * 3600 * 1000);
+  const f = from.toISOString().replace(/\.\d+Z$/, "Z");
+  const t = to.toISOString().replace(/\.\d+Z$/, "Z");
+  return `/signalk/v1/history/values?from=${f}&to=${t}&paths=navigation.position&resolution=${resolutionSec}`;
+}
+
+// ---------------------------------------------------------------------------
+// Sight & LOP input (SPEC §14.1 "Manual LOP & Sight Input")
+// Pure form→REST-body shapers + small conversions, unit-tested. The
+// <dr-sight-panel> component calls these; they never touch the DOM.
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts a magnetic bearing to true, adding variation (east positive,
+ * west negative). Per navigator convention: True = Magnetic + Variation
+ * (E), i.e. add east variation, subtract west.
+ *
+ * @param {number} bearingMag
+ * @param {number} variationDeg - east positive, west negative
+ * @returns {number} 0..360
+ */
+export function bearingToTrue(bearingMag, variationDeg) {
+  return (((Number(bearingMag) + Number(variationDeg)) % 360) + 360) % 360;
+}
+
+/**
+ * Distance to an object of known height from a vertical angle, in
+ * nautical miles. Standard formula: distance = height / tan(angle),
+ * with height in meters converted to nm (1 nm = 1852 m).
+ *
+ * @param {number} heightM - height of the object above the observer's eye
+ * @param {number} angleDeg - vertical angle above the horizontal
+ * @returns {number} distance in nm
+ */
+export function verticalAngleDistanceNm(heightM, angleDeg) {
+  const rad = Number(angleDeg) * RAD;
+  if (rad <= 0) return Number.POSITIVE_INFINITY;
+  return Number(heightM) / Math.tan(rad) / 1852;
+}
+
+/**
+ * Shape a compass-bearing form into a `POST /fix/lop` body. The
+ * navigator takes a bearing to a charted object whose position is
+ * known; the LOP is the line from the object at the reciprocal bearing
+ * (you are somewhere on it). The engine's LOP convention is "a line
+ * through `assumed` perpendicular to `azimuth`", so to make the line
+ * run *along* the bearing we feed the object position as the assumed
+ * point and rotate the azimuth +90° (the line's normal points
+ * across-track). Intercept is 0 — the line passes through the object.
+ *
+ * @param {object} form - { object, bearing_true, object_lat, object_lon, confirmed_by? }
+ * @returns {object}
+ */
+export function bearingLopBody(form) {
+  const bearing = Number(form.bearing_true);
+  return {
+    lop_type: "bearing",
+    assumed_lat: Number(form.object_lat),
+    assumed_lon: Number(form.object_lon),
+    // +90° so the line runs along the bearing (engine normal ⊥ line).
+    azimuth_true: (bearing + 90) % 360,
+    intercept_nm: 0,
+    body_or_object: form.object || null,
+    confirmed_by: form.confirmed_by || null,
+  };
+}
+
+/**
+ * Shape a vertical-angle form into a `POST /fix/cpl` body. The CPL is
+ * centered on the object's charted position with radius = the distance
+ * computed from height + angle.
+ *
+ * @param {object} form - { object, height_m, angle_deg, center_lat, center_lon, confirmed_by? }
+ * @returns {object}
+ */
+export function verticalAngleCplBody(form) {
+  return {
+    cpl_type: "vertical-angle",
+    center_lat: Number(form.center_lat),
+    center_lon: Number(form.center_lon),
+    radius_nm: verticalAngleDistanceNm(form.height_m, form.angle_deg),
+    source_object: form.object || null,
+    confirmed_by: form.confirmed_by || null,
+  };
+}
+
+/**
+ * Shape a celestial-sight form into a `POST /celestial/sight` body.
+ *
+ * @param {object} form - { body, hs_deg, index_correction_deg?, eye_height_m?,
+ *   limb?, epoch_ms, assumed_position?, confirmed_by? }
+ * @returns {object}
+ */
+export function celestialSightBody(form) {
+  const body = {
+    body: form.body,
+    hs_deg: Number(form.hs_deg),
+    epoch_ms: Number(form.epoch_ms),
+    confirmed_by: form.confirmed_by || null,
+  };
+  if (form.index_correction_deg != null && form.index_correction_deg !== "") {
+    body.index_correction_deg = Number(form.index_correction_deg);
+  }
+  if (form.eye_height_m != null && form.eye_height_m !== "") {
+    body.eye_height_m = Number(form.eye_height_m);
+  }
+  if (form.limb) body.limb = form.limb;
+  if (form.assumed_lat != null && form.assumed_lon != null) {
+    body.assumed_position = {
+      latitude: Number(form.assumed_lat),
+      longitude: Number(form.assumed_lon),
+    };
+  }
+  return body;
+}

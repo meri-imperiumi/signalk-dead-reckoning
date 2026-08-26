@@ -32,6 +32,17 @@ class FakeSignalKApp extends EventEmitter {
     this.statusMessages = [];
     this.handledMessages = [];
     this.errors = [];
+    /** @type {Array<{path: string, handler: Function}>} app-level GET routes (e.g. public config endpoint) */
+    this.appRoutes = [];
+  }
+
+  /**
+   * Records an app-level GET route (e.g. the public config endpoint).
+   * @param {string} path
+   * @param {Function} handler
+   */
+  get(path, handler) {
+    this.appRoutes.push({ path, handler });
   }
 
   getDataDirPath() {
@@ -101,7 +112,7 @@ class FakeRouter {
    * @param {object} [reqQuery] - explicit query overrides the path's
    * @returns {{status: number, body: unknown}}
    */
-  invoke(method, path, reqBody, reqQuery) {
+  invoke(method, path, reqBody, reqQuery, reqExtra = {}) {
     const [pathname, search] = path.split("?");
     const route = this.routes.find(
       (r) => r.method === method && r.path === pathname,
@@ -121,7 +132,10 @@ class FakeRouter {
         this.body = body;
       },
     };
-    route.handler({ body: reqBody, query: reqQuery ?? query }, res);
+    route.handler(
+      { body: reqBody, query: reqQuery ?? query, ...reqExtra },
+      res,
+    );
     return { status: res.statusCode, body: res.body };
   }
 }
