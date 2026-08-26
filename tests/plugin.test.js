@@ -625,6 +625,97 @@ test("POST /fix still accepts a plain point fix (back-compat)", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test("POST /fix records timestamp, notes and estimated error (offline/paper fixes)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-fix-meta-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // Seed a prior origin so a correction row is also written with the
+  // fix's own timestamp.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  const { status, body } = router.invoke("post", "/fix", {
+    latitude: 60.01,
+    longitude: 24.01,
+    source_type: "backfill",
+    timestamp: "2025-08-25T12:30:00.000Z",
+    notes: "reduced on paper, logged next morning",
+    estimated_error_nm: 0.15,
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.fix_id > 0);
+  await new Promise((r) => setTimeout(r, 20));
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const fix = db
+    .prepare("SELECT * FROM fixes WHERE fix_id = ?")
+    .get(body.fix_id);
+  assert.strictEqual(fix.source_type, "backfill");
+  assert.strictEqual(
+    fix.timestamp,
+    "2025-08-25T12:30:00.000Z",
+    "fix row should carry the observation time, not entry time",
+  );
+  assert.strictEqual(fix.notes, "reduced on paper, logged next morning");
+  assert.ok(Math.abs(fix.estimated_error_radius - 0.15) < 1e-9);
+  const correction = db
+    .prepare("SELECT * FROM dr_corrections WHERE fix_id = ?")
+    .get(body.fix_id);
+  assert.ok(correction, "correction row written for the backfilled fix");
+  assert.strictEqual(correction.timestamp, "2025-08-25T12:30:00.000Z");
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix ignores an invalid timestamp rather than rejecting the fix", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-fix-badts-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("post", "/fix", {
+    latitude: 60,
+    longitude: 24,
+    source_type: "manual",
+    timestamp: "not-a-date",
+  });
+  assert.strictEqual(status, 200);
+  await new Promise((r) => setTimeout(r, 20));
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const fix = db
+    .prepare("SELECT * FROM fixes WHERE fix_id = ?")
+    .get(body.fix_id);
+  assert.notStrictEqual(
+    fix.timestamp,
+    "not-a-date",
+    "invalid timestamp should fall back to entry time",
+  );
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("POST /celestial/sight reduces a Sun sight and persists a celestial LOP", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-cel-"));
   const app = new FakeSignalKApp();

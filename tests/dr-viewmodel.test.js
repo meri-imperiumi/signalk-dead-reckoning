@@ -484,3 +484,102 @@ test("elapsedText: formats fix age at watchkeeper granularity", async () => {
   assert.strictEqual(vm.elapsedText(4 * 60), "4m");
   assert.strictEqual(vm.elapsedText(134 * 60), "2h 14m");
 });
+
+test("pointFixBody: numbers pass through, defaults to manual source", async () => {
+  const vm = await loadVm();
+  const body = vm.pointFixBody({
+    latitude: 60.155,
+    longitude: 24.955,
+    fix_time: "",
+  });
+  assert.strictEqual(body.source_type, "manual");
+  assert.strictEqual(body.latitude, 60.155);
+  assert.strictEqual(body.longitude, 24.955);
+  assert.ok(!("timestamp" in body));
+  assert.ok(!("notes" in body));
+  assert.ok(!("estimated_error_nm" in body));
+});
+
+test("pointFixBody: coordinate strings parse in decimal, DM and DMS", async () => {
+  const vm = await loadVm();
+  for (const [latStr, expected] of [
+    ["60.155", 60.155],
+    ["60°09.300' N", 60.155],
+    ["60°09'18.0\" N", 60.155],
+    ["60°09'18\" S", -60.155],
+  ]) {
+    const body = vm.pointFixBody({ latitude: latStr, longitude: "025.000" });
+    closeTo(body.latitude, expected, 0.0002, `parse ${latStr}`);
+  }
+});
+
+test("pointFixBody: throws on unparseable coordinates", async () => {
+  const vm = await loadVm();
+  assert.throws(() => vm.pointFixBody({ latitude: "banana", longitude: 25 }));
+  assert.throws(() => vm.pointFixBody({ latitude: "", longitude: 25 }));
+});
+
+test("pointFixBody: forwards timestamp (tz-aware), notes and error estimate", async () => {
+  const vm = await loadVm();
+  const body = vm.pointFixBody({
+    latitude: 60,
+    longitude: 24,
+    source_type: "backfill",
+    fix_time: "2025-06-21T17:00:00",
+    fix_tz: "utc",
+    notes: "berth 12, guest harbour",
+    estimated_error_nm: "0.05",
+  });
+  assert.strictEqual(body.source_type, "backfill");
+  assert.strictEqual(body.timestamp, "2025-06-21T17:00:00.000Z");
+  assert.strictEqual(body.notes, "berth 12, guest harbour");
+  assert.strictEqual(body.estimated_error_nm, 0.05);
+  // Zero/empty error → omitted rather than recorded as a bogus 0.
+  const zero = vm.pointFixBody({
+    latitude: 60,
+    longitude: 24,
+    estimated_error_nm: "0",
+  });
+  assert.ok(!("estimated_error_nm" in zero));
+});
+
+test("hdopErrorNm: HDOP × UERE estimate, null without usable HDOP", async () => {
+  const vm = await loadVm();
+  assert.strictEqual(vm.hdopErrorNm(null), null);
+  assert.strictEqual(vm.hdopErrorNm(0), null);
+  assert.strictEqual(vm.hdopErrorNm(-1), null);
+  closeTo(vm.hdopErrorNm(1), 3 / 1852, 1e-9, "HDOP 1");
+  closeTo(vm.hdopErrorNm(2.5), 7.5 / 1852, 1e-9, "HDOP 2.5");
+  closeTo(vm.hdopErrorNm(2, 5), 10 / 1852, 1e-9, "custom UERE");
+});
+
+test("gnssStats: rows only for known fields, none when empty", async () => {
+  const vm = await loadVm();
+  assert.deepStrictEqual(vm.gnssStats(null), []);
+  assert.deepStrictEqual(vm.gnssStats({}), []);
+  const full = vm.gnssStats({
+    type: "GPS",
+    method: "3D",
+    satellites: 12,
+    satellitesVisible: 15,
+    hdop: 0.9,
+  });
+  assert.deepStrictEqual(full, [
+    { label: "System", value: "GPS" },
+    { label: "Fix method", value: "3D" },
+    { label: "Satellites", value: "12 in use, 15 visible" },
+    { label: "HDOP", value: "0.9 (≈ 3 m error)" },
+  ]);
+  // Satellites in use only (no visible count, or equal to it).
+  const inUse = vm.gnssStats({ satellites: 12, satellitesVisible: 12 });
+  assert.deepStrictEqual(inUse[0], { label: "Satellites", value: "12 in use" });
+  // Only a visible count → labelled as such.
+  const visible = vm.gnssStats({ satellitesVisible: 9 });
+  assert.deepStrictEqual(visible[0], {
+    label: "Satellites",
+    value: "9 visible",
+  });
+  // Partial data renders partial rows.
+  const partial = vm.gnssStats({ type: "GLONASS" });
+  assert.deepStrictEqual(partial, [{ label: "System", value: "GLONASS" }]);
+});

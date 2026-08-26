@@ -1762,11 +1762,17 @@ module.exports = (app) => {
      * origin. Does NOT flip navigational authority — OVERRIDE stays a
      * separate human action (§7, §14.1).
      *
-     * Point body: { latitude, longitude, source_type?, confirmed_by?, resets? }
+     * Point body: { latitude, longitude, source_type?, confirmed_by?, resets?,
+     *                timestamp?, notes?, estimated_error_nm? }
      * LOP/CPL body: { source_type, observations?, lop_ids?, cpl_ids?,
      *                confirmed_by?, resets? } — resolved via the pipeline
      *   (a pre-resolved `candidate` from POST /fix/resolve may also be passed
      *   back verbatim as { candidate }).
+     *
+     * `timestamp` (ISO), `notes` and `estimated_error_nm` record fixes made
+     * away from the console (paper forms, known berth coordinates) with
+     * their own observation time and context; the logbook write-through
+     * uses the fix timestamp, not the entry time.
      */
     router.post("/fix", (req, res) => {
       if (!engine || !db) {
@@ -1775,6 +1781,16 @@ module.exports = (app) => {
       }
       const b = parseBody(req.body);
       const resets = b.resets !== false;
+      // Optional fix-time metadata (backfilled/offline fixes). Invalid
+      // timestamps are ignored rather than rejected — the fix is still
+      // confirmed at entry time.
+      let fixTimestamp = null;
+      if (
+        typeof b.timestamp === "string" &&
+        !Number.isNaN(Date.parse(b.timestamp))
+      ) {
+        fixTimestamp = new Date(b.timestamp).toISOString();
+      }
       // `confirmed_by`: prefer an explicit client value, else the
       // logged-in watchkeeper from the auth cookie (mirrors
       // signalk-logbook). Falls back to null for anonymous clients.
@@ -1844,6 +1860,12 @@ module.exports = (app) => {
         resets,
         sailState,
         seaState,
+        timestamp: fixTimestamp ?? undefined,
+        notes: typeof b.notes === "string" && b.notes ? b.notes : undefined,
+        estimatedErrorRadius:
+          typeof b.estimated_error_nm === "number" && b.estimated_error_nm > 0
+            ? b.estimated_error_nm
+            : undefined,
       });
 
       // §9.5: write-through to signalk-logbook (optional peer). `fixes`
@@ -1852,7 +1874,7 @@ module.exports = (app) => {
       // unmarked (`logged_to_logbook = 0`, visible in `fixes`).
       writeLogbookEntry(
         deps.composeFixEntry({
-          datetime: new Date().toISOString(),
+          datetime: fixTimestamp ?? new Date().toISOString(),
           source_type: candidate.source_type,
           latitude: candidate.latitude,
           longitude: candidate.longitude,

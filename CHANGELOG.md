@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **"Fix at coordinates" dialog** (replaces the one-tap "Fix at GPS"
+  button): opens prefilled with the live GNSS position, editable before
+  confirming. Covers three point-fix workflows with one flow —
+  the GPS reality check (accept the prefill as-is), known-position fixes
+  (type a berth/dock position, works without GNSS), and offline fixes
+  from paper forms (backdated fix time, `backfill` source type). The
+  dialog shows GNSS fix-quality stats when the receiver publishes them
+  (`navigation.gnss.*`): system (GPS/GLONASS/…), fix method (2D/3D/DGNSS),
+  satellites in use/visible, and HDOP with a rough error estimate that
+  prefills the new estimated-error field. Coordinates accept decimal,
+  DM or DMS free text so they can be transcribed from paper exactly as
+  written; editing a prefilled GNSS coordinate switches the source to
+  manual automatically.
+- `POST /fix` accepts optional `timestamp`, `notes` and
+  `estimated_error_nm` on point fixes (the fix pipeline already
+  supported them; the route now forwards them). Backfilled fixes are
+  recorded at their observation time — in `fixes`, `dr_corrections` and
+  the signalk-logbook write-through — not at entry time. `backfill`
+  fixes get a distinct map color.
 - Sea-trial safety hardening — honest DR under sensor failure:
   - **Idle-while-making-way detection**: when STW/heading drop but
     GPS-derived motion shows the vessel still making way (fouled

@@ -14,6 +14,7 @@ import * as posfmt from "./dr-position-format.js";
 import * as vm from "./dr-viewmodel.js";
 import "./dr-map-view.js";
 import "./dr-sight-panel.js";
+import "./dr-fix-panel.js";
 
 /** Signal K mounts plugin REST routes under /plugins/<name>/. */
 const API = "/plugins/signalk-dead-reckoning";
@@ -134,7 +135,7 @@ template.innerHTML = /* html */ `
     </div>
     <div class="dr-toolbar">
       <button id="btn-sight">⊕ Sight / LOP</button>
-      <button id="btn-gps-fix" title="Confirm a fix at the current GNSS position (GPS reality check)">⊙ Fix at GPS</button>
+      <button id="btn-coord-fix" title="Confirm a fix at coordinates — prefilled from the current GNSS position, editable for offline/known-position fixes">⊙ Fix at coordinates</button>
     </div>
   </section>
 
@@ -149,6 +150,10 @@ template.innerHTML = /* html */ `
 
   <dialog id="sight-dialog">
     <dr-sight-panel id="dr-sight"></dr-sight-panel>
+  </dialog>
+
+  <dialog id="fix-dialog">
+    <dr-fix-panel id="dr-fix"></dr-fix-panel>
   </dialog>
 
   <section class="dr-panel dr-override">
@@ -192,10 +197,24 @@ class DrApp extends HTMLElement {
     };
     root.querySelector("#btn-sight")?.addEventListener("click", openSight);
 
-    /** Confirm a fix at the current GNSS position (GPS reality check). */
-    root
-      .querySelector("#btn-gps-fix")
-      ?.addEventListener("click", () => this.confirmGpsFix());
+    // "Fix at coordinates" — opens the prefilled confirm dialog.
+    /** @type {HTMLDialogElement|null} */
+    this.fixDialog = root.querySelector("#fix-dialog");
+    /** @type {import("./dr-fix-panel.js").default|null} */
+    this.fixPanel = root.querySelector("#dr-fix");
+    const openFix = () => {
+      this.fixPanel?.seed({
+        position: this.snap.gpsPosition,
+        gnss: this.snap.gnss,
+      });
+      this.fixDialog?.showModal();
+    };
+    root.querySelector("#btn-coord-fix")?.addEventListener("click", openFix);
+    this.fixPanel?.addEventListener("dr-fix-confirmed", () => {
+      this.snap.candidate = null;
+      this.refreshOverlays();
+    });
+    this.fixPanel?.addEventListener("dr-close", () => this.fixDialog?.close());
 
     /** @type {import("./dr-sight-panel.js").default|null} */
     this.sight = root.querySelector("#dr-sight");
@@ -230,6 +249,7 @@ class DrApp extends HTMLElement {
       ghostTrack: [],
       gpsTrack: [],
       sparkStats: null,
+      gnss: null,
     };
 
     this.connectStream();
@@ -259,6 +279,11 @@ class DrApp extends HTMLElement {
       "navigation.deadReckoning.state",
       "navigation.deadReckoning.elapsedSinceFix",
       "navigation.position",
+      "navigation.gnss.type",
+      "navigation.gnss.method",
+      "navigation.gnss.satellites",
+      "navigation.gnss.satellitesVisible",
+      "navigation.gnss.horizontalDilution",
     ]);
     stream.on((delta) => this.onDelta(delta));
     stream.onStatus((s) => this.renderLinkStatus(s));
@@ -292,6 +317,7 @@ class DrApp extends HTMLElement {
       if (fmt === "decimal" || fmt === "dm" || fmt === "dms") {
         posfmt.setFormat(fmt);
         this.sight?.applyFormat(fmt);
+        this.fixPanel?.refreshFormat();
       }
       this.lastConfigHash = body?.configHash ?? null;
     } catch {
@@ -340,6 +366,18 @@ class DrApp extends HTMLElement {
           dr.elapsedSinceFix.value,
         );
       }
+      // GNSS fix-quality snapshot for the fix dialog's stats block.
+      const gnss = nav?.navigation?.gnss;
+      if (gnss) {
+        const pick = (key) => gnss[key]?.value ?? gnss[key] ?? undefined;
+        this.applyGnss({
+          type: pick("type"),
+          method: pick("method"),
+          satellites: pick("satellites"),
+          satellitesVisible: pick("satellitesVisible"),
+          hdop: pick("horizontalDilution"),
+        });
+      }
       this.render();
     } catch {
       /* REST unavailable — stream will drive when it can */
@@ -383,7 +421,7 @@ class DrApp extends HTMLElement {
           // Merge the live point onto the history track if we have one,
           // else use the live-session ring buffer alone.
           this.updateGpsTrack();
-          this.renderGpsFixButton();
+          this.liveUpdateFixPanel();
           // Default the sight panel's assumed position to GPS when DR
           // isn't running (moored). DR position takes priority when it
           // arrives (applied in its own case below).
@@ -428,9 +466,49 @@ class DrApp extends HTMLElement {
         }
         break;
       }
+      case "navigation.gnss.type":
+        this.applyGnss({ type: value });
+        break;
+      case "navigation.gnss.method":
+        this.applyGnss({ method: value });
+        break;
+      case "navigation.gnss.satellites":
+        this.applyGnss({ satellites: value });
+        break;
+      case "navigation.gnss.satellitesVisible":
+        this.applyGnss({ satellitesVisible: value });
+        break;
+      case "navigation.gnss.horizontalDilution":
+        this.applyGnss({ hdop: value });
+        break;
       default:
         break;
     }
+  }
+
+  /**
+   * Merges GNSS fix-quality fields into the snap state and pushes a live
+   * update into the fix dialog when it's open (stats + prefilled
+   * coordinates the user hasn't edited).
+   *
+   * @param {Partial<{type: string, method: string, satellites: number, satellitesVisible: number, hdop: number}>} fields
+   * @returns {void}
+   */
+  applyGnss(fields) {
+    this.snap.gnss = { ...(this.snap.gnss ?? {}), ...fields };
+    this.liveUpdateFixPanel();
+  }
+
+  /**
+   * Feeds the current position + GNSS quality into an open fix dialog.
+   * @returns {void}
+   */
+  liveUpdateFixPanel() {
+    if (!this.fixDialog?.open || !this.fixPanel) return;
+    this.fixPanel.updateGnss({
+      position: this.snap.gpsPosition,
+      gnss: this.snap.gnss,
+    });
   }
 
   /**
@@ -522,47 +600,6 @@ class DrApp extends HTMLElement {
   showCandidate(candidate) {
     this.snap.candidate = candidate;
     this.render();
-  }
-
-  /**
-   * Enables/disables the "Fix at GPS" button based on whether a GPS
-   * position is currently known.
-   * @returns {void}
-   */
-  renderGpsFixButton() {
-    const btn = this.shadowRoot?.querySelector("#btn-gps-fix");
-    if (btn) btn.disabled = !this.snap.gpsPosition;
-  }
-
-  /**
-   * Confirms a fix at the current GNSS position — the GPS reality check
-   * (SPEC §9.3): the watchkeeper judges GPS good right now and snaps the
-   * DR origin to it. This is a GPS *point* fix (source_type "gps"), not a
-   * celestial/LOP fix; it records a `fixes` row and a `dr_corrections`
-   * row if the origin moves, and refreshes the overlays. Disabled when
-   * no GPS position is known.
-   *
-   * @returns {Promise<void>}
-   */
-  async confirmGpsFix() {
-    const pos = this.snap.gpsPosition;
-    if (!pos) return;
-    const [latitude, longitude] = pos;
-    try {
-      const res = await fetch(`${API}/fix`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source_type: "gps",
-          latitude,
-          longitude,
-        }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await this.refreshOverlays();
-    } catch (err) {
-      console.error("GPS fix confirm failed", err);
-    }
   }
 
   /**

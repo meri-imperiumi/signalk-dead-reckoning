@@ -11,6 +11,8 @@
  * @module dr-viewmodel.js
  */
 
+import * as posfmt from "./dr-position-format.js";
+
 /** Rendering style constants (SPEC §14.1: LOPs #ffcc00 on #003399). */
 export const STYLE = {
   lop: "#ffcc00",
@@ -26,6 +28,7 @@ export const STYLE = {
     celestial: "#ffb74d",
     bearing: "#ba68c8",
     manual: "#90a4ae",
+    backfill: "#8d6e63",
   },
   uncertainty: "#b39ddb",
 };
@@ -601,6 +604,105 @@ export function celestialSightBody(form) {
       latitude: Number(form.assumed_lat),
       longitude: Number(form.assumed_lon),
     };
+  }
+  return body;
+}
+
+// ---------------------------------------------------------------------------
+// Fix at coordinates (SPEC §9.1/§9.3 — point-fix confirm dialog)
+// Pure shapers for the <dr-fix-panel> component: GNSS fix-quality stats,
+// HDOP-based error estimate, and the form → POST /fix body. No DOM.
+// ---------------------------------------------------------------------------
+
+/**
+ * Typical user-equivalent range error (m) of a modern receiver, used with
+ * HDOP for a rough horizontal-error estimate (HDOP × UERE).
+ */
+export const GNSS_UERE_M = 3;
+
+/**
+ * Rough horizontal position-error estimate from HDOP, in nautical miles:
+ * HDOP × UERE (~3 m for a modern receiver). Returns null when no usable
+ * HDOP is known — never invents a number without a fix-quality basis.
+ *
+ * @param {number|null|undefined} hdop
+ * @param {number} [uereM=GNSS_UERE_M]
+ * @returns {number|null}
+ */
+export function hdopErrorNm(hdop, uereM = GNSS_UERE_M) {
+  if (!Number.isFinite(hdop) || hdop <= 0) return null;
+  return (hdop * uereM) / 1852;
+}
+
+/**
+ * Shapes the live GNSS quality data (from `navigation.gnss.*`) into
+ * label/value rows for the fix dialog's stats block. Only fields with a
+ * known value are included — the dialog renders "no data" when the array
+ * is empty (receiver or provider doesn't publish gnss quality).
+ *
+ * @param {object|null|undefined} gnss - { type, method, satellites,
+ *   satellitesVisible, hdop } with any subset of fields
+ * @returns {Array<{label: string, value: string}>}
+ */
+export function gnssStats(gnss) {
+  const rows = [];
+  if (gnss?.type) rows.push({ label: "System", value: String(gnss.type) });
+  if (gnss?.method)
+    rows.push({ label: "Fix method", value: String(gnss.method) });
+  const sats = Number(gnss?.satellites);
+  const visible = Number(gnss?.satellitesVisible);
+  if (Number.isFinite(sats)) {
+    rows.push({
+      label: "Satellites",
+      value:
+        Number.isFinite(visible) && visible !== sats
+          ? `${sats} in use, ${visible} visible`
+          : `${sats} in use`,
+    });
+  } else if (Number.isFinite(visible)) {
+    rows.push({ label: "Satellites", value: `${visible} visible` });
+  }
+  if (Number.isFinite(gnss?.hdop) && gnss.hdop > 0) {
+    const errM = Math.round(gnss.hdop * GNSS_UERE_M);
+    rows.push({
+      label: "HDOP",
+      value: `${gnss.hdop.toFixed(1)} (≈ ${errM} m error)`,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Shape a fix-dialog form into a `POST /fix` body. Coordinates may be
+ * strings in any supported position format (decimal / DM / DMS — the
+ * paper-form transcription case) or already-parsed numbers; string
+ * parsing throws on malformed input so the panel can surface the error.
+ * Fix time, notes and estimated error are forwarded only when present.
+ *
+ * @param {object} form - { latitude, longitude, source_type?, fix_time?,
+ *   fix_tz?, estimated_error_nm?, notes? }
+ * @returns {object}
+ * @throws {Error} when a coordinate string can't be parsed
+ */
+export function pointFixBody(form) {
+  const toDeg = (v, kind) =>
+    typeof v === "number" ? v : posfmt.parseCoord(v, kind);
+  const body = {
+    source_type: form.source_type || "manual",
+    latitude: toDeg(form.latitude, "lat"),
+    longitude: toDeg(form.longitude, "lon"),
+  };
+  const ts = sightTimeToIso(form.fix_time, form.fix_tz);
+  if (ts) body.timestamp = ts;
+  if (form.notes) body.notes = form.notes;
+  const err = Number(form.estimated_error_nm);
+  if (
+    form.estimated_error_nm != null &&
+    form.estimated_error_nm !== "" &&
+    Number.isFinite(err) &&
+    err > 0
+  ) {
+    body.estimated_error_nm = err;
   }
   return body;
 }
