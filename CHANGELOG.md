@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers, then runs the geometric resolver on them.
 
 ### Added
+- Sun-run-sun / running fix (SPEC §9.1): `resolveCandidateFix` now
+  advances earlier observations to the timestamp of the latest one along
+  the vessel's DR track before resolving, turning two LOPs taken at
+  different times into a fix. The displacement comes from a new
+  `GroundTrack` DR-history buffer (`plugin/ground-track.js`) fed by the
+  DR engine's water-track integration only — **never GPS** (celestial is
+  a GPS-independent position check; GPS is used only to calibrate DR
+  accuracy, not to advance celestial LOPs). Boats without water-track
+  sensors get no advance — the honest failure rather than a wrong fix.
+  New `advanceToLatest` + `input.advance` provider in the pipeline.
+- "Fix at GPS" quick action in the DR toolbar: confirms a GPS point fix
+  (`source_type: "gps"`) at the current GNSS position — the GPS reality
+  check that snaps the DR origin to GPS when the watchkeeper judges GPS
+  good. Disabled when no GPS position is known.
 - Noon Sun sight reduction (SPEC §13): `POST /celestial/sight` with
   `noon: true` reduces a local-apparent-noon meridian-altitude sight to
   latitude directly (Lat = Dec ± z) via `reduceNoonSight`, emitted as an

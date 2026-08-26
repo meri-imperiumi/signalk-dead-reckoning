@@ -127,6 +127,7 @@ template.innerHTML = /* html */ `
     </div>
     <div class="dr-toolbar">
       <button id="btn-sight">⊕ Sight / LOP</button>
+      <button id="btn-gps-fix" title="Confirm a fix at the current GNSS position (GPS reality check)">⊙ Fix at GPS</button>
     </div>
   </section>
 
@@ -183,6 +184,11 @@ class DrApp extends HTMLElement {
       this.sight?.hydratePending();
     };
     root.querySelector("#btn-sight")?.addEventListener("click", openSight);
+
+    /** Confirm a fix at the current GNSS position (GPS reality check). */
+    root
+      .querySelector("#btn-gps-fix")
+      ?.addEventListener("click", () => this.confirmGpsFix());
 
     /** @type {import("./dr-sight-panel.js").default|null} */
     this.sight = root.querySelector("#dr-sight");
@@ -363,6 +369,7 @@ class DrApp extends HTMLElement {
           // Merge the live point onto the history track if we have one,
           // else use the live-session ring buffer alone.
           this.updateGpsTrack();
+          this.renderGpsFixButton();
           // Default the sight panel's assumed position to GPS when DR
           // isn't running (moored). DR position takes priority when it
           // arrives (applied in its own case below).
@@ -497,6 +504,47 @@ class DrApp extends HTMLElement {
   showCandidate(candidate) {
     this.snap.candidate = candidate;
     this.render();
+  }
+
+  /**
+   * Enables/disables the "Fix at GPS" button based on whether a GPS
+   * position is currently known.
+   * @returns {void}
+   */
+  renderGpsFixButton() {
+    const btn = this.shadowRoot?.querySelector("#btn-gps-fix");
+    if (btn) btn.disabled = !this.snap.gpsPosition;
+  }
+
+  /**
+   * Confirms a fix at the current GNSS position — the GPS reality check
+   * (SPEC §9.3): the watchkeeper judges GPS good right now and snaps the
+   * DR origin to it. This is a GPS *point* fix (source_type "gps"), not a
+   * celestial/LOP fix; it records a `fixes` row and a `dr_corrections`
+   * row if the origin moves, and refreshes the overlays. Disabled when
+   * no GPS position is known.
+   *
+   * @returns {Promise<void>}
+   */
+  async confirmGpsFix() {
+    const pos = this.snap.gpsPosition;
+    if (!pos) return;
+    const [latitude, longitude] = pos;
+    try {
+      const res = await fetch(`${API}/fix`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_type: "gps",
+          latitude,
+          longitude,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await this.refreshOverlays();
+    } catch (err) {
+      console.error("GPS fix confirm failed", err);
+    }
   }
 
   /**

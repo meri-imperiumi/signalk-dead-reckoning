@@ -1682,3 +1682,48 @@ test("logbook: posting a celestial sight writes a sight entry with reduction", a
   }
   await rm(dir, { recursive: true, force: true });
 });
+
+test("POST /fix with source_type gps confirms a fix at the given position", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-gps-fix-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  const { status, body } = router.invoke("post", "/fix", {
+    source_type: "gps",
+    latitude: 60.001,
+    longitude: 24.001,
+  });
+  assert.strictEqual(status, 200);
+  assert.ok(body.fix_id > 0);
+  // GPS point fix has zero residual.
+  assert.strictEqual(body.confirmed_by, null);
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const row = db
+    .prepare("SELECT source_type FROM fixes WHERE fix_id = ?")
+    .get(body.fix_id);
+  assert.strictEqual(row.source_type, "gps");
+  db.close();
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});

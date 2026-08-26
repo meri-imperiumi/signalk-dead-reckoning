@@ -32,6 +32,7 @@ const {
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
+const { GroundTrack } = require("./ground-track.js");
 const {
   TrainingState,
   resolveCurrent,
@@ -242,6 +243,7 @@ const deps = {
   listCorrections,
   DeadReckoningEngine,
   MatrixStore,
+  GroundTrack,
   TrainingState,
   resolveCurrent,
   trainingTick,
@@ -272,6 +274,9 @@ module.exports = (app) => {
 
   /** @type {DeadReckoningEngine|null} */
   let engine = null;
+
+  /** @type {import("./ground-track.js").GroundTrack|null} */
+  let groundTrack = null;
 
   /** @type {TrainingState|null} */
   let training = null;
@@ -367,6 +372,7 @@ module.exports = (app) => {
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
+      groundTrack = new deps.GroundTrack();
       training = new deps.TrainingState({
         settleSustainS: config.training.settleSustainS,
       });
@@ -480,6 +486,7 @@ module.exports = (app) => {
       }
       matrix = null;
       engine = null;
+      groundTrack = null;
       training = null;
       // Hygiene: clear a live advisory so it doesn't linger after the
       // plugin stops monitoring.
@@ -517,9 +524,12 @@ module.exports = (app) => {
       for (const v of update.values) {
         deltaState.set(v.path, v.value);
         // Seed the engine origin from the first GPS fix if we have none yet.
-        if (v.path === "navigation.position" && !engine?.origin) {
-          const pos = unwrapPosition(v.value);
-          if (pos) snapToFix(pos, "gps", { confirmed_by: null, resets: true });
+        if (v.path === "navigation.position") {
+          if (!engine?.origin) {
+            const pos = unwrapPosition(v.value);
+            if (pos)
+              snapToFix(pos, "gps", { confirmed_by: null, resets: true });
+          }
         }
       }
     }
@@ -650,6 +660,17 @@ module.exports = (app) => {
       },
       config.tickIntervalMs / 1000,
     );
+
+    // Feed the DR position into the track buffer so running-fix advances
+    // work without GPS (SPEC §9.1). GPS samples (appended in the delta
+    // handler) take precedence at a given instant.
+    if (pos && groundTrack) {
+      groundTrack.append({
+        timestamp: Date.now(),
+        latitude: pos.latitude,
+        longitude: pos.longitude,
+      });
+    }
 
     // --- Training Mode (SPEC §6.1) --------------------------------------
     // When GPS is reliable and we're sailing (not motoring, paddlewheel
@@ -1395,6 +1416,7 @@ module.exports = (app) => {
           getLineOfPosition: deps.getLineOfPosition,
           getCircularPositionLine: deps.getCircularPositionLine,
         },
+        advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
       });
       if (!candidate) {
         res.status(400).json({ message: "observations not resolvable" });
@@ -1464,6 +1486,7 @@ module.exports = (app) => {
             getLineOfPosition: deps.getLineOfPosition,
             getCircularPositionLine: deps.getCircularPositionLine,
           },
+          advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
         });
       } else {
         candidate = deps.resolveCandidateFix({
@@ -1480,6 +1503,7 @@ module.exports = (app) => {
             getLineOfPosition: deps.getLineOfPosition,
             getCircularPositionLine: deps.getCircularPositionLine,
           },
+          advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
         });
       }
       if (!candidate) {

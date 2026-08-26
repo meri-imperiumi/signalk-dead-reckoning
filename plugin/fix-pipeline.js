@@ -30,7 +30,7 @@
  * @file fix-pipeline.js
  */
 
-const { resolveFix } = require("./fixes.js");
+const { resolveFix, advanceObservation } = require("./fixes.js");
 
 /**
  * The helpers the orchestrator needs, injected by the caller. In
@@ -94,6 +94,7 @@ const { resolveFix } = require("./fixes.js");
  * @param {DrEngineLike|null} [input.engine] - to default drPosition from origin
  * @param {import('node:sqlite').DatabaseSync|null} [input.db] - to hydrate observations from ids
  * @param {{getLineOfPosition?: Function, getCircularPositionLine?: Function}} [input.helpers] - db getters for id-hydration
+ * @param {((t0: number, t1: number) => ({bearingTrue: number, distanceNm: number}|null))|null} [input.advance] - ground-track displacement provider for running fixes; advances earlier observations to the latest timestamp
  * @returns {CandidateFix|null} null if observations can't be resolved (e.g. a single LOP with no point)
  */
 /**
@@ -119,6 +120,7 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
       assumed_lon: row.assumed_lon,
       azimuth_true: row.azimuth_true,
       intercept_nm: row.intercept_nm ?? 0,
+      timestamp_ms: Date.parse(row.timestamp),
     });
   }
   for (const id of cplIds) {
@@ -129,9 +131,38 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
       center_lat: row.center_lat,
       center_lon: row.center_lon,
       radius_nm: row.radius_nm,
+      timestamp_ms: Date.parse(row.timestamp),
     });
   }
   return out;
+}
+
+/**
+ * Advances earlier observations to the timestamp of the latest one along
+ * the vessel's ground track (running fix / sun-run-sun, SPEC §9.1).
+ * Observations without a timestamp, or taken at the latest time, are
+ * left in place. If no displacement provider is supplied or it returns
+ * null for an interval (no GPS history for that span), that observation
+ * is left un-advanced — the resolver may still succeed if the other
+ * inputs suffice, but a single stale LOP will not silently yield a
+ * wrong fix.
+ *
+ * @param {Array<object>} observations - each may carry `timestamp_ms`
+ * @param {((t0: number, t1: number) => ({bearingTrue: number, distanceNm: number}|null))|null} advance
+ * @returns {Array<object>} a new array
+ */
+function advanceToLatest(observations, advance) {
+  const stamped = observations.filter((o) => Number.isFinite(o.timestamp_ms));
+  if (!advance || stamped.length < 2) return observations;
+  const tLate = Math.max(...stamped.map((o) => o.timestamp_ms));
+  return observations.map((o) => {
+    if (!Number.isFinite(o.timestamp_ms) || o.timestamp_ms >= tLate) {
+      return o;
+    }
+    const disp = advance(o.timestamp_ms, tLate);
+    if (!disp || disp.distanceNm === 0) return o;
+    return advanceObservation(o, disp);
+  });
 }
 
 function resolveCandidateFix(input) {
@@ -165,6 +196,16 @@ function resolveCandidateFix(input) {
     );
   }
   if (observations.length === 0) return null;
+
+  // Running fix (SPEC §9.1, sun-run-sun): when observations carry
+  // timestamps and span a time interval, advance the earlier ones to the
+  // latest observation time along the vessel's ground track before
+  // resolving. This turns two LOPs taken at different times into a
+  // fix — the celestial analog of a terrestrial running fix. Without a
+  // displacement provider (no GPS history), earlier observations are
+  // left in place and the resolver may fail or return a weaker result —
+  // the honest failure rather than a silently-wrong un-advanced fix.
+  observations = advanceToLatest(observations, input.advance || null);
 
   const drPosition = input.drPosition ??
     input.engine?.origin ?? { latitude: 0, longitude: 0 };
@@ -283,4 +324,5 @@ module.exports = {
   resolveCandidateFix,
   confirmFix,
   loadObservationsById,
+  advanceToLatest,
 };

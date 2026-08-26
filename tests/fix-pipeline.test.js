@@ -28,6 +28,7 @@ const {
   resolveCandidateFix,
   confirmFix,
   loadObservationsById,
+  advanceToLatest,
 } = require("../plugin/fix-pipeline.js");
 
 let tempDir;
@@ -190,6 +191,116 @@ test("loadObservationsById: shapes LOP + CPL rows into resolver inputs", () => {
   assert.strictEqual(obs[1].kind, "cpl");
   assert.strictEqual(obs[1].radius_nm, 2);
   db.close();
+});
+
+test("advanceToLatest: advances earlier observations to the latest timestamp", () => {
+  // Two LOPs 4h apart; the first anchored at 60N/24E. DR displacement
+  // 25 nm due east over the interval. The advanced LOP's anchor should
+  // move east by ~25 nm; the later one is untouched.
+  const T0 = Date.UTC(2026, 0, 1, 10, 0, 0);
+  const T1 = Date.UTC(2026, 0, 1, 14, 17, 0);
+  const obs = [
+    {
+      kind: "lop",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 0,
+      timestamp_ms: T0,
+    },
+    {
+      kind: "lop",
+      assumed_lat: 60,
+      assumed_lon: 24.5,
+      azimuth_true: 90,
+      timestamp_ms: T1,
+    },
+  ];
+  const advanced = advanceToLatest(obs, () => ({
+    bearingTrue: 90,
+    distanceNm: 25,
+  }));
+  // First LOP moved east; second untouched.
+  assert.ok(advanced[0].assumed_lon > 24);
+  assert.strictEqual(advanced[1].assumed_lon, 24.5);
+});
+
+test("advanceToLatest: no provider → observations unchanged", () => {
+  const obs = [
+    {
+      kind: "lop",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 0,
+      timestamp_ms: 0,
+    },
+    {
+      kind: "lop",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 90,
+      timestamp_ms: 1000,
+    },
+  ];
+  const out = advanceToLatest(obs, null);
+  assert.strictEqual(out[0].assumed_lon, 24);
+  assert.strictEqual(out[1].assumed_lon, 24);
+});
+
+test("advanceToLatest: provider returns null → that observation left in place", () => {
+  const obs = [
+    {
+      kind: "lop",
+      assumed_lat: 60,
+      assumed_lon: 24,
+      azimuth_true: 0,
+      timestamp_ms: 0,
+    },
+    {
+      kind: "lop",
+      assumed_lat: 60,
+      assumed_lon: 25,
+      azimuth_true: 90,
+      timestamp_ms: 1000,
+    },
+  ];
+  const out = advanceToLatest(obs, () => null);
+  assert.strictEqual(out[0].assumed_lon, 24);
+});
+
+test("resolveCandidateFix: running fix — two time-separated LOPs resolve with an advance provider", () => {
+  const T0 = Date.UTC(2026, 0, 1, 10, 0, 0);
+  const T1 = Date.UTC(2026, 0, 1, 14, 0, 0);
+  // First LOP: a north-south line (azimuth 0 → east-west LOP) through 60N/24E.
+  // After 4h sailing due east at 6kn = 24 nm, the line moves to ~24.4E.
+  // Second LOP: an east-west line (azimuth 90 → north-south LOP) through 60N/24.4E,
+  // taken at T1. They cross at ~60N/24.4E.
+  const c = resolveCandidateFix({
+    source_type: "celestial",
+    observations: [
+      {
+        kind: "lop",
+        assumed_lat: 60,
+        assumed_lon: 24,
+        azimuth_true: 0,
+        intercept_nm: 0,
+        timestamp_ms: T0,
+      },
+      {
+        kind: "lop",
+        assumed_lat: 60,
+        assumed_lon: 24.4,
+        azimuth_true: 90,
+        intercept_nm: 0,
+        timestamp_ms: T1,
+      },
+    ],
+    drPosition: { latitude: 60, longitude: 24.4 },
+    advance: () => ({ bearingTrue: 90, distanceNm: 24 }),
+  });
+  assert.ok(c, "running fix should resolve");
+  // The crossing is at the second LOP's longitude and the first's latitude.
+  assert.ok(Math.abs(c.latitude - 60) < 0.05, `lat ${c.latitude}`);
+  assert.ok(Math.abs(c.longitude - 24.4) < 0.05, `lon ${c.longitude}`);
 });
 
 test("resolveCandidateFix: single LOP with no point → null (not resolvable)", () => {
