@@ -1785,3 +1785,166 @@ test("tick integrates the Weather API current into the DR solution (tier 3)", as
   }
   await rm(dir, { recursive: true, force: true });
 });
+
+/**
+ * Emits a GPS fix sequence moving due east at `speedKn` at ~100 ms
+ * intervals, so the pair-derived motion estimator converges.
+ */
+async function emitMovingGps(app, speedKn, fixes = 6) {
+  // 6 kn × 100 ms = 0.000167 nm; at 60N, 1° lon ≈ 30 nm.
+  const dLon =
+    (speedKn * (100 / 3600000)) / (30 * Math.cos((60 * Math.PI) / 180));
+  for (let i = 1; i <= fixes; i++) {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 + dLon * i },
+            },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+function lastValues(app, path) {
+  return app.handledMessages
+    .filter((m) =>
+      m.message?.updates?.some((u) => u.values?.some((v) => v.path === path)),
+    )
+    .flatMap((m) =>
+      m.message.updates.flatMap((u) => u.values.filter((v) => v.path === path)),
+    )
+    .map((v) => v.value);
+}
+
+test("idle while making way: uncertainty grows, state carries moving, alert raised", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-idle-moving-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  try {
+    // No STW/heading (idle), but GPS shows ~6 kn over ground.
+    await emitMovingGps(app, 6, 6);
+
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    assert.ok(states.length > 0, "no state deltas");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "idle");
+    assert.strictEqual(last.moving, true, `state ${JSON.stringify(last)}`);
+
+    const unc = lastValues(app, "navigation.deadReckoning.uncertainty");
+    assert.ok(unc.length >= 2, "expected uncertainty deltas while idle-moving");
+    assert.ok(
+      unc[unc.length - 1].radius_nm > unc[0].radius_nm,
+      `radius should grow: ${unc[0].radius_nm} → ${unc[unc.length - 1].radius_nm}`,
+    );
+
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.ok(
+      alerts.some((a) => a.state === "alert" && /stale/i.test(a.message)),
+      `no stale alert: ${JSON.stringify(alerts)}`,
+    );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("idle and stationary (moored): no moving flag, no growth alert", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-idle-still-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  try {
+    // Same fix repeated → deduped, no motion samples.
+    for (let i = 0; i < 5; i++) {
+      app.emitDelta({
+        context: "vessels.self",
+        updates: [
+          {
+            values: [
+              {
+                path: "navigation.position",
+                value: { latitude: 60, longitude: 24 },
+              },
+            ],
+          },
+        ],
+      });
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "idle");
+    assert.strictEqual(last.moving, false);
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.strictEqual(
+      alerts.filter((a) => a.state === "alert").length,
+      0,
+      "no alert when stationary",
+    );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("fouled paddlewheel: STW 0 while making way raises fouling alert + state flag", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-fouled-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  try {
+    // STW reads 0, heading present → underway branch; GPS moving ~6 kn.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "navigation.speedThroughWater", value: 0 },
+            { path: "navigation.headingTrue", value: 45 },
+          ],
+        },
+      ],
+    });
+    await emitMovingGps(app, 6, 8);
+
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const underway = states.filter((s) => s.status === "underway");
+    assert.ok(underway.length > 0, "no underway state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "underway");
+    assert.strictEqual(last.fouled, true, `state ${JSON.stringify(last)}`);
+
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.ok(
+      alerts.some((a) => a.state === "alert" && /fouled/i.test(a.message)),
+      `no fouling alert: ${JSON.stringify(alerts)}`,
+    );
+
+    // Elapsed-since-fix figure is published for the UI headline.
+    const elapsed = lastValues(app, "navigation.deadReckoning.elapsedSinceFix");
+    assert.ok(elapsed.length > 0, "no elapsedSinceFix delta");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});

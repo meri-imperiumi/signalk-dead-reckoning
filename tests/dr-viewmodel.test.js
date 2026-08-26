@@ -472,3 +472,15 @@ test("extendLineSpec: celestial LOP stays symmetric (no lopType)", async () => {
   const lats = [a[0], b[0]].sort((x, y) => x - y);
   assert.ok(lats[0] < 60 && lats[1] > 60);
 });
+
+test("elapsedText: formats fix age at watchkeeper granularity", async () => {
+  const vm = await loadVm();
+  assert.strictEqual(vm.elapsedText(null), "—");
+  assert.strictEqual(vm.elapsedText(undefined), "—");
+  assert.strictEqual(vm.elapsedText(Number.NaN), "—");
+  assert.strictEqual(vm.elapsedText(-5), "—");
+  assert.strictEqual(vm.elapsedText(45), "45s");
+  assert.strictEqual(vm.elapsedText(60), "1m");
+  assert.strictEqual(vm.elapsedText(4 * 60), "4m");
+  assert.strictEqual(vm.elapsedText(134 * 60), "2h 14m");
+});

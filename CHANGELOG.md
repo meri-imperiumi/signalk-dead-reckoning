@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Sea-trial safety hardening — honest DR under sensor failure:
+  - **Idle-while-making-way detection**: when STW/heading drop but
+    GPS-derived motion shows the vessel still making way (fouled
+    paddlewheel, compass dropout), the frozen DR position is flagged
+    `moving: true` in `navigation.deadReckoning.state`, the uncertainty
+    polygon keeps growing by GPS-derived ground distance (instead of
+    freezing with the water track), and a §3.1 sensor-health alert
+    (`notifications.navigation.deadReckoning.status`) is raised:
+    "DR stopped tracking… position is stale". GPS remains authoritative
+    until proven faulty or OVERRIDE — the watchkeeper is informed, not
+    left with falsely-confident DR.
+  - **Paddlewheel fouling surfaced**: `detectFouling`'s verdict (STW≈0
+    while SOG/wind indicate motion) now raises the same §3.1 alert and
+    sets `fouled: true` on the state, instead of silently gating
+    training.
+  - **Transient flag**: the underway state now carries
+    `transient: true` during a tack/gybe — the UI explains an expected
+    divergence spike instead of reading it as a fault.
+  - **"Since last fix" headline**: `navigation.deadReckoning.elapsedSinceFix`
+    (s, per-tick) drives the previously-unwired UI figure — the
+    watchkeeper's fix-cadence cue (`elapsedText` formatter in the
+    view-model).
+  - UI status panel renders the new states with distinct styling:
+    stale-DR / fouled (red), maneuver-in-progress (amber).
 - Signal K Weather API current (SPEC §6.2 tier 3): a new
   `plugin/current.js` subsystem polls
   `/signalk/v2/api/weather/forecasts/point` at the vessel position

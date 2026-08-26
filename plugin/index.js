@@ -37,6 +37,7 @@ const {
   TrainingState,
   tick: trainingTick,
   detectManeuver,
+  SOG_MOVING_KN,
 } = require("./training.js");
 const { resolveCurrent, WeatherCurrentClient } = require("./current.js");
 const { distanceNm, bearingDeg } = require("./geo.js");
@@ -156,8 +157,12 @@ const PATHS = {
   uncertainty: "navigation.deadReckoning.uncertainty",
   divergence: "navigation.deadReckoning.divergence",
   state: "navigation.deadReckoning.state",
+  elapsedSinceFix: "navigation.deadReckoning.elapsedSinceFix",
   divergenceAdvisory:
     "notifications.navigation.deadReckoning.divergenceAdvisory",
+  // SPEC §3.1: sensor-health flags (idle-while-making-way, paddlewheel
+  // fouling). Published only on transitions, like the divergence advisory.
+  sensorHealth: "notifications.navigation.deadReckoning.status",
 };
 
 /**
@@ -284,6 +289,34 @@ module.exports = (app) => {
 
   /** @type {WeatherCurrentClient|null} §6.2 tier-3 weather current poller */
   let weatherClient = null;
+
+  /**
+   * GPS-derived vessel speed (kn) from consecutive fixes — the motion
+   * signal for "idle but making way" (§6.3/§8). EMA-smoothed so a single
+   * jittery fix doesn't flap it.
+   * @type {{lastGps: {latitude: number, longitude: number, tsMs: number}|null, speedKn: number|null}}
+   */
+  let gpsMotion = { lastGps: null, speedKn: null };
+
+  /**
+   * Distance (nm) the vessel made over ground while DR was idle — grown
+   * into the uncertainty polygon's effective "distance run" so the
+   * polygon keeps growing when the water track freezes. Reset when a
+   * confirmed fix resets the engine log.
+   * @type {number}
+   */
+  let idleRunNm = 0;
+
+  /** Previous tick's engine log — detects the reset that follows a fix. */
+  let prevLogNm = 0;
+
+  /**
+   * Active sensor-health issue ("idle-moving" | "fouled" | null) —
+   * tracked so the §3.1 status notification publishes on transitions
+   * only, mirroring the divergence advisory's hysteresis.
+   * @type {string|null}
+   */
+  let sensorHealthIssue = null;
 
   /** @type {TrainingState|null} */
   let training = null;
@@ -543,6 +576,16 @@ module.exports = (app) => {
         });
       }
       divergence = null;
+      if (sensorHealthIssue) {
+        publishNotification(PATHS.sensorHealth, {
+          state: "normal",
+          message: "DR monitoring stopped",
+        });
+        sensorHealthIssue = null;
+      }
+      gpsMotion = { lastGps: null, speedKn: null };
+      idleRunNm = 0;
+      prevLogNm = 0;
       if (accessPoll) {
         clearInterval(accessPoll);
         accessPoll = null;
@@ -654,6 +697,15 @@ module.exports = (app) => {
     const heel = unwrapHeel(deltaState.get("navigation.attitude"));
     const gps = unwrapPosition(deltaState.get("navigation.position"));
 
+    // GPS-derived motion (independent of the water-track sensors):
+    // updated every tick, used to detect "idle but making way" below.
+    updateGpsMotion(gps);
+
+    // A confirmed fix resets the engine log (logNmSinceOrigin → 0);
+    // drop the accumulated idle-run distance with it.
+    if (engine.logNmSinceOrigin < prevLogNm) idleRunNm = 0;
+    prevLogNm = engine.logNmSinceOrigin;
+
     // Heading: prefer true heading; fall back to magnetic (WMM correction
     // applied upstream in v1 — see SPEC §12). If neither, hold position.
     const headingTrueDeg = headingTrue ?? headingMag;
@@ -672,8 +724,37 @@ module.exports = (app) => {
       } else {
         reason = "no heading";
       }
+
+      // §8/§6.3: idle is honest only when the boat actually stopped. When
+      // GPS shows the vessel still making way (fouled paddlewheel, compass
+      // dropout), the frozen DR position is stale and the uncertainty
+      // polygon must keep growing — by the ground distance travelled with
+      // no water track — or it falsely advertises confidence. GPS stays
+      // authoritative until proven faulty or OVERRIDE (§7), so the
+      // watchkeeper is alerted, not left guessing.
+      const moving =
+        gpsMotion.speedKn != null && gpsMotion.speedKn > SOG_MOVING_KN;
+      let uncertaintyValue = null;
+      if (moving) {
+        idleRunNm += (gpsMotion.speedKn * config.tickIntervalMs) / 3600000;
+        const u = deps.computeRadius({
+          elapsedDistanceNm: engine.logNmSinceOrigin + idleRunNm,
+          effectiveHitCount: 0, // unknown bin while idle — fallback growth
+          stwKn: 0,
+        });
+        uncertaintyValue = { radius_nm: u.radius_nm, method: u.method };
+      }
+      setSensorHealth(
+        moving ? "idle-moving" : null,
+        moving
+          ? `DR stopped tracking (${reason}) but the vessel is making ~${gpsMotion.speedKn.toFixed(1)} kn over ground — DR position is stale, uncertainty growing`
+          : null,
+      );
+
       publish({
-        [PATHS.state]: { status: "idle", reason },
+        [PATHS.state]: { status: "idle", reason, moving },
+        ...(uncertaintyValue ? { [PATHS.uncertainty]: uncertaintyValue } : {}),
+        [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
       });
       return;
     }
@@ -755,6 +836,17 @@ module.exports = (app) => {
         { source: "live" },
       );
     }
+
+    // §6.3: the fouling detector's verdict (STW≈0 while SOG/wind say
+    // the boat moves) is surfaced, not just used to gate training — a
+    // fouled paddlewheel silently integrating 0 speed is the classic
+    // way DR freezes while the vessel sails on.
+    setSensorHealth(
+      tr.fouled ? "fouled" : null,
+      tr.fouled
+        ? "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR is integrating near-zero speed; verify position by other means"
+        : null,
+    );
 
     // §9.4: auto tack/gybe logbook entries. The transient window's close
     // edge is a completed maneuver; classify from the AWA change across
@@ -845,7 +937,15 @@ module.exports = (app) => {
           radius_nm: u.radius_nm,
           method: u.method,
         },
-        [PATHS.state]: { status: "underway" },
+        // §6.4: transient flags a tack/gybe in progress — the moment when
+        // a large DR divergence is expected (unsteady flow over the
+        // paddlewheel, rapid heading changes) and not yet a fault signal.
+        [PATHS.state]: {
+          status: "underway",
+          transient: tr.transient,
+          fouled: tr.fouled,
+        },
+        [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
         ...(dvg ? { [PATHS.divergence]: dvg } : {}),
       });
     }
@@ -1038,6 +1138,62 @@ module.exports = (app) => {
     return ref;
   }
 
+  /**
+   * Updates the GPS-derived motion estimate (kn) from consecutive fixes.
+   * EMA-smoothed (α=0.3, mirroring the trainer's ground-truth filter) so a
+   * single jittery fix doesn't flap the "idle but making way" alert.
+   *
+   * @param {{latitude:number, longitude:number}|null} gps
+   * @returns {void}
+   */
+  function updateGpsMotion(gps) {
+    if (!gps) return;
+    const last = gpsMotion.lastGps;
+    // Only sample when the fix actually changed — the tick may run faster
+    // than the GPS, and re-sampling an unchanged fix would drag the EMA
+    // toward zero.
+    if (
+      last &&
+      last.latitude === gps.latitude &&
+      last.longitude === gps.longitude
+    ) {
+      return;
+    }
+    const tsMs = Date.now();
+    gpsMotion.lastGps = { ...gps, tsMs };
+    if (!last) return;
+    const dtH = (tsMs - last.tsMs) / 3600000;
+    if (dtH <= 0) return;
+    const speedKn = deps.distanceNm(last, gps) / dtH;
+    gpsMotion.speedKn =
+      gpsMotion.speedKn == null
+        ? speedKn
+        : gpsMotion.speedKn * 0.7 + speedKn * 0.3;
+  }
+
+  /**
+   * Publishes the §3.1 sensor-health notification on *transitions only*
+   * (raise when an issue appears, clear when it resolves) — the same
+   * hysteresis discipline as the divergence advisory. No issue → null.
+   *
+   * @param {string|null} issue - "idle-moving" | "fouled" | null
+   * @param {string|null} message - human explanation for the raise
+   * @returns {void}
+   */
+  function setSensorHealth(issue, message) {
+    if (issue === sensorHealthIssue) return;
+    const wasIssue = sensorHealthIssue;
+    sensorHealthIssue = issue;
+    if (issue) {
+      publishNotification(PATHS.sensorHealth, { state: "alert", message });
+    } else if (wasIssue) {
+      publishNotification(PATHS.sensorHealth, {
+        state: "normal",
+        message: "DR sensor health nominal",
+      });
+    }
+  }
+
   function publishNotification(path, n) {
     app.handleMessage(PLUGIN_ID, {
       context: "vessels.self",
@@ -1099,6 +1255,15 @@ module.exports = (app) => {
                 displayName: "DR uncertainty polygon",
                 description:
                   "Confidence-weighted circular error region around the DR position; radius scales with distance run and tightens as the matching matrix bin accumulates hits.",
+              },
+            },
+            {
+              path: PATHS.elapsedSinceFix,
+              value: {
+                units: "s",
+                displayName: "Time since last fix",
+                description:
+                  "Seconds since the DR origin was last snapped to a confirmed fix — the watchkeeper's fix-cadence cue.",
               },
             },
             {

@@ -77,6 +77,13 @@ template.innerHTML = /* html */ `
     .dr-status.underway {
       color: #56d364;
     }
+    .dr-status.alert {
+      color: #f85149;
+      font-weight: 600;
+    }
+    .dr-status.transient {
+      color: #f0b429;
+    }
     .dr-status.retrying {
       color: #f85149;
     }
@@ -250,6 +257,7 @@ class DrApp extends HTMLElement {
       "navigation.deadReckoning.uncertainty",
       "navigation.deadReckoning.divergence",
       "navigation.deadReckoning.state",
+      "navigation.deadReckoning.elapsedSinceFix",
       "navigation.position",
     ]);
     stream.on((delta) => this.onDelta(delta));
@@ -326,6 +334,12 @@ class DrApp extends HTMLElement {
       if (dr?.state?.value) {
         this.applyValue("navigation.deadReckoning.state", dr.state.value);
       }
+      if (dr?.elapsedSinceFix?.value != null) {
+        this.applyValue(
+          "navigation.deadReckoning.elapsedSinceFix",
+          dr.elapsedSinceFix.value,
+        );
+      }
       this.render();
     } catch {
       /* REST unavailable — stream will drive when it can */
@@ -400,6 +414,10 @@ class DrApp extends HTMLElement {
         break;
       case "navigation.deadReckoning.state":
         this.renderDrState(value);
+        break;
+      case "navigation.deadReckoning.elapsedSinceFix":
+        this.shadowRoot.querySelector("#dr-elapsed").textContent =
+          vm.elapsedText(value);
         break;
       case "navigation.deadReckoning.configHash": {
         // Server-side config edit → re-fetch the plugin config so the
@@ -596,7 +614,7 @@ class DrApp extends HTMLElement {
     const panel = this.shadowRoot.querySelector("#dr-status-panel");
     const text = this.shadowRoot.querySelector("#dr-status-text");
     if (!panel || !text) return;
-    panel.classList.remove("idle", "underway");
+    panel.classList.remove("idle", "underway", "alert", "transient");
     if (!value) {
       text.textContent = "No dead-reckoning data";
       return;
@@ -604,10 +622,27 @@ class DrApp extends HTMLElement {
     if (value.status === "idle") {
       panel.classList.add("idle");
       const reason = value.reason ?? "waiting for speed and heading";
-      text.textContent = `Dead reckoning idle — ${reason}. GPS position still shown on map.`;
+      if (value.moving) {
+        // Idle while making way — the dangerous case (fouled paddlewheel,
+        // sensor dropout): DR is stale, not merely paused.
+        panel.classList.add("alert");
+        text.textContent = `⚠ DR stale — ${reason}, but the vessel is making way. DR position is NOT tracking; uncertainty is growing.`;
+      } else {
+        text.textContent = `Dead reckoning idle — ${reason}. GPS position still shown on map.`;
+      }
     } else if (value.status === "underway") {
       panel.classList.add("underway");
-      text.textContent = "Dead reckoning active";
+      if (value.fouled) {
+        panel.classList.add("alert");
+        text.textContent =
+          "⚠ Paddlewheel appears fouled — STW≈0 while making way. DR is integrating near-zero speed.";
+      } else if (value.transient) {
+        panel.classList.add("transient");
+        text.textContent =
+          "Dead reckoning active — tack/gybe in progress, divergence may spike temporarily.";
+      } else {
+        text.textContent = "Dead reckoning active";
+      }
     }
   }
 

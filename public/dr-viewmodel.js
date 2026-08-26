@@ -333,6 +333,22 @@ export function divergenceText(d) {
 }
 
 /**
+ * Formats seconds since the last confirmed fix for the headline figure —
+ * the watchkeeper's fix-cadence cue ("how stale is my DR origin?").
+ *
+ * @param {number|null|undefined} s
+ * @returns {string} e.g. "4m", "2h 14m", "—"
+ */
+export function elapsedText(s) {
+  if (s == null || !Number.isFinite(s) || s < 0) return "—";
+  const m = Math.floor(s / 60);
+  if (m < 1) return `${Math.floor(s)}s`;
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m - h * 60}m`;
+}
+
+/**
  * Parses Signal K's `resources/charts` object into tile layers the map
  * can render (chart identifier/name + a `{z}/{x}/{y}`-template URL).
  * Charts without a `tilemapUrl` (WMS, S-57, PDFs…) are dropped. No OSM
