@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token plumbing is needed.
 
 ### Fixed
+- Windows CI: the plugin smoke tests leaked open SQLite handles in the
+  shared temp directory (four `makeStarted()` tests never called
+  `plugin.stop()`). On Linux/macOS an open file can still be unlinked; on
+  Windows the cleanup `rm` failed with `EBUSY: resource busy or locked`.
+  Those tests now stop the plugin, and the shared teardown retries the
+  removal (`maxRetries`/`retryDelay`, which `fs.rm` applies to EBUSY/EPERM
+  on Windows only) to ride out transient locks from AV scanners on CI
+  runners.
 - `POST /fix/resolve` and `POST /fix` no longer return `observations not
   resolvable` when called with only `lop_ids`/`cpl_ids` (the common sight
   panel path). The pipeline now hydrates the observation bodies from the

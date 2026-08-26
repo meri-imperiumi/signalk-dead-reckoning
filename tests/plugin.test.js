@@ -21,7 +21,15 @@ test.before(async () => {
 });
 
 test.after(async () => {
-  if (tempDir) await rm(tempDir, { recursive: true, force: true });
+  // Windows holds sqlite files briefly after close (AV scanners on CI
+  // runners are notorious for it); rm retries EBUSY/EPERM only on Windows.
+  if (tempDir)
+    await rm(tempDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 100,
+    });
 });
 
 /**
@@ -1528,10 +1536,11 @@ test("GET /celestial/bodies lists Sun, Moon, and bundled stars with validity", (
   assert.ok(typeof r.body.valid_from === "string");
   assert.ok(typeof r.body.valid_until === "string");
   assert.strictEqual(typeof r.body.expired, "boolean");
+  plugin.stop();
 });
 
 test("app.get config endpoint serves the plugin config with a hash", () => {
-  const { app } = makeStarted();
+  const { app, plugin } = makeStarted();
   // The public config endpoint is mounted on app.get (not the router).
   assert.ok(app.appRoutes.length >= 1);
   const cfg = app.appRoutes.find((r) =>
@@ -1553,6 +1562,7 @@ test("app.get config endpoint serves the plugin config with a hash", () => {
   assert.strictEqual(res._body.config.positionFormat, "dms");
   assert.ok(typeof res._body.configHash === "string");
   assert.ok(res._body.configHash.length > 0);
+  plugin.stop();
 });
 
 test("schema exposes the positionFormat option with DMS default", () => {
@@ -1589,6 +1599,7 @@ test("POST /fix populates confirmed_by from the JAUTHENTICATION cookie", () => {
   );
   assert.strictEqual(r.status, 200);
   assert.strictEqual(r.body.confirmed_by, "watchkeeper");
+  plugin.stop();
 });
 
 test("POST /fix leaves confirmed_by null when anonymous", () => {
@@ -1608,6 +1619,7 @@ test("POST /fix leaves confirmed_by null when anonymous", () => {
   );
   assert.strictEqual(r.status, 200);
   assert.strictEqual(r.body.confirmed_by, null);
+  plugin.stop();
 });
 
 test("logbook: posting a bearing LOP writes an observation entry", async () => {
