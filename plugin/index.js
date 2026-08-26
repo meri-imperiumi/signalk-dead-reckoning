@@ -14,8 +14,14 @@
 /** @typedef {import("@signalk/server-api").Plugin} Plugin */
 
 const { join } = require("node:path");
-const { openDatabase, getState, setState, recordFix, recordCorrection } =
-  require("./db.js");
+const {
+  openDatabase,
+  getState,
+  setState,
+  recordFix,
+  recordCorrection,
+  getDeviationRateStats,
+} = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
 const {
@@ -32,6 +38,7 @@ const {
 const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
 const { reduceSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
+const { computeRadius } = require("./uncertainty.js");
 
 /**
  * Plugin identifier (matches package name without the scope).
@@ -50,6 +57,7 @@ const PATHS = {
   stw: "navigation.speedThroughWater",
   headingTrue: "navigation.headingTrue",
   current: "environment.current",
+  uncertainty: "navigation.deadReckoning.uncertainty",
   gpsSpoofed: "notifications.navigation.gpsSpoofed",
   divergenceAdvisory:
     "notifications.navigation.deadReckoning.divergenceAdvisory",
@@ -91,11 +99,13 @@ const deps = {
   setState,
   recordFix,
   recordCorrection,
+  getDeviationRateStats,
   recordLineOfPosition,
   recordCircularPositionLine,
   attachObservationsToFix,
   resolveCandidateFix,
   confirmFix,
+  computeRadius,
   DeadReckoningEngine,
   MatrixStore,
   TrainingState,
@@ -191,6 +201,10 @@ module.exports = (app) => {
           // or confirmed fix will seed the origin.
         }
       }
+      // §8: restore the per-excursion distance so a mid-excursion restart
+      // continues the uncertainty polygon rather than resetting it.
+      const logSinceOrigin = deps.getState(db, "dr_log_since_origin");
+      if (logSinceOrigin) engine.logNmSinceOrigin = Number(logSinceOrigin) || 0;
 
       // Subscribe to the sensor inputs the engine needs.
       const subscription = {
@@ -423,6 +437,21 @@ module.exports = (app) => {
     }
 
     if (pos) {
+      // §8: uncertainty polygon around the DR position. Recomputed each
+      // tick from the current bin (so a tack/sail change re-evaluates),
+      // the recent per-condition dr_corrections, and the distance run
+      // since the last snap — radius scales with distance, not time.
+      const devRows = deps.getDeviationRateStats(db, {
+        sail_state: sailState,
+        sea_state: seaState,
+        limit: 50,
+      });
+      const u = deps.computeRadius({
+        elapsedDistanceNm: engine.logNmSinceOrigin,
+        effectiveHitCount: corrections.hit_count,
+        deviationRows: devRows,
+        stwKn: rawStw,
+      });
       publish({
         [PATHS.position]: pos,
         [PATHS.active]: engine.active,
@@ -432,6 +461,10 @@ module.exports = (app) => {
         [PATHS.stw]: rawStw,
         [PATHS.headingTrue]: headingTrueDeg,
         [PATHS.current]: current,
+        [PATHS.uncertainty]: {
+          radius_nm: u.radius_nm,
+          method: u.method,
+        },
       });
     }
   }
@@ -508,6 +541,14 @@ module.exports = (app) => {
                 description: "Water-track distance since trip start",
               },
             },
+            {
+              path: PATHS.uncertainty,
+              value: {
+                displayName: "DR uncertainty polygon",
+                description:
+                  "Confidence-weighted circular error region around the DR position; radius scales with distance run and tightens as the matching matrix bin accumulates hits.",
+              },
+            },
           ],
         },
       ],
@@ -526,6 +567,7 @@ module.exports = (app) => {
     }
     deps.setState(db, "dr_log_nm", String(engine.logNm));
     deps.setState(db, "dr_trip_log_nm", String(engine.tripLogNm));
+    deps.setState(db, "dr_log_since_origin", String(engine.logNmSinceOrigin));
   }
 
   // --- REST API ----------------------------------------------------------

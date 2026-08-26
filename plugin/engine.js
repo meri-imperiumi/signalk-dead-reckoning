@@ -61,6 +61,11 @@ class DeadReckoningEngine {
     this.tripLogNm = opts.tripLogNm ?? 0;
     /** @type {number|null} seconds since the DR origin was last reset */
     this.elapsedSinceOriginS = 0;
+    /** @type {number} water-track log accumulated since the last snap-to-fix (nm)
+     * — SPEC §8 uses elapsed *distance* run, not clock time, as the
+     * uncertainty-polygon growth axis (DR error compounds with distance
+     * more honestly than with time). */
+    this.logNmSinceOrigin = 0;
     /** @type {string} active calculation method (SPEC §3.1) */
     this.method = "inertial-paddlewheel";
     /** @type {boolean} whether DR is authoritative for navigation.position */
@@ -78,6 +83,7 @@ class DeadReckoningEngine {
   snapToFix(fix) {
     this.origin = { latitude: fix.latitude, longitude: fix.longitude };
     this.elapsedSinceOriginS = 0;
+    this.logNmSinceOrigin = 0;
   }
 
   /**
@@ -135,6 +141,7 @@ class DeadReckoningEngine {
     this.logNm += effectiveStw * hours;
     this.tripLogNm += effectiveStw * hours;
     this.elapsedSinceOriginS += dtS;
+    this.logNmSinceOrigin += effectiveStw * hours;
     return pos;
   }
 }

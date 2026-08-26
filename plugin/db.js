@@ -385,6 +385,38 @@ function attachObservationsToFix(db, fixId, ids) {
   for (const id of ids?.cplIds ?? []) cpl.run(fixId, id);
 }
 
+/**
+ * Reads recent `dr_corrections` rows for the uncertainty polygon's
+ * empirical deviation-rate (SPEC §8). Returns rows newest-first so the
+ * EWMA in `uncertainty.js` can apply them oldest→newest. Filters by
+ * sail/sea state so the rate is condition-specific.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {object} q
+ * @param {string} [q.sail_state]
+ * @param {string} [q.sea_state]
+ * @param {number} [q.limit=50]
+ * @returns {Array<{deviation_nm: number, dr_elapsed_seconds: number}>}
+ */
+function getDeviationRateStats(db, q = {}) {
+  const limit = q.limit ?? 50;
+  const stmt = db.prepare(
+    `SELECT deviation_nm, dr_elapsed_seconds
+     FROM dr_corrections
+     WHERE (? IS NULL OR sail_state = ?)
+       AND (? IS NULL OR sea_state = ?)
+     ORDER BY correction_id DESC
+     LIMIT ?`,
+  );
+  return stmt.all(
+    q.sail_state ?? null,
+    q.sail_state ?? null,
+    q.sea_state ?? null,
+    q.sea_state ?? null,
+    limit,
+  );
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
@@ -396,4 +428,5 @@ module.exports = {
   recordCircularPositionLine,
   attachObservationsToFix,
   recordCorrection,
+  getDeviationRateStats,
 };

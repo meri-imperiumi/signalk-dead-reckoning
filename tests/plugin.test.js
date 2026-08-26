@@ -646,3 +646,209 @@ test("POST /celestial/sight returns 400 for a below-cutoff sight", async () => {
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
+
+test("uncertainty polygon publishes fallback method with no correction history", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-unc-fb-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1100));
+  const uDelta = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .find((v) => v.path === "navigation.deadReckoning.uncertainty");
+  assert.ok(uDelta, "uncertainty delta not published");
+  assert.strictEqual(uDelta.value.method, "fallback");
+  assert.ok(typeof uDelta.value.radius_nm === "number");
+  assert.ok(uDelta.value.radius_nm >= 0);
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("uncertainty polygon radius grows monotonically with distance run", async () => {
+  // Isolated DB so no leftover dr_corrections push it into empirical mode.
+  const dir = await mkdtemp(join(tmpdir(), "dr-unc-grow-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1200));
+  const r1 = latestUncertainty(app);
+  assert.strictEqual(r1.method, "fallback");
+  await new Promise((r) => setTimeout(r, 1200));
+  const r2 = latestUncertainty(app);
+  // Distance run grew → radius grows (the §8 "scales with distance, not
+  // time" claim is tested precisely at the unit level; here we confirm the
+  // live path publishes growing radii).
+  assert.ok(
+    r2.radius_nm > r1.radius_nm,
+    `radius should grow: r1=${r1.radius_nm} r2=${r2.radius_nm}`,
+  );
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("uncertainty polygon tightens toward empirical after corrections + bin hits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-unc-emp-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+
+  // Seed the matrix bin with a high live hit count so effectiveHitCount
+  // is high (live × 5), and seed dr_corrections rows with a *low* deviation
+  // rate so the empirical radius is far below the fallback.
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"));
+  db.prepare(
+    `INSERT INTO dr_matrix_bins
+       (sail_state, sea_state, stw_bin, awa_bin, heel_bin,
+        leeway_angle, speed_loss, upwash_correction,
+        hit_count, live_hit_count, historical_hit_count, historical_confidence_tier)
+     VALUES ('unknown','unknown',5,0,0, 0,0,0, 60,60,0,NULL)`,
+  ).run();
+  // Low-deviation corrections: 0.01 nm over 3600 s → tiny per-time rate,
+  // → per-distance rate well below the fallback.
+  const insFix = db.prepare(
+    "INSERT INTO fixes (timestamp, source_type, latitude, longitude, confirmed_by, resets_dr_origin) VALUES (?, 'gps', 60, 24, NULL, 1)",
+  );
+  const insCorr = db.prepare(
+    `INSERT INTO dr_corrections
+       (fix_id, timestamp, dr_lat, dr_lon, fix_lat, fix_lon,
+        deviation_nm, deviation_bearing, dr_elapsed_seconds, sail_state, sea_state)
+     VALUES (?, '2026-01-01T00:00:00Z', 60.01, 24.01, 60, 24, 0.01, 200, 3600, 'unknown','unknown')`,
+  );
+  for (let i = 0; i < 25; i++) {
+    const fid = insFix.run("2026-01-01T00:00:00Z");
+    insCorr.run(Number(fid.lastInsertRowid));
+  }
+  db.close();
+
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1200));
+  const u = latestUncertainty(app);
+  assert.ok(
+    u.method === "empirical" || u.method === "blend",
+    `expected empirical/blend, got ${u.method}`,
+  );
+  // The empirical/blend radius should be well below the pure-fallback
+  // radius at the same distance (the tightening signal).
+  const { computeRadius } = require("../plugin/uncertainty.js");
+  const fallbackOnly = computeRadius({
+    elapsedDistanceNm: 5 / 3600,
+    effectiveHitCount: 0,
+    deviationRows: [],
+    stwKn: 5,
+  }).radius_nm;
+  assert.ok(
+    u.radius_nm < fallbackOnly,
+    `empirical/blend radius ${u.radius_nm} should be below fallback ${fallbackOnly}`,
+  );
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("uncertainty polygon radius drops after a snap-to-fix resets the excursion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-unc-snap-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+
+  // Sail ~3 ticks to accumulate distance (so `before` reflects several
+  // ticks of growth).
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 3200));
+  const before = latestUncertainty(app);
+  assert.ok(before.radius_nm > 0, "radius should be non-zero before snap");
+
+  // Confirm a fix → snapToFix resets logNmSinceOrigin to 0; the next tick
+  // re-grows it from one tick of distance, so `after` reflects far less
+  // accumulated distance than `before`.
+  router.invoke("post", "/fix", {
+    latitude: 60.001,
+    longitude: 24.001,
+    source_type: "gps",
+  });
+  await new Promise((r) => setTimeout(r, 1200));
+  const after = latestUncertainty(app);
+  assert.ok(
+    after.radius_nm < before.radius_nm,
+    `radius should drop after snap (excursion reset): before=${before.radius_nm} after=${after.radius_nm}`,
+  );
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+/** Returns the latest published uncertainty value, or throws. */
+function latestUncertainty(app) {
+  const vals = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === "navigation.deadReckoning.uncertainty");
+  if (vals.length === 0) throw new Error("no uncertainty delta published");
+  return vals[vals.length - 1].value;
+}

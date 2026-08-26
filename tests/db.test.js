@@ -15,6 +15,7 @@ const {
   setState,
   recordFix,
   recordCorrection,
+  getDeviationRateStats,
   SCHEMA_VERSION,
 } = require("../plugin/db.js");
 
@@ -139,4 +140,68 @@ test("recordCorrection inserts a dr_corrections row referencing a fix", () => {
   assert.strictEqual(row.dr_elapsed_seconds, 2700);
   assert.strictEqual(row.sail_state, "sailing");
   db.close();
+});
+
+test("getDeviationRateStats returns recent rows filtered by sail/sea state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-devstats-"));
+  const db = openDatabase(join(dir, "t.sqlite"));
+  const fix = (lat, lon) =>
+    recordFix(db, {
+      timestamp: "2026-01-01T00:00:00Z",
+      source_type: "gps",
+      latitude: lat,
+      longitude: lon,
+      resets_dr_origin: true,
+    });
+  const corr = (sail, sea, dev, secs) => {
+    const fid = fix(60, 24);
+    return recordCorrection(db, {
+      fix_id: fid,
+      timestamp: "2026-01-01T00:00:00Z",
+      dr_lat: 60.01,
+      dr_lon: 24.01,
+      fix_lat: 60,
+      fix_lon: 24,
+      deviation_nm: dev,
+      deviation_bearing: 200,
+      dr_elapsed_seconds: secs,
+      sail_state: sail,
+      sea_state: sea,
+    });
+  };
+  // Two sailing + unknown rows, one motoring row (different sail_state).
+  corr("sailing", "unknown", 0.5, 1800);
+  corr("sailing", "unknown", 0.3, 1800);
+  corr("motoring", "unknown", 0.1, 1800);
+
+  const sailingRows = getDeviationRateStats(db, {
+    sail_state: "sailing",
+    sea_state: "unknown",
+  });
+  assert.strictEqual(sailingRows.length, 2);
+  // newest-first ordering
+  assert.strictEqual(sailingRows[0].deviation_nm, 0.3);
+  assert.strictEqual(sailingRows[1].deviation_nm, 0.5);
+
+  // No filter returns all three.
+  const allRows = getDeviationRateStats(db, {});
+  assert.strictEqual(allRows.length, 3);
+
+  // limit honoured.
+  const limited = getDeviationRateStats(db, {
+    sail_state: "sailing",
+    limit: 1,
+  });
+  assert.strictEqual(limited.length, 1);
+  assert.strictEqual(limited[0].deviation_nm, 0.3);
+
+  // non-matching state returns none.
+  const none = getDeviationRateStats(db, {
+    sail_state: "motoring",
+    sea_state: "calm",
+  });
+  assert.strictEqual(none.length, 0);
+
+  db.close();
+  await rm(dir, { recursive: true, force: true });
 });

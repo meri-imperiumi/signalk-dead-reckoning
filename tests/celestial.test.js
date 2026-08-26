@@ -15,8 +15,6 @@ const suncalc = require("suncalc");
 const celestial = require("../plugin/celestial.js");
 const almanac = require("../plugin/star-almanac.js");
 
-const RAD = Math.PI / 180;
-
 /** suncalc azimuth is measured from south, westward; convert to true bearing from north. */
 function suncalcBearing(p) {
   return ((p.azimuth * 180) / Math.PI + 180 + 360) % 360;
