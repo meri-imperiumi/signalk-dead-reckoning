@@ -14,6 +14,7 @@ import * as posfmt from "./dr-position-format.js";
 import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 import "./dr-map-view.js";
+import "./dr-current-panel.js";
 import "./dr-sight-panel.js";
 import "./dr-fix-panel.js";
 import "./dr-pending-list.js";
@@ -147,11 +148,16 @@ template.innerHTML = /* html */ `
       <span class="value" id="dr-divergence">— nm</span>
       <span class="label">DR vs GPS</span>
     </div>
+    <div class="dr-figure" id="dr-current-fig">
+      <span class="value" id="dr-current">—</span>
+      <span class="label" id="dr-current-label">Current set/drift</span>
+    </div>
     <div class="dr-figure">
       <span class="value" id="dr-method">—</span>
       <span class="label">Active method</span>
     </div>
     <div class="dr-toolbar">
+      <button id="btn-current" title="Manual set &amp; drift — the override outranks weather/pilot-chart sources while its TTL lasts">≋ Current</button>
       <button id="btn-sight">⊕ Sight / LOP</button>
       <button id="btn-coord-fix" title="Confirm a fix at coordinates — prefilled from the current GNSS position, editable for offline/known-position fixes">⊙ Fix at coordinates</button>
     </div>
@@ -170,6 +176,10 @@ template.innerHTML = /* html */ `
     <h2>Pending Observations</h2>
     <dr-pending-list id="dr-pending"></dr-pending-list>
   </section>
+
+  <dialog id="current-dialog">
+    <dr-current-panel id="dr-current-panel"></dr-current-panel>
+  </dialog>
 
   <dialog id="sight-dialog">
     <dr-sight-panel id="dr-sight"></dr-sight-panel>
@@ -242,6 +252,24 @@ class DrApp extends HTMLElement {
       this.refreshOverlays();
     });
     this.fixPanel?.addEventListener("dr-close", () => this.fixDialog?.close());
+
+    // Manual set & drift (§6.2 tier 1): the panel edits the override;
+    // changes re-read /status so the header figure updates even when
+    // the DR engine is idle (no deltas flowing).
+    /** @type {HTMLDialogElement|null} */
+    this.currentDialog = root.querySelector("#current-dialog");
+    /** @type {import("./dr-current-panel.js").default|null} */
+    this.currentPanel = root.querySelector("#dr-current-panel");
+    root.querySelector("#btn-current")?.addEventListener("click", () => {
+      this.currentPanel?.refresh();
+      this.currentDialog?.showModal();
+    });
+    this.currentPanel?.addEventListener("dr-current-changed", () =>
+      this.fetchStatus(),
+    );
+    this.currentPanel?.addEventListener("dr-close", () =>
+      this.currentDialog?.close(),
+    );
 
     /** @type {import("./dr-sight-panel.js").default|null} */
     this.sight = root.querySelector("#dr-sight");
@@ -338,15 +366,23 @@ class DrApp extends HTMLElement {
       sparkStats: null,
       gnss: null,
       highlight: null,
+      current: null,
+      manualCurrent: null,
     };
 
     this.connectStream();
     this.loadPluginConfig();
     this.bootstrapSelf();
+    this.fetchStatus();
     this.refreshOverlays();
     this.refreshGpsHistory();
     // Slow REST refresh for persisted overlays; stream drives the live parts.
-    setInterval(() => this.refreshOverlays(), 30000);
+    // /status also refreshes the header current figure (manual TTL
+    // countdown) between deltas.
+    setInterval(() => {
+      this.refreshOverlays();
+      this.fetchStatus();
+    }, 30000);
   }
 
   /**
@@ -373,6 +409,7 @@ class DrApp extends HTMLElement {
       "navigation.gnss.satellitesVisible",
       "navigation.gnss.horizontalDilution",
       "environment.mode",
+      "environment.current",
     ]);
     stream.on((delta) => this.onDelta(delta));
     stream.onStatus((s) => this.renderLinkStatus(s));
@@ -578,6 +615,10 @@ class DrApp extends HTMLElement {
           document.documentElement.setAttribute("data-mode", value);
         }
         break;
+      case "environment.current":
+        this.snap.current = value;
+        this.renderCurrent();
+        break;
       default:
         break;
     }
@@ -685,6 +726,44 @@ class DrApp extends HTMLElement {
     this.shadowRoot.querySelector("#dr-divergence").textContent =
       vm.divergenceText(this.snap.divergence);
     this.map?.render(this.snap);
+  }
+
+  /**
+   * Fetches the plugin status snapshot so the header's current figure
+   * reflects the resolved vector + manual override even before (or
+   * without) live `environment.current` deltas.
+   *
+   * @returns {Promise<void>}
+   */
+  async fetchStatus() {
+    try {
+      const res = await fetch(`${API}/status`);
+      if (!res.ok) return;
+      const body = await res.json();
+      this.snap.current = body.current ?? this.snap.current;
+      this.snap.manualCurrent = body.manualCurrent ?? null;
+      this.renderCurrent();
+    } catch {
+      /* REST unavailable — stream will drive when it can */
+    }
+  }
+
+  /**
+   * Renders the header set/drift figure with its semantic source
+   * theme (manual = orange, weather/pilot = teal, none = offline).
+   *
+   * @returns {void}
+   */
+  renderCurrent() {
+    const fig = this.shadowRoot.querySelector("#dr-current-fig");
+    const value = this.shadowRoot.querySelector("#dr-current");
+    const label = this.shadowRoot.querySelector("#dr-current-label");
+    if (!fig || !value || !label) return;
+    const f = vm.currentFigure(this.snap.current, this.snap.manualCurrent);
+    value.textContent = f.value;
+    label.textContent = f.label;
+    fig.classList.remove("theme-orange", "theme-teal", "theme-offline");
+    if (f.theme) fig.classList.add(f.theme);
   }
 
   /**

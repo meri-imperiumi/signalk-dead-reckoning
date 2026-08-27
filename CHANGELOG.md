@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deg/min/sec/hem fields.
 
 ### Added
+- **Header set & drift readout + manual override** (SPEC §6.2 tier 1):
+  the webapp header shows the resolved current vector (`067° · 1.2 kn`)
+  themed by source (manual = orange with TTL countdown, weather/pilot
+  chart = teal, none = offline grey). A new `≋ Current` toolbar button
+  opens `<dr-current-panel>` — enter set (° true), drift (kn) and a TTL
+  (default 60 min) to `PUT /current/manual`, or clear the override
+  (`DELETE /current/manual`); the resolver honors the manual tier over
+  every automatic source while the TTL lasts. `GET /status` now also
+  reports the resolved `current` vector and any `manualCurrent`, so
+  the header can bootstrap and refresh between deltas (the manual TTL
+  caption counts down on the 30 s status poll).
 - **Stopwatch sight-time entry ("N min N sec ago")**: each sight
   form's time field gains an `ago` mode — enter the minutes/seconds
   elapsed since the sight was taken (stopwatch method) and the offset

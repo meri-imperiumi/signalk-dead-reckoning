@@ -245,6 +245,94 @@ test("PUT /override toggles the active flag", () => {
   plugin.stop();
 });
 
+test("PUT /current/manual validates and normalizes input", () => {
+  const { plugin, router } = makeStarted();
+  let res = router.invoke("put", "/current/manual", { setTrue: 45 });
+  assert.strictEqual(res.status, 400);
+  res = router.invoke("put", "/current/manual", { drift: -1, setTrue: 10 });
+  assert.strictEqual(res.status, 400);
+  // 405° → 45°, negative → +315°, TTL defaults to 60 min.
+  res = router.invoke("put", "/current/manual", {
+    setTrue: 405,
+    drift: 1.5,
+  });
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.body.manualCurrent.setTrue, 45);
+  assert.strictEqual(res.body.manualCurrent.drift, 1.5);
+  assert.ok(
+    res.body.manualCurrent.validUntilMs - res.body.manualCurrent.setAtMs <=
+      61 * 60_000,
+  );
+  res = router.invoke("put", "/current/manual", { setTrue: -45, drift: 0.8 });
+  assert.strictEqual(res.body.manualCurrent.setTrue, 315);
+  plugin.stop();
+});
+
+test("manual current is mirrored in /status and cleared by DELETE", () => {
+  const { plugin, router } = makeStarted();
+  router.invoke("put", "/current/manual", {
+    setTrue: 120,
+    drift: 0.9,
+    ttlMinutes: 15,
+    setBy: "watchkeeper",
+  });
+  let { status, body } = router.invoke("get", "/status");
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.manualCurrent.setTrue, 120);
+  assert.strictEqual(body.manualCurrent.drift, 0.9);
+  assert.strictEqual(body.manualCurrent.setBy, "watchkeeper");
+  const { status: delStatus, body: delBody } = router.invoke(
+    "delete",
+    "/current/manual",
+  );
+  assert.strictEqual(delStatus, 200);
+  assert.strictEqual(delBody.manualCurrent, null);
+  ({ body } = router.invoke("get", "/status"));
+  assert.strictEqual(body.manualCurrent, null);
+  plugin.stop();
+});
+
+test("manual current outranks automatic sources in the tick", async () => {
+  const { app, plugin, router } = makeStarted();
+  // Weather current is enabled by default with no provider reachable;
+  // the manual tier must win regardless once set.
+  router.invoke("put", "/current/manual", { setTrue: 67, drift: 1.2 });
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1100));
+  const currentDeltas = app.handledMessages
+    .filter((m) =>
+      m.message?.updates?.some((u) =>
+        u.values?.some((v) => v.path === "environment.current"),
+      ),
+    )
+    .flatMap((m) =>
+      m.message.updates.flatMap((u) =>
+        u.values.filter((v) => v.path === "environment.current"),
+      ),
+    );
+  assert.ok(currentDeltas.length > 0, "no current delta published");
+  const c = currentDeltas[currentDeltas.length - 1].value;
+  assert.strictEqual(c.source, "manual");
+  assert.strictEqual(c.tier, 1);
+  assert.strictEqual(c.setTrue, 67);
+  assert.strictEqual(c.drift, 1.2);
+  plugin.stop();
+});
+
 test("/status before start returns 503", () => {
   const app = new FakeSignalKApp();
   const plugin = makePlugin(app);

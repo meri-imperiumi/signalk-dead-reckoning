@@ -106,6 +106,49 @@ export function stopwatchToIso(minutes, seconds, now = new Date()) {
 }
 
 /**
+ * Shapes the resolved current vector (§6.2) into the header figure:
+ * value "067° · 1.2 kn", a source-labeled caption, and a semantic
+ * theme class (manual = orange — alternate input; weather/pilot =
+ * teal — active system; none = offline grey).
+ *
+ * @param {{setTrue: number, drift: number, source: string}|null} current
+ * @param {{validUntilMs: number}|null} [manual] - active override, for the TTL caption
+ * @param {number} [nowMs]
+ * @returns {{value: string, label: string, theme: string|null}}
+ */
+export function currentFigure(current, manual = null, nowMs = Date.now()) {
+  if (!current || !Number.isFinite(current.setTrue)) {
+    return { value: "—", label: "Current set/drift", theme: null };
+  }
+  const set = String(
+    Math.round(((current.setTrue % 360) + 360) % 360),
+  ).padStart(3, "0");
+  const drift = (Number(current.drift) || 0).toFixed(1);
+  const source = current.source ?? "";
+  let label;
+  let theme;
+  if (source === "manual") {
+    const minLeft =
+      manual?.validUntilMs != null
+        ? Math.max(0, Math.ceil((manual.validUntilMs - nowMs) / 60_000))
+        : null;
+    label =
+      minLeft != null ? `Current · manual (${minLeft}m)` : "Current · manual";
+    theme = "theme-orange";
+  } else if (source === "weather-api") {
+    label = "Current · weather";
+    theme = "theme-teal";
+  } else if (source === "pilot-chart") {
+    label = "Current · pilot chart";
+    theme = "theme-teal";
+  } else {
+    label = "Current · none";
+    theme = "theme-offline";
+  }
+  return { value: `${set}° · ${drift} kn`, label, theme };
+}
+
+/**
  * Great-circle destination point from [lat, lon], bearing (deg true),
  * distance (nm). Mirrors plugin/geo.js (kept self-contained so this
  * module loads in the browser without a bundler).

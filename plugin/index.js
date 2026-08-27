@@ -311,6 +311,21 @@ module.exports = (app) => {
   let weatherClient = null;
 
   /**
+   * Manual set-and-drift override (§6.2 tier 1): watchstander input,
+   * honored while its TTL lasts. Set/cleared via
+   * PUT/DELETE /current/manual.
+   * @type {{setTrue: number, drift: number, validUntilMs: number, setBy: string|null, setAtMs: number}|null}
+   */
+  let manualCurrent = null;
+
+  /**
+   * Last resolved current vector (§6.2) — mirrored into GET /status so
+   * the UI can render the header readout without waiting for a delta.
+   * @type {{setTrue: number, drift: number, tier: number, source: string}|null}
+   */
+  let lastCurrent = null;
+
+  /**
    * GPS-derived vessel speed (kn) from consecutive fixes — the motion
    * signal for "idle but making way" (§6.3/§8). EMA-smoothed so a single
    * jittery fix doesn't flap it.
@@ -796,14 +811,16 @@ module.exports = (app) => {
 
     // Resolve the best available current vector (SPEC §6.2). v1 ships
     // tier 5 (zero); the resolver has a hook for tier 4 pilot charts.
-    // Resolve the best available current vector (SPEC §6.2): tier 3
-    // (Weather API GRIB via the poller cache) → tier 4 pilot charts
-    // (reserved) → tier 5 zero. Synchronous cache read, no network on
-    // the tick path.
+    // Resolve the best available current vector (SPEC §6.2): tier 1
+    // manual override → tier 3 (Weather API GRIB via the poller cache)
+    // → tier 4 pilot charts (reserved) → tier 5 zero. Synchronous
+    // cache read, no network on the tick path.
     const current = deps.resolveCurrent({
+      manual: manualCurrent,
       weather: weatherClient?.currentAt(Date.now()),
       nowMs: Date.now(),
     });
+    lastCurrent = current;
 
     const pos = engine.tick(
       {
@@ -1440,6 +1457,10 @@ module.exports = (app) => {
         tripLogNm: engine.tripLogNm,
         elapsedSinceOriginS: engine.elapsedSinceOriginS,
         binCount: matrix.count(),
+        // §6.2: the resolved current vector + any manual override, so
+        // the UI's header readout can bootstrap without a delta.
+        current: lastCurrent,
+        manualCurrent,
       });
     });
 
@@ -1506,6 +1527,63 @@ module.exports = (app) => {
       engine.active = !!body?.active;
       setStatus(engine.active ? "DR OVERRIDE engaged" : "DR OVERRIDE released");
       res.json({ active: engine.active });
+    });
+
+    /**
+     * PUT /current/manual — set the manual set-and-drift override
+     * (SPEC §6.2 tier 1: watchstander input outranks every automatic
+     * source while its TTL lasts). Body: `setTrue` (deg true, the
+     * direction the current flows toward), `drift` (kn), optional
+     * `ttlMinutes` (default 60, max 1440) and `setBy`. Always
+     * human-initiated, like OVERRIDE.
+     */
+    router.put("/current/manual", (req, res) => {
+      if (!engine) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      const b = parseBody(req.body);
+      const setTrue = Number(b?.setTrue);
+      const drift = Number(b?.drift);
+      if (!Number.isFinite(setTrue) || !Number.isFinite(drift) || drift < 0) {
+        res.status(400).json({
+          message: "setTrue (deg true) and drift (kn >= 0) required",
+        });
+        return;
+      }
+      const ttlMin = Math.max(
+        1,
+        Math.min(1440, Number(b?.ttlMinutes) > 0 ? Number(b.ttlMinutes) : 60),
+      );
+      const now = Date.now();
+      manualCurrent = {
+        setTrue: ((setTrue % 360) + 360) % 360,
+        drift,
+        validUntilMs: now + ttlMin * 60_000,
+        setBy:
+          (typeof b?.setBy === "string" && b.setBy) ||
+          usernameFromCookies(req.cookies) ||
+          null,
+        setAtMs: now,
+      };
+      setStatus(
+        `Manual current set: ${manualCurrent.setTrue.toFixed(0)}° true, ${drift.toFixed(2)} kn (${ttlMin} min TTL)`,
+      );
+      res.json({ manualCurrent });
+    });
+
+    /**
+     * DELETE /current/manual — clear the override; the resolver falls
+     * back down the §6.2 hierarchy on the next tick.
+     */
+    router.delete("/current/manual", (_req, res) => {
+      if (!engine) {
+        res.status(503).json({ message: "Plugin not started" });
+        return;
+      }
+      manualCurrent = null;
+      setStatus("Manual current cleared");
+      res.json({ manualCurrent: null });
     });
 
     /**
