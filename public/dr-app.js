@@ -10,6 +10,11 @@
  * @file dr-app.js
  */
 
+import {
+  fetchHistory,
+  mergeHistoryTrack,
+  seriesToTrack,
+} from "./dr-history.js";
 import * as posfmt from "./dr-position-format.js";
 import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
@@ -351,6 +356,9 @@ class DrApp extends HTMLElement {
     this.gps = new vm.TrackLog(3600);
     this.spark = new vm.Sparkline(120);
     this.lastElapsedS = null;
+    /** History-API backfill tracks (null until a provider answers). */
+    this.gpsHistory = [];
+    this.ghostHistory = [];
     this.snap = {
       drPosition: null,
       gpsPosition: null,
@@ -375,7 +383,7 @@ class DrApp extends HTMLElement {
     this.bootstrapSelf();
     this.fetchStatus();
     this.refreshOverlays();
-    this.refreshGpsHistory();
+    this.refreshTrackHistory();
     // Slow REST refresh for persisted overlays; stream drives the live parts.
     // /status also refreshes the header current figure (manual TTL
     // countdown) between deltas.
@@ -536,7 +544,7 @@ class DrApp extends HTMLElement {
         if (value?.latitude != null) {
           this.snap.drPosition = [value.latitude, value.longitude];
           this.ghost.push(value.latitude, value.longitude);
-          this.snap.ghostTrack = this.ghost.points();
+          this.updateGhostTrack();
           this.sight?.setDefaultPosition(value);
         }
         break;
@@ -681,43 +689,64 @@ class DrApp extends HTMLElement {
    * @returns {void}
    */
   updateGpsTrack() {
-    const live = this.gps.points();
-    if (this.gpsHistory && this.gpsHistory.length > 0) {
-      const last = this.gpsHistory[this.gpsHistory.length - 1];
-      const extending = live.filter(
-        (p) =>
-          Math.abs(p[0] - last[0]) > 0.001 || Math.abs(p[1] - last[1]) > 0.001,
-      );
-      this.snap.gpsTrack = [...this.gpsHistory, ...extending];
-    } else {
-      this.snap.gpsTrack = live;
-    }
+    this.snap.gpsTrack = mergeHistoryTrack(this.gpsHistory, this.gps.points());
   }
 
   /**
-   * Fetches the historical GPS track from the Signal K history API (see
-   * ../signalk-logbook's Map.jsx) and merges it with the live-session
-   * track so the map shows where the boat has actually been — the
-   * baseline against which DR divergence is measured. Falls back
-   * silently to the live-session track when no history provider is
-   * configured (the route 404s).
+   * Same merge for the DR ghost track — a page reload no longer blanks
+   * it when a history provider is configured.
+   *
+   * @returns {void}
+   */
+  updateGhostTrack() {
+    this.snap.ghostTrack = mergeHistoryTrack(
+      this.ghostHistory,
+      this.ghost.points(),
+    );
+  }
+
+  /**
+   * Backfills restart-survival series from the Signal K History API in
+   * a single multi-path request: the GPS track (the baseline DR
+   * divergence is measured against), the DR ghost track, and the
+   * divergence record (an object — `:last` aggregation, the only kind
+   * non-numeric paths accept). Falls back silently to the live-session
+   * buffers when no history provider is configured (request fails).
    *
    * @returns {Promise<void>}
    */
-  async refreshGpsHistory() {
-    try {
-      const res = await fetch(vm.historyUrl());
-      if (!res.ok) return;
-      const data = await res.json();
-      const history = vm.historyToTrack(data);
-      if (history.length === 0) return;
-      this.gpsHistory = history;
+  async refreshTrackHistory() {
+    const series = await fetchHistory({
+      paths: [
+        "navigation.position",
+        "navigation.deadReckoning.position",
+        "navigation.deadReckoning.divergence:last",
+      ],
+      durationSec: 6 * 3600,
+      resolutionSec: 60,
+    });
+    if (!series) return; // no history provider — live buffers only
+    const byPath = new Map(series.map((s) => [s.path, s]));
+    const gps = byPath.get("navigation.position");
+    if (gps && gps.points.length > 0) {
+      this.gpsHistory = seriesToTrack(gps.points);
       this.updateGpsTrack();
-      this.snap.gpsPosition = history[history.length - 1];
-      this.render();
-    } catch {
-      /* no history provider — live stream track is the fallback */
+      this.snap.gpsPosition = this.gpsHistory[this.gpsHistory.length - 1];
     }
+    const ghost = byPath.get("navigation.deadReckoning.position");
+    if (ghost && ghost.points.length > 0) {
+      this.ghostHistory = seriesToTrack(ghost.points);
+      this.updateGhostTrack();
+    }
+    const dvg = byPath.get("navigation.deadReckoning.divergence");
+    if (dvg) {
+      for (const { v } of dvg.points) {
+        const nm = v?.distance_nm;
+        if (nm != null && Number.isFinite(nm)) this.spark.push(nm);
+      }
+      this.snap.sparkStats = this.spark.stats();
+    }
+    this.render();
   }
 
   /** @returns {void} */

@@ -16,6 +16,9 @@ const {
   recordFix,
   recordCorrection,
   getDeviationRateStats,
+  recordTrackSamples,
+  pruneTrackSamplesBefore,
+  loadTrackSamplesSince,
   SCHEMA_VERSION,
 } = require("../plugin/db.js");
 
@@ -36,7 +39,7 @@ test("openDatabase creates all SPEC §4 tables idempotently", () => {
     .all()
     .map((r) => r.name);
   for (const expected of [
-    "dr_matrix_bins",
+    "dr_track_samples",
     "dr_state_store",
     "offline_pilot_currents",
     "fixes",
@@ -482,6 +485,52 @@ test("updateFix: edits audit metadata, guards position/source_type/timestamp", a
     ok: false,
     reason: "not_found",
   });
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("track samples: record, incremental re-record (replace), prune, load", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-db-track-"));
+  const db = openDatabase(join(dir, "t.sqlite"));
+
+  // Empty write is a no-op.
+  recordTrackSamples(db, []);
+
+  const t0 = 1_000_000;
+  recordTrackSamples(
+    db,
+    [0, 1, 2].map((i) => ({
+      timestamp: t0 + i * 1000,
+      latitude: -18.86 + i * 0.01,
+      longitude: -159.8 + i * 0.01,
+    })),
+  );
+  let loaded = loadTrackSamplesSince(db, t0 - 1);
+  assert.strictEqual(loaded.length, 3);
+  assert.deepStrictEqual(loaded[0], {
+    timestamp: t0,
+    latitude: -18.86,
+    longitude: -159.8,
+  });
+  // Oldest-first ordering.
+  assert.strictEqual(loaded[2].timestamp, t0 + 2000);
+
+  // Same-timestamp sample replaces (GroundTrack.append semantics).
+  recordTrackSamples(db, [
+    { timestamp: t0 + 1000, latitude: -18.5, longitude: -159.5 },
+  ]);
+  loaded = loadTrackSamplesSince(db, t0 + 999);
+  assert.strictEqual(loaded.length, 2);
+  assert.strictEqual(loaded[0].latitude, -18.5);
+
+  // Prune older than cutoff; `since` is inclusive of the boundary.
+  pruneTrackSamplesBefore(db, t0 + 1000);
+  loaded = loadTrackSamplesSince(db, 0);
+  assert.deepStrictEqual(
+    loaded.map((s) => s.timestamp),
+    [t0 + 1000, t0 + 2000],
+  );
+
   db.close();
   await rm(dir, { recursive: true, force: true });
 });

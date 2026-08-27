@@ -36,6 +36,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deg/min/sec/hem fields.
 
 ### Added
+- **Restart survival for the DR ground track** (work doc #16, sea-trial
+  prep): the running-fix advancement buffer (6 h ring of 1 Hz DR
+  samples, SPEC §9.1) is now persisted to SQLite (`dr_track_samples`,
+  flushed incrementally on the 60 s state-flush cadence plus the
+  stop-time flush, pruned to the buffer window, `INSERT OR REPLACE`
+  keyed on timestamp to match `GroundTrack.append` semantics) and
+  re-seeded on plugin start — a mid-passage server restart no longer
+  leaves sights taken before the restart un-advanced. Verified
+  end-to-end: plugin run → stop → restart on the same db →
+  `POST /fix/resolve` advances a pre-restart sight along the persisted
+  DR run.
+- **History-backed map restart survival** (work doc #16): a new
+  `public/dr-history.js` module speaks the Signal K History API
+  (`/signalk/v2/api/history`, no auth) — multi-path `/values` queries
+  with aggregation postfixes (`:last` is mandatory for non-numeric
+  paths like the divergence record; numbers may use `average`/`sma`/
+  `ema`). On load, `<dr-app>` now backfills in one request: the GPS
+  track, the DR ghost track (previously live-session only — a page
+  reload blanked it), and the divergence sparkline. Tracks merge
+  history → live-session points continuously.
 - **Header set & drift readout + manual override** (SPEC §6.2 tier 1):
   the webapp header shows the resolved current vector (`067° · 1.2 kn`)
   themed by source (manual = orange with TTL countdown, weather/pilot
@@ -150,6 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token plumbing is needed.
 
 ### Fixed
+- **GPS track history backfill was silently 404ing**: the webapp
+  queried `/signalk/v1/history/values`, but the history API (and the
+  installed `signalk-history-sqlite` provider) serves
+  `/signalk/v2/api/history/values` — the fallback to the live-session
+  track always kicked in. The query now uses the v2 endpoint with the
+  `duration` parameter from the History API contract.
 - Sight panel assumed-position seeding threw on every DR/GPS position
   update: the `seedCoord` sub-field selector was missing its closing
   `]` (invalid selector), so the celestial form's assumed position

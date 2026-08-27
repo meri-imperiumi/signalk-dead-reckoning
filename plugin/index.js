@@ -39,6 +39,9 @@ const {
   updateLineOfPosition,
   updateCircularPositionLine,
   updateFix,
+  recordTrackSamples,
+  pruneTrackSamplesBefore,
+  loadTrackSamplesSince,
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
@@ -256,6 +259,9 @@ const deps = {
   enqueueLogbookPending,
   listLogbookPending,
   dequeueLogbookPending,
+  recordTrackSamples,
+  pruneTrackSamplesBefore,
+  loadTrackSamplesSince,
   listFixes,
   listLinesOfPosition,
   listCircularPositionLines,
@@ -306,6 +312,13 @@ module.exports = (app) => {
 
   /** @type {import("./ground-track.js").GroundTrack|null} */
   let groundTrack = null;
+
+  /**
+   * High-water mark (ms epoch) of ground-track samples already flushed
+   * to `dr_track_samples` — restart-survival incremental flush.
+   * @type {number}
+   */
+  let trackFlushedTs = 0;
 
   /** @type {WeatherCurrentClient|null} §6.2 tier-3 weather current poller */
   let weatherClient = null;
@@ -464,6 +477,21 @@ module.exports = (app) => {
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
       groundTrack = new deps.GroundTrack();
+
+      // Restart survival (SPEC §9.1): seed the advancement buffer from
+      // the persisted window so running-fix displacement keeps working
+      // for sights taken before a mid-passage restart. The flush
+      // high-water mark starts at the newest persisted sample.
+      const trackWindowMs =
+        groundTrack.capacity * (config.tickIntervalMs / 1000) * 1000;
+      const seedTs = Date.now() - trackWindowMs;
+      for (const s of deps.loadTrackSamplesSince(db, seedTs)) {
+        groundTrack.append(s);
+      }
+      trackFlushedTs =
+        groundTrack.samples.length > 0
+          ? groundTrack.samples[groundTrack.samples.length - 1].timestamp
+          : seedTs;
 
       // §6.2 tier 3: poll the Signal K Weather API for the point-forecast
       // current at the vessel position (typically a GRIB another process
@@ -1420,11 +1448,25 @@ module.exports = (app) => {
 
   /**
    * Flushes engine state to the state store so it survives restarts.
+   * Also persists new ground-track samples (running-fix advancement
+   * buffer) and prunes rows older than the buffer window.
    *
    * @returns {void}
    */
   function flushState() {
     if (!db || !engine) return;
+    if (groundTrack) {
+      const windowMs =
+        groundTrack.capacity * (config.tickIntervalMs / 1000) * 1000;
+      const fresh = groundTrack.samples.filter(
+        (s) => s.timestamp > trackFlushedTs,
+      );
+      deps.recordTrackSamples(db, fresh);
+      deps.pruneTrackSamplesBefore(db, Date.now() - windowMs);
+      if (fresh.length > 0) {
+        trackFlushedTs = fresh[fresh.length - 1].timestamp;
+      }
+    }
     if (engine.origin) {
       deps.setState(db, "last_known_good_fix", JSON.stringify(engine.origin));
     }

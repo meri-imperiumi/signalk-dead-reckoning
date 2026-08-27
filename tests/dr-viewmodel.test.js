@@ -253,41 +253,6 @@ test("chartLayersWithFallback: OSM fallback when nothing configured (404/empty)"
   }
 });
 
-test("historyToTrack: converts SK history [lon,lat] to [lat,lon], dedupes", async () => {
-  const vm = await loadVm();
-  const track = vm.historyToTrack({
-    data: [
-      ["2026-01-01T00:00:00Z", [-159.8, -18.86]],
-      ["2026-01-01T00:01:00Z", [-159.81, -18.87]],
-      ["2026-01-01T00:02:00Z", null],
-      ["2026-01-01T00:03:00Z", [-159.82, -18.88]],
-      ["2026-01-01T00:04:00Z", [-159.82, -18.88]], // dup → dropped
-    ],
-  });
-  assert.deepStrictEqual(track, [
-    [-18.86, -159.8],
-    [-18.87, -159.81],
-    [-18.88, -159.82],
-  ]);
-});
-
-test("historyToTrack: empty/null/non-data → empty array", async () => {
-  const vm = await loadVm();
-  assert.deepStrictEqual(vm.historyToTrack(null), []);
-  assert.deepStrictEqual(vm.historyToTrack({}), []);
-  assert.deepStrictEqual(vm.historyToTrack({ data: [] }), []);
-});
-
-test("historyUrl: builds the SK history path with from/to/resolution", async () => {
-  const vm = await loadVm();
-  const url = vm.historyUrl(6, 60);
-  assert.ok(url.startsWith("/signalk/v1/history/values?"));
-  assert.ok(url.includes("paths=navigation.position"));
-  assert.ok(url.includes("resolution=60"));
-  assert.ok(url.includes("from="));
-  assert.ok(url.includes("to="));
-});
-
 test("bearingToTrue: east variation adds, west subtracts, wraps 360", async () => {
   const vm = await loadVm();
   closeTo(vm.bearingToTrue(350, 15), 5, 0.001, "east var wraps");

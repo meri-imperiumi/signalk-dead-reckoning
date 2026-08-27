@@ -2688,3 +2688,75 @@ test("POST /fix/resolve response carries per-observation advancements (work doc 
   app.subscriptionmanager.subscriptions.length = 0;
   plugin.stop();
 });
+
+test("ground-track samples survive a plugin restart and still advance fixes (work doc #16)", async () => {
+  const { app, plugin } = makeStarted();
+  // Sail east at 5 kn so the DR shadow boat produces a measurable track.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 90 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 5000));
+  const tNow = Date.now();
+  // Sight times strictly inside the sampled window. Ticks fire at ~1 Hz
+  // but the first position-bearing tick lands ~2s in, so after a 5s
+  // wait samples span ≈ [tNow-3000, tNow-1000]. Keep both sights inside
+  // the last two inter-tick gaps with margin on each edge.
+  const earlyTs = tNow - 1900;
+  const lateTs = tNow - 1200;
+  plugin.stop(); // flushState() persists the ground-track samples
+
+  // "Restart": a fresh plugin instance over the same data dir/db.
+  const app2 = new FakeSignalKApp();
+  app2.dataPath = tempDir;
+  const plugin2 = makePlugin(app2);
+  plugin2.start({});
+  const router2 = new FakeRouter();
+  plugin2.registerWithRouter(router2);
+
+  const early = router2.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    timestamp: new Date(earlyTs).toISOString(),
+  }).body.lop_id;
+  const late = router2.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24.4,
+    azimuth_true: 90,
+    timestamp: new Date(lateTs).toISOString(),
+  }).body.lop_id;
+  const { status, body } = router2.invoke("post", "/fix/resolve", {
+    source_type: "bearing",
+    lop_ids: [early, late],
+  });
+  assert.strictEqual(status, 200);
+  const advancements = body.candidate.advancements;
+  assert.ok(Array.isArray(advancements), "advancements present");
+  const byId = Object.fromEntries(advancements.map((a) => [a.id, a]));
+  // The pre-restart DR run advanced the older sight: displacement is a
+  // real (bearing, distance) pair, not the un-advanced null.
+  assert.ok(
+    byId[early].displacement && byId[early].displacement.distanceNm > 0,
+    `early sight advanced along pre-restart DR run: ${JSON.stringify(
+      byId[early].displacement,
+    )}`,
+  );
+  // The newest sight is the reference — never advanced.
+  assert.strictEqual(byId[late].displacement, null);
+  plugin2.stop();
+  app.subscriptionmanager.subscriptions.length = 0;
+});

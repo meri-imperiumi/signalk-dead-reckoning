@@ -162,6 +162,17 @@ const SCHEMA_DDL = [
     fix_id INTEGER,
     payload TEXT NOT NULL
   )`,
+
+  // §9.1 restart survival: the running-fix advancement ring buffer
+  // (GroundTrack) is in-memory; these rows persist it so a mid-passage
+  // server restart keeps displacementBetween() working for sights
+  // taken before the restart. Keyed on the sample timestamp (ms) with
+  // INSERT OR REPLACE to mirror GroundTrack.append's same-ms replace.
+  `CREATE TABLE IF NOT EXISTS dr_track_samples (
+    timestamp INTEGER PRIMARY KEY,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL
+  )`,
 ];
 
 /**
@@ -854,6 +865,64 @@ function updateRow(db, table, idCol, id, allowed, fields, getter) {
   return { ok: true, row: getter(db, id) };
 }
 
+/**
+ * Persists ground-track samples (running-fix advancement buffer).
+ * INSERT OR REPLACE matches GroundTrack.append's same-timestamp
+ * replace semantics.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {{timestamp: number, latitude: number, longitude: number}[]} samples
+ * @returns {void}
+ */
+function recordTrackSamples(db, samples) {
+  if (samples.length === 0) return;
+  const stmt = db.prepare(
+    "INSERT OR REPLACE INTO dr_track_samples (timestamp, latitude, longitude) VALUES (?, ?, ?)",
+  );
+  db.exec("BEGIN");
+  try {
+    for (const s of samples) {
+      stmt.run(s.timestamp, s.latitude, s.longitude);
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+/**
+ * Deletes ground-track samples older than the cutoff (ms epoch).
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} cutoffMs
+ * @returns {void}
+ */
+function pruneTrackSamplesBefore(db, cutoffMs) {
+  db.prepare("DELETE FROM dr_track_samples WHERE timestamp < ?").run(cutoffMs);
+}
+
+/**
+ * Loads ground-track samples taken at/after `sinceMs`, oldest first —
+ * used to seed a fresh GroundTrack after a restart.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @param {number} sinceMs
+ * @returns {{timestamp: number, latitude: number, longitude: number}[]}
+ */
+function loadTrackSamplesSince(db, sinceMs) {
+  return db
+    .prepare(
+      "SELECT timestamp, latitude, longitude FROM dr_track_samples WHERE timestamp >= ? ORDER BY timestamp",
+    )
+    .all(sinceMs)
+    .map((r) => ({
+      timestamp: Number(r.timestamp),
+      latitude: Number(r.latitude),
+      longitude: Number(r.longitude),
+    }));
+}
+
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_DDL,
@@ -868,6 +937,9 @@ module.exports = {
   getDeviationRateStats,
   markFixLogged,
   enqueueLogbookPending,
+  recordTrackSamples,
+  pruneTrackSamplesBefore,
+  loadTrackSamplesSince,
   listLogbookPending,
   dequeueLogbookPending,
   listFixes,

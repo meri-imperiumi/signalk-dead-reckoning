@@ -498,64 +498,6 @@ export function bearingBetween(from, to) {
   return (((Math.atan2(y, x) / RAD) % 360) + 360) % 360;
 }
 
-/**
- * Reduces a Signal K `/signalk/v1/history/values` response for
- * `navigation.position` into a Leaflet-style [lat, lon] track.
- *
- * The history API returns `{ data: [[timestamp, [lon, lat]], ...] }`
- * (GeoJSON [lon, lat] order inside the value). Points with no value or
- * duplicating the previous point (within ~0.001°, ~6 m) are dropped —
- * the server may store a static position every tick when moored.
- *
- * @param {object|null|undefined} response
- * @returns {Array<[number, number]>} [lat, lon] pairs
- */
-export function historyToTrack(response) {
-  if (!response?.data || !Array.isArray(response.data)) return [];
-  const pts = [];
-  let prevLat = null;
-  let prevLon = null;
-  for (const entry of response.data) {
-    if (!Array.isArray(entry) || entry.length < 2) continue;
-    const value = entry[1];
-    if (!Array.isArray(value) || value.length < 2) continue;
-    // SK history stores [longitude, latitude] (GeoJSON order).
-    const lon = value[0];
-    const lat = value[1];
-    if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon)) {
-      continue;
-    }
-    // Dedupe near-identical points (moored vessel holds a static fix).
-    if (
-      prevLat !== null &&
-      Math.abs(lat - prevLat) < 0.001 &&
-      Math.abs(lon - prevLon) < 0.001
-    ) {
-      continue;
-    }
-    pts.push([lat, lon]);
-    prevLat = lat;
-    prevLon = lon;
-  }
-  return pts;
-}
-
-/**
- * Builds the history-values URL for the GPS track. `hours` defaults to
- * 6 (enough to see a recent passage without pulling the whole season).
- *
- * @param {number} [hours=6]
- * @param {number} [resolutionSec=60]
- * @returns {string} absolute path under /signalk/v1
- */
-export function historyUrl(hours = 6, resolutionSec = 60) {
-  const to = new Date();
-  const from = new Date(to.getTime() - hours * 3600 * 1000);
-  const f = from.toISOString().replace(/\.\d+Z$/, "Z");
-  const t = to.toISOString().replace(/\.\d+Z$/, "Z");
-  return `/signalk/v1/history/values?from=${f}&to=${t}&paths=navigation.position&resolution=${resolutionSec}`;
-}
-
 // ---------------------------------------------------------------------------
 // Sight & LOP input (SPEC §14.1 "Manual LOP & Sight Input")
 // Pure form→REST-body shapers + small conversions, unit-tested. The
