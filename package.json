@@ -33,6 +33,11 @@
     "recommends": [
       "@meri-imperiumi/signalk-autostate",
       "@meri-imperiumi/signalk-logbook"
+    ],
+    "screenshots": [
+      "./doc/dr-map.png",
+      "./doc/dr-celestial.png",
+      "./doc/dr-bearing-to.png"
     ]
   },
   "engines": {
