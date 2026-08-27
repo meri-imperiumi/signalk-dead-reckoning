@@ -64,3 +64,44 @@ test("GroundTrack: capacity evicts oldest", () => {
   assert.strictEqual(gt.samples.length, 3);
   assert.strictEqual(gt.earliest(), 1);
 });
+
+test("GroundTrack: default capacity covers a 36h 1Hz run (one sight per day)", () => {
+  const gt = new GroundTrack();
+  assert.strictEqual(gt.capacity, 36 * 3600);
+});
+
+test("GroundTrack: 24h+ sight spacing advances when capacity is sized for it", () => {
+  // Capacity as the plugin sizes it for 36 h at 1 Hz.
+  const gt = new GroundTrack({
+    capacity: Math.round((36 * 3600 * 1000) / 1000),
+  });
+  // One DR sample per minute over 24.5 h (sight-to-sight drift), boat
+  // sailing due east at 60N: 0.001° lon per sample.
+  const stepMs = 60 * 1000;
+  const n = Math.round((24.5 * 3600 * 1000) / stepMs) + 1;
+  for (let i = 0; i < n; i++) {
+    gt.append({
+      timestamp: i * stepMs,
+      latitude: 60,
+      longitude: 24 + i * 0.001,
+    });
+  }
+  // Yesterday's sight → today's sight, 24.5 h apart.
+  const d = gt.displacementBetween(0, 24.5 * 3600 * 1000);
+  assert.ok(d, "day-long interval advanced");
+  assert.ok(Math.abs(d.bearingTrue - 90) < 1, "east run");
+  assert.ok(d.distanceNm > 0);
+});
+
+test("GroundTrack: day-long interval ages out beyond the capacity window", () => {
+  // Old default: 21 600 samples at the 1 Hz tick cadence = a 6 h window.
+  const gt = new GroundTrack({ capacity: 21600 });
+  for (let i = 0; i < 22000; i++) {
+    gt.append({ timestamp: i * 1000, latitude: 60, longitude: 24 + i * 0.001 });
+  }
+  // Samples older than 6 h evicted: a 7 h span cannot advance — the
+  // honest null — while the retained 6 h window still resolves.
+  assert.strictEqual(gt.displacementBetween(0, 7 * 3600 * 1000), null);
+  const kept = gt.displacementBetween(500 * 1000, 6 * 3600 * 1000);
+  assert.ok(kept && kept.distanceNm > 0, "retained window still advances");
+});

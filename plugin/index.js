@@ -206,6 +206,14 @@ const SUBSCRIPTION_PATHS = [
 const DEFAULT_CONFIG = {
   tickIntervalMs: 1000,
   saveIntervalMs: 60000,
+  /**
+   * Ground-track (running-fix advancement) window in hours. Sized for
+   * traditional single-sight-per-day sun-run-sun: consecutive sights
+   * land ~24 h apart, plus drift margin for when the day's sight
+   * slips. 36 h ≈ 129,600 samples at 1 Hz (~13 MB, same order in
+   * SQLite) — cheap on Pi-class hardware.
+   */
+  groundTrackHours: 36,
   positionFormat: "dms",
   divergence: {
     factor: DEFAULT_FACTOR,
@@ -415,6 +423,15 @@ module.exports = (app) => {
           title: "State Save Interval (ms)",
           default: DEFAULT_CONFIG.saveIntervalMs,
         },
+        groundTrackHours: {
+          type: "integer",
+          title: "Running-fix advancement window (hours)",
+          description:
+            "How long the water-track DR run is retained for advancing earlier sights to a later one. Traditional sun-run-sun with one sight per day needs ≥24 h plus margin; raise for multi-day pairing (memory and database grow ~3.6 MB per hour at the default 1 s integration interval).",
+          minimum: 1,
+          maximum: 168,
+          default: DEFAULT_CONFIG.groundTrackHours,
+        },
         positionFormat: {
           type: "string",
           title: "Position format shown in the UI",
@@ -476,7 +493,14 @@ module.exports = (app) => {
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
       engine = new deps.DeadReckoningEngine();
-      groundTrack = new deps.GroundTrack();
+      groundTrack = new deps.GroundTrack({
+        capacity: Math.max(
+          60,
+          Math.round(
+            (config.groundTrackHours * 3600 * 1000) / config.tickIntervalMs,
+          ),
+        ),
+      });
 
       // Restart survival (SPEC §9.1): seed the advancement buffer from
       // the persisted window so running-fix displacement keeps working

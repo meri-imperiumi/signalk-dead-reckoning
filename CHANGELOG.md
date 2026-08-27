@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deg/min/sec/hem fields.
 
 ### Added
+- **Traditional sun-run-sun support: 36 h running-fix window** —
+  classic single-sight-per-day practice advances yesterday's LOP by a
+  full day's run, so consecutive sights land ~24 h apart; the old 6 h
+  buffer couldn't span them. The ground-track window is now
+  configurable (`groundTrackHours`, default 36 h ≈ 129 600 samples at
+  1 Hz — a day plus drift margin for when the sight slips; the SQLite
+  persistence window follows automatically). Memory and database grow
+  ~3.6 MB per configured hour.
 - **Restart survival for the DR ground track** (work doc #16, sea-trial
   prep): the running-fix advancement buffer (6 h ring of 1 Hz DR
   samples, SPEC §9.1) is now persisted to SQLite (`dr_track_samples`,

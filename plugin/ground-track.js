@@ -17,8 +17,9 @@
  * resolves un-advanced — the honest failure rather than a silently
  * wrong advanced fix).
  *
- * The buffer is bounded (default 6 h at 1 Hz = 21 600 samples). Older
- * samples age out.
+ * The buffer is bounded (default 36 h at 1 Hz = 129 600 samples —
+ * sized for traditional single-sight-per-day sun-run-sun where
+ * consecutive sights land ~24 h apart). Older samples age out.
  *
  * @file ground-track.js
  */
@@ -31,14 +32,14 @@ const { distanceNm, bearingDeg } = require("./geo.js");
 
 /**
  * @param {object} [opts]
- * @param {number} [opts.capacity=21600] max samples
+ * @param {number} [opts.capacity=129600] max samples (36 h at 1 Hz)
  */
 class GroundTrack {
   constructor(opts = {}) {
     /** @type {Sample[]} */
     this.samples = [];
     /** @type {number} */
-    this.capacity = opts.capacity ?? 21600;
+    this.capacity = opts.capacity ?? 129600;
   }
 
   /**
