@@ -18,7 +18,8 @@
   "homepage": "https://github.com/meri-imperiumi/signalk-dead-reckoning#readme",
   "keywords": [
     "signalk-node-server-plugin",
-    "signalk-category-navigation",
+    "signalk-category-chart-plotters",
+    "signalk-category-instruments",
     "signalk-webapp"
   ],
   "author": "Henri Bergius <henri.bergius@iki.fi>",
