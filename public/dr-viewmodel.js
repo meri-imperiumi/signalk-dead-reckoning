@@ -13,24 +13,28 @@
 
 import * as posfmt from "./dr-position-format.js";
 
-/** Rendering style constants (SPEC §14.1: LOPs #ffcc00 on #003399). */
+/**
+ * Rendering style constants — the Lille Ø semantic neon palette
+ * (green = nominal/GPS, teal = primary active DR system, orange =
+ * pending/warning constraint, grey = consumed/inactive).
+ */
 export const STYLE = {
-  lop: "#ffcc00",
-  lopUsed: "#8a7a1a",
-  cpl: "#4dd0e1",
-  cplUsed: "#256b73",
-  ghostTrack: "#b39ddb",
-  gpsTrack: "#64b5f6",
-  drMarker: "#e1bee7",
-  snapVector: "#f5f5f5",
+  lop: "#c77b28",
+  lopUsed: "#7a4f1b",
+  cpl: "#4b8b99",
+  cplUsed: "#2a525c",
+  ghostTrack: "#4b8b99",
+  gpsTrack: "#6b9e78",
+  drMarker: "#ffffff",
+  snapVector: "#888899",
   fix: {
-    gps: "#4caf50",
-    celestial: "#ffb74d",
-    bearing: "#ba68c8",
-    manual: "#90a4ae",
-    backfill: "#8d6e63",
+    gps: "#6b9e78",
+    celestial: "#c77b28",
+    bearing: "#4b8b99",
+    manual: "#888899",
+    backfill: "#888899",
   },
-  uncertainty: "#b39ddb",
+  uncertainty: "#888899",
 };
 
 const RAD = Math.PI / 180;

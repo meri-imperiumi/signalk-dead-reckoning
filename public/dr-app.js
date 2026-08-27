@@ -11,6 +11,7 @@
  */
 
 import * as posfmt from "./dr-position-format.js";
+import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 import "./dr-map-view.js";
 import "./dr-sight-panel.js";
@@ -24,98 +25,99 @@ const API = "/plugins/signalk-dead-reckoning";
 const template = document.createElement("template");
 template.innerHTML = /* html */ `
   <style>
+    ${THEME_CSS}
     :host { display: block; padding: 1rem; }
-    .dr-panel {
-      background: var(--dr-panel, #111827);
-      border: 1px solid #1f2937;
-      border-radius: 8px;
-      padding: 1rem;
-      margin-bottom: 1rem;
-    }
-    .dr-panel h2 {
-      margin: 0 0 0.75rem 0;
-      font-size: 1rem;
-      color: var(--dr-muted, #8b949e);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
+    /* Headline figures: massive monospace payload, tracked labels */
+    .dr-headline {
       display: flex;
-      align-items: center;
-      gap: 0.5rem;
+      gap: clamp(1rem, 3vw, 2.5rem);
+      flex-wrap: wrap;
+      align-items: end;
     }
-    h2 button {
-      font: inherit;
-      padding: 0 0.25rem;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
+    .dr-figure { display: flex; flex-direction: column; gap: 0.15rem; }
+    .dr-figure .value {
+      font-family: ui-monospace, "Fira Code", monospace;
+      font-size: clamp(1.5rem, 4vw, 2.5rem);
+      font-weight: 700;
+      line-height: 1.05;
+      color: var(--text-main);
+      font-variant-numeric: tabular-nums;
     }
-    .dr-headline { display: flex; gap: 1.5rem; flex-wrap: wrap; }
-    .dr-figure { display: flex; flex-direction: column; }
-    .dr-figure .value { font-size: 1.75rem; font-weight: 600; }
-    .dr-figure .label { font-size: 0.75rem; color: var(--dr-muted, #8b949e); }
-    .dr-override { display: flex; align-items: center; gap: 0.75rem; }
-    .dr-override button {
-      font: inherit;
-      padding: 0.5rem 1rem;
-      border-radius: 6px;
-      border: 1px solid #2d3748;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
-    .dr-override button.engaged {
-      background: var(--dr-accent, #003399);
-      border-color: var(--dr-accent, #003399);
-    }
-    .dr-status {
-      font-size: 0.9rem;
-      color: var(--dr-muted, #8b949e);
-      text-align: center;
-    }
-    .dr-status.idle {
-      color: #f0b429;
-    }
-    .dr-status.underway {
-      color: #56d364;
-    }
-    .dr-status.alert {
-      color: #f85149;
-      font-weight: 600;
-    }
-    .dr-status.transient {
-      color: #f0b429;
-    }
-    .dr-status.retrying {
-      color: #f85149;
+    .dr-figure .label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--theme-color);
     }
     .dr-toolbar {
       display: flex;
       gap: 0.5rem;
       margin-left: auto;
       align-items: center;
+      flex-wrap: wrap;
     }
-    .dr-toolbar button {
-      font: inherit;
-      padding: 0.4rem 0.8rem;
-      border-radius: 6px;
-      border: 1px solid #2d3748;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
+    /* Engine status line — semantic theme per state */
+    .dr-status {
+      font-family: ui-monospace, "Fira Code", monospace;
+      font-size: 0.9rem;
+      text-align: center;
+      color: var(--text-muted);
+      --theme-color: var(--color-green);
+    }
+    .dr-status.idle,
+    .dr-status.transient {
+      --theme-color: var(--color-orange);
+      color: var(--color-orange);
+    }
+    .dr-status.underway {
+      --theme-color: var(--color-green);
+      color: var(--color-green);
+    }
+    .dr-status.alert,
+    .dr-status.retrying {
+      --theme-color: var(--color-red);
+      color: var(--color-red);
+      font-weight: 600;
+    }
+    /* Failover control — alternate-power semantics: orange, red when
+       engaged (DR authoritative). */
+    .dr-override {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .dr-override button {
+      --theme-color: var(--color-orange);
+      min-width: 13rem;
+    }
+    .dr-override button.engaged,
+    .dr-override button.engaged:hover,
+    .dr-override button.engaged:active {
+      --theme-color: var(--color-red);
+      background: var(--color-red);
+      border-color: var(--color-red);
+      color: var(--bg-base);
+    }
+    .dr-override #dr-override-state {
+      font-family: ui-monospace, "Fira Code", monospace;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
     }
     dialog {
       max-width: 32rem;
       width: 90vw;
-      border: 1px solid #2d3748;
-      border-radius: 8px;
-      background: var(--dr-panel, #111827);
-      color: var(--dr-fg, #e6edf3);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 0;
+      background: var(--bg-panel);
+      color: var(--text-main);
       padding: 0;
     }
     dialog::backdrop {
-      background: rgba(0, 0, 0, 0.6);
+      background: rgba(8, 10, 12, 0.7);
     }
     /* Phone-first (work doc #13 update #2): dialogs become bottom
        sheets on narrow viewports — the map stays visible around the
@@ -125,13 +127,14 @@ template.innerHTML = /* html */ `
         margin: auto auto 0 auto;
         width: 100vw;
         max-width: none;
-        border-radius: 12px 12px 0 0;
+        border-left: none;
+        border-right: none;
         border-bottom: none;
         max-height: 85vh;
       }
     }
   </style>
-  <section class="dr-panel dr-headline">
+  <section class="sk-card theme-teal dr-headline">
     <div class="dr-figure">
       <span class="value" id="dr-log">— nm</span>
       <span class="label">Water-track log</span>
@@ -154,16 +157,16 @@ template.innerHTML = /* html */ `
     </div>
   </section>
 
-  <section class="dr-panel dr-status" id="dr-status-panel">
+  <section class="sk-card dr-status" id="dr-status-panel">
     <span id="dr-status-text">Connecting to Signal K…</span>
   </section>
 
-  <section class="dr-panel">
+  <section class="sk-card">
     <h2>Ghost Track <button id="dr-recenter" title="Follow DR position">◎</button></h2>
     <dr-map-view id="dr-map"></dr-map-view>
   </section>
 
-  <section class="dr-panel">
+  <section class="sk-card">
     <h2>Pending Observations</h2>
     <dr-pending-list id="dr-pending"></dr-pending-list>
   </section>
@@ -180,7 +183,7 @@ template.innerHTML = /* html */ `
     <dr-detail-popover id="dr-detail"></dr-detail-popover>
   </dialog>
 
-  <section class="dr-panel dr-override">
+  <section class="sk-card dr-override">
     <h2>Failover Control</h2>
     <button id="dr-override-btn">Engage OVERRIDE</button>
     <span id="dr-override-state">NORMAL (GPS authoritative)</span>
@@ -369,6 +372,7 @@ class DrApp extends HTMLElement {
       "navigation.gnss.satellites",
       "navigation.gnss.satellitesVisible",
       "navigation.gnss.horizontalDilution",
+      "environment.mode",
     ]);
     stream.on((delta) => this.onDelta(delta));
     stream.onStatus((s) => this.renderLinkStatus(s));
@@ -402,7 +406,7 @@ class DrApp extends HTMLElement {
       if (fmt === "decimal" || fmt === "dm" || fmt === "dms") {
         posfmt.setFormat(fmt);
         this.sight?.applyFormat(fmt);
-        this.fixPanel?.refreshFormat();
+        this.fixPanel?.applyFormat(fmt);
       }
       this.lastConfigHash = body?.configHash ?? null;
     } catch {
@@ -565,6 +569,14 @@ class DrApp extends HTMLElement {
         break;
       case "navigation.gnss.horizontalDilution":
         this.applyGnss({ hdop: value });
+        break;
+      case "environment.mode":
+        // Day/night theme hook (UI spec): the document root carries
+        // data-mode so the tactical palette can lift the canvas for
+        // daylight legibility.
+        if (value === "night" || value === "day") {
+          document.documentElement.setAttribute("data-mode", value);
+        }
         break;
       default:
         break;

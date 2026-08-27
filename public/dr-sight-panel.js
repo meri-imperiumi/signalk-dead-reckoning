@@ -14,7 +14,13 @@
  * @file dr-sight-panel.js
  */
 
-import * as posfmt from "./dr-position-format.js";
+import {
+  buildCoordFieldset,
+  COORD_FIELD_CSS,
+  readCoordData,
+  seedCoord,
+} from "./dr-coord-fields.js";
+import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 
 /** Signal K plugin REST mount (kept in sync with dr-app.js). */
@@ -23,158 +29,85 @@ const API = "/plugins/signalk-dead-reckoning";
 const template = document.createElement("template");
 template.innerHTML = /* html */ `
   <style>
+    ${THEME_CSS}
+    ${COORD_FIELD_CSS}
     :host { display: block; padding: 1rem; }
-    h2 {
-      margin: 0 0 0.75rem 0;
-      font-size: 1rem;
-      color: var(--dr-muted, #8b949e);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    h2 button {
-      font: inherit;
-      padding: 0 0.4rem;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
-    .tabs { display: flex; gap: 0.25rem; margin-bottom: 0.75rem; }
-    .tabs button {
-      flex: 1;
-      font: inherit;
-      padding: 0.4rem;
-      border: 1px solid #2d3748;
-      border-radius: 6px;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
+    h2 { justify-content: space-between; }
+    /* Bracketed mode toggle — active tab inverts */
+    .tabs { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .tabs button { flex: 1; }
     .tabs button.active {
-      background: var(--dr-accent, #003399);
-      border-color: var(--dr-accent, #003399);
+      background: var(--theme-color);
+      color: var(--bg-base);
     }
-    .form { display: grid; gap: 0.5rem; }
+    .form { display: grid; gap: 0.75rem; }
     .form[hidden] { display: none; }
     label {
       display: flex;
       flex-direction: column;
-      font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
       gap: 0.2rem;
     }
-    input, select {
-      font: inherit;
-      padding: 0.3rem 0.4rem;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #0d1117;
-      color: var(--dr-fg, #e6edf3);
-    }
-    .row { display: flex; gap: 0.5rem; }
-    .row > label { flex: 1; }
-    .sight-time { display: flex; gap: 0.5rem; align-items: end; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .row > label { flex: 1; min-width: 8rem; }
+    .sight-time { display: flex; gap: 0.75rem; align-items: end; }
     .sight-time > label { flex: 1; }
     .sight-time .tz-toggle { flex: 0 0 auto; }
-    .sight-time .tz-toggle select { font: inherit; padding: 0.35rem; }
-    .check { display: flex; align-items: center; gap: 0.4rem; }
-    .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; align-items: center; }
-    .actions button {
-      font: inherit;
-      padding: 0.4rem 0.8rem;
-      border-radius: 6px;
-      border: 1px solid #2d3748;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
+    .sight-time .tz-toggle select { min-width: 6rem; }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-direction: row;
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: 0.85rem;
+      font-weight: 400;
+      color: var(--text-main);
     }
-    .actions button.primary {
-      background: #238636;
-      border-color: #238636;
+    .actions {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
     }
-    .actions button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
+    .actions button.primary { --theme-color: var(--color-teal); }
     .pending {
       margin-top: 0.75rem;
       font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
+      color: var(--text-muted);
     }
     .status {
       margin-top: 0.5rem;
       font-size: 0.8rem;
-      color: #56d364;
+      color: var(--color-green);
+      font-family: ui-monospace, "Fira Code", monospace;
     }
     .editing-note {
       margin-top: 0.5rem;
       font-size: 0.8rem;
-      color: #f0b429;
+      color: var(--color-orange);
+      font-family: ui-monospace, "Fira Code", monospace;
     }
     .reduction {
       margin-top: 0.5rem;
-      padding: 0.5rem;
-      background: #0d1117;
-      border: 1px solid #1f2937;
-      border-radius: 4px;
-      font: 0.8rem ui-monospace, monospace;
-      color: #c9d1d9;
+      padding: 0.6rem;
+      background: var(--bg-panel-muted);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      font: 0.8rem/1.5 ui-monospace, "Fira Code", monospace;
+      color: var(--text-main);
       white-space: pre-wrap;
     }
     .error {
-      color: #f85149;
       font-size: 0.8rem;
       margin-top: 0.5rem;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
-    .coord {
-      border: 1px solid #1f2937;
-      border-radius: 6px;
-      padding: 0.5rem;
-      margin: 0;
-    }
-    .coord legend {
-      font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
-      padding: 0 0.3rem;
-    }
-    .coord-row {
-      display: flex;
-      gap: 0.4rem;
-      align-items: end;
-      margin-bottom: 0.3rem;
-    }
-    .coord-row:last-child { margin-bottom: 0; }
-    .coord-field {
-      display: flex;
-      flex-direction: column;
-      font-size: 0.75rem;
-      color: var(--dr-muted, #8b949e);
-      gap: 0.15rem;
-    }
-    .coord-field input, .coord-field select {
-      width: 3.5rem;
-      padding: 0.25rem 0.3rem;
-      font: inherit;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #0d1117;
-      color: var(--dr-fg, #e6edf3);
-    }
-    .coord-field input.deg { width: 2.5rem; }
-    /* Decimal format: hide min/sec/hem, show a single decimal field */
-    :host([data-pos-format="decimal"]) .coord-field.min,
-    :host([data-pos-format="decimal"]) .coord-field.sec,
-    :host([data-pos-format="decimal"]) .coord-field.hem { display: none; }
-    :host([data-pos-format="decimal"]) .coord-field.dec { display: flex; }
-    /* DM: hide seconds */
-    :host([data-pos-format="dm"]) .coord-field.sec { display: none; }
-    :host([data-pos-format="dm"]) .coord-field.dec { display: none; }
-    /* DMS: show everything, hide decimal */
-    :host([data-pos-format="dms"]) .coord-field.dec { display: none; }
   </style>
   <div class="panel">
     <h2>Sight &amp; LOP Input
@@ -396,120 +329,15 @@ class DrSightPanel extends HTMLElement {
 
     // Build structured coordinate inputs for each fieldset.
     for (const fs of this.shadowRoot.querySelectorAll("fieldset.coord")) {
-      this.buildCoordFields(fs);
+      buildCoordFieldset(fs);
     }
-  }
-
-  /**
-   * Populates a `.coord` fieldset's lat/lon containers with deg/min/sec/
-   * hem (and decimal) inputs. Field names use the fieldset's data-prefix
-   * (e.g. assumed_lat_deg, center_lon_min). Optional fieldsets mark
-   * their inputs non-required.
-   *
-   * @param {HTMLFieldSetElement} fs
-   * @returns {void}
-   */
-  buildCoordFields(fs) {
-    const prefix = fs.dataset.prefix;
-    const optional = fs.dataset.optional === "true";
-    for (const kind of ["lat", "lon"]) {
-      const container = fs.querySelector(`.coord-${kind}`);
-      const row = document.createElement("div");
-      row.className = "coord-row";
-      // Decimal field (shown only in decimal mode)
-      row.appendChild(
-        this.coordField(`${prefix}_${kind}`, "dec", kind, optional),
-      );
-      // Deg / min / sec / hem fields
-      row.appendChild(
-        this.coordField(`${prefix}_${kind}`, "deg", kind, optional),
-      );
-      row.appendChild(
-        this.coordField(`${prefix}_${kind}`, "min", kind, optional),
-      );
-      row.appendChild(
-        this.coordField(`${prefix}_${kind}`, "sec", kind, optional),
-      );
-      row.appendChild(
-        this.coordField(`${prefix}_${kind}`, "hem", kind, optional),
-      );
-      container.appendChild(row);
-    }
-  }
-
-  /**
-   * Builds a single labeled coordinate sub-field.
-   *
-   * @param {string} name - base name (e.g. assumed_lat)
-   * @param {"deg"|"min"|"sec"|"hem"|"dec"} part
-   * @param {"lat"|"lon"} kind
-   * @param {boolean} optional
-   * @returns {HTMLLabelElement}
-   */
-  coordField(name, part, kind, optional) {
-    const label = document.createElement("label");
-    label.className = `coord-field ${part}`;
-    const cap =
-      part === "deg"
-        ? "°"
-        : part === "min"
-          ? "'"
-          : part === "sec"
-            ? '"'
-            : part === "hem"
-              ? ""
-              : "dec";
-    label.textContent = cap || part;
-    if (part === "dec") {
-      const inp = document.createElement("input");
-      inp.type = "number";
-      inp.step = "0.0001";
-      inp.name = `${name}`;
-      inp.dataset.part = part;
-      if (!optional) inp.required = true;
-      label.appendChild(inp);
-    } else if (part === "hem") {
-      const sel = document.createElement("select");
-      sel.name = `${name}_hem`;
-      sel.dataset.part = part;
-      const blank = document.createElement("option");
-      blank.value = "";
-      blank.textContent = kind === "lat" ? "N/S" : "E/W";
-      sel.appendChild(blank);
-      for (const h of kind === "lat" ? ["N", "S"] : ["E", "W"]) {
-        const opt = document.createElement("option");
-        opt.value = h;
-        opt.textContent = h;
-        sel.appendChild(opt);
-      }
-      if (!optional) sel.required = true;
-      label.appendChild(sel);
-    } else {
-      const inp = document.createElement("input");
-      inp.type = "number";
-      inp.step = part === "sec" ? "0.1" : "0.001";
-      inp.min = "0";
-      inp.name = `${name}_${part}`;
-      inp.dataset.part = part;
-      if (!optional) inp.required = true;
-      label.appendChild(inp);
-    }
-    return label;
   }
 
   /**
    * Called by dr-app when the DR or GPS position updates, so the
    * assumed-position defaults track the boat without the user typing.
-   * Only fills fields the user hasn't manually edited (dirty flag).
-   *
-   * @param {{latitude: number, longitude: number}|null} pos
-   * @returns {void}
-   */
-  /**
-   * Called by dr-app when the DR or GPS position updates, so the
-   * assumed-position defaults track the boat without the user typing.
-   * Only fills fields the user hasn't manually edited (dirty flag).
-   * Seeds the structured deg/min/sec/hem (or decimal) fields.
+   * Seeds the structured deg/min/sec/hem (or decimal) fields, skipping
+   * any the user has manually edited (dirty flag).
    *
    * @param {{latitude: number, longitude: number}|null} pos
    * @returns {void}
@@ -521,36 +349,9 @@ class DrSightPanel extends HTMLElement {
       const prefix = fs.dataset.prefix;
       // Only seed the assumed-position fieldsets (not object positions).
       if (prefix !== "assumed") continue;
-      this.seedCoord(fs, "lat", pos.latitude);
-      this.seedCoord(fs, "lon", pos.longitude);
+      seedCoord(fs, "lat", pos.latitude);
+      seedCoord(fs, "lon", pos.longitude);
     }
-  }
-
-  /**
-   * Seeds one coordinate's structured fields from a degree value,
-   * skipping any the user has marked dirty.
-   *
-   * @param {HTMLFieldSetElement} fs
-   * @param {"lat"|"lon"} kind
-   * @param {number} deg
-   * @returns {void}
-   */
-  seedCoord(fs, kind, deg) {
-    const prefix = fs.dataset.prefix;
-    const parts = posfmt.coordParts(deg, kind);
-    const set = (part, val) => {
-      const el = fs.querySelector(
-        `[name="${prefix}_${kind}${part === "" ? "" : `_${part}`}"`,
-      );
-      if (!el || el.dataset.dirty === "true") return;
-      if (el.tagName === "SELECT") el.value = String(val);
-      else el.value = String(val);
-    };
-    set("dec", deg.toFixed(4));
-    set("deg", parts.deg);
-    set("min", parts.min);
-    if (parts.sec != null) set("sec", parts.sec);
-    set("hem", parts.hem);
   }
 
   /**
@@ -688,34 +489,8 @@ class DrSightPanel extends HTMLElement {
     );
     if (!fs) return;
     // Force-fill (a chart pick overwrites, no dirty check).
-    this.seedCoordForced(fs, "lat", lat);
-    this.seedCoordForced(fs, "lon", lon);
-  }
-
-  /**
-   * Like {@link seedCoord} but overwrites regardless of the dirty flag
-   * (used for explicit chart picks).
-   *
-   * @param {HTMLFieldSetElement} fs
-   * @param {"lat"|"lon"} kind
-   * @param {number} deg
-   * @returns {void}
-   */
-  seedCoordForced(fs, kind, deg) {
-    const prefix = fs.dataset.prefix;
-    const parts = posfmt.coordParts(deg, kind);
-    const set = (part, val) => {
-      const el = fs.querySelector(
-        `[name="${prefix}_${kind}${part === "" ? "" : `_${part}`}"]`,
-      );
-      if (!el) return;
-      el.value = String(val);
-    };
-    set("dec", deg.toFixed(4));
-    set("deg", parts.deg);
-    set("min", parts.min);
-    if (parts.sec != null) set("sec", parts.sec);
-    set("hem", parts.hem);
+    seedCoord(fs, "lat", lat, true);
+    seedCoord(fs, "lon", lon, true);
   }
 
   /** @returns {void} */
@@ -895,13 +670,13 @@ class DrSightPanel extends HTMLElement {
         (((record.azimuth_true - 90) % 360) + 360) % 360,
       );
       const fs = form.querySelector('fieldset.coord[data-prefix="object"]');
-      this.seedCoordForced(fs, "lat", record.assumed_lat);
-      this.seedCoordForced(fs, "lon", record.assumed_lon);
+      seedCoord(fs, "lat", record.assumed_lat, true);
+      seedCoord(fs, "lon", record.assumed_lon, true);
     } else {
       form.querySelector('[name="object"]').value = record.source_object ?? "";
       const fs = form.querySelector('fieldset.coord[data-prefix="center"]');
-      this.seedCoordForced(fs, "lat", record.center_lat);
-      this.seedCoordForced(fs, "lon", record.center_lon);
+      seedCoord(fs, "lat", record.center_lat, true);
+      seedCoord(fs, "lon", record.center_lon, true);
     }
     const tz = this.loadSightTz();
     const timeInput = form.querySelector('input[name="sight_time"]');
@@ -951,22 +726,14 @@ class DrSightPanel extends HTMLElement {
         : mode === "bearing"
           ? "object"
           : "assumed";
+    const format = this.getAttribute("data-pos-format") ?? "dms";
     for (const kind of ["lat", "lon"]) {
       const name = `${prefix}_${kind}`;
-      // Decimal format: a single number field named `${prefix}_${kind}`.
-      if (data[name] != null && data[name] !== "") {
-        data[name] = Number(data[name]);
-        continue;
-      }
-      // DM/DMS: assemble from deg/min/sec/hem sub-fields.
-      const deg = data[`${name}_deg`];
-      if (deg == null || deg === "") continue; // optional + blank
-      data[name] = posfmt.parseParts({
-        deg,
-        min: data[`${name}_min`] ?? 0,
-        sec: data[`${name}_sec`] ?? null,
-        hem: data[`${name}_hem`] ?? "",
-      });
+      const deg = readCoordData(data, prefix, kind, format);
+      if (deg != null) data[name] = deg;
+      // Optional + blank → leave unset; the shapers treat missing as
+      // "use DR" / "no position".
+      else delete data[name];
     }
   }
 

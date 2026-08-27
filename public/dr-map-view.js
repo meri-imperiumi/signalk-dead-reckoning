@@ -19,6 +19,7 @@
 
 /* global L */
 
+import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 
 class DrMapView extends HTMLElement {
@@ -27,35 +28,84 @@ class DrMapView extends HTMLElement {
     const root = this.attachShadow({ mode: "open" });
     const style = document.createElement("style");
     style.textContent = `
-      :host { display: block; height: 60vh; border-radius: 8px; overflow: hidden; }
+      ${THEME_CSS}
+      /* Desktop aggressively consumes viewport height; mobile keeps a
+         strict floor so the page stays scrollable (UI spec §7). */
+      :host {
+        display: block;
+        position: relative;
+        height: max(50vh, calc(100vh - 260px));
+        min-height: 50vh;
+        overflow: hidden;
+      }
       .map-host { position: relative; width: 100%; height: 100%; }
-      .map-wrap { width: 100%; height: 100%; background: #0d1117; }
+      .map-wrap { width: 100%; height: 100%; background: var(--bg-base, #080a0c); }
+      /* Floating overlays: semi-transparent dark panels with sharp 1px
+         borders so they stay legible over any tileset (UI spec §7). */
+      .dr-chip {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        z-index: 1000;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 4px 10px;
+        background-color: rgba(17, 20, 20, 0.8);
+        border: 1px solid rgba(75, 139, 153, 0.5);
+        color: var(--color-teal, #4b8b99);
+        font: 12px/1.4 ui-monospace, "Fira Code", monospace;
+        font-variant-numeric: tabular-nums;
+      }
       .dr-pick-menu {
         position: absolute;
         z-index: 1000;
-        background: var(--dr-panel, #111827);
-        border: 1px solid #2d3748;
-        border-radius: 6px;
-        padding: 0.25rem;
+        background-color: rgba(17, 20, 20, 0.8);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        padding: 0.4rem;
+        font-family: ui-monospace, "Fira Code", monospace;
         font-size: 0.8rem;
-        color: var(--dr-muted, #8b949e);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        color: var(--text-muted, #888899);
         display: flex;
         flex-direction: column;
-        gap: 0.2rem;
+        gap: 0.3rem;
         min-width: 12rem;
       }
       .dr-pick-menu button {
-        font: inherit;
         text-align: left;
-        padding: 0.3rem 0.5rem;
-        border: 1px solid #1f2937;
-        border-radius: 4px;
-        background: #1a202c;
-        color: var(--dr-fg, #e6edf3);
-        cursor: pointer;
+        padding: 0 0.75rem;
+        background: transparent;
       }
-      .dr-pick-menu button:hover { background: #2d3748; }
+      /* Leaflet chrome → tactical: dark, flat, teal */
+      .leaflet-bar,
+      .leaflet-control-layers {
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+      }
+      .leaflet-bar a {
+        background-color: rgba(17, 20, 20, 0.8) !important;
+        color: var(--color-teal, #4b8b99) !important;
+        border-radius: 0 !important;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.2) !important;
+      }
+      .leaflet-control-layers {
+        background-color: rgba(17, 20, 20, 0.8) !important;
+        color: var(--text-main, #ffffff) !important;
+      }
+      .leaflet-control-layers-expanded {
+        background-color: rgba(17, 20, 20, 0.8) !important;
+        color: var(--text-main, #ffffff) !important;
+        border-radius: 0 !important;
+      }
+      .leaflet-tooltip {
+        background-color: rgba(17, 20, 20, 0.85) !important;
+        color: var(--text-main, #ffffff) !important;
+        border: 1px solid rgba(255, 255, 255, 0.25) !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+        font: 11px ui-monospace, "Fira Code", monospace !important;
+      }
     `;
     root.appendChild(style);
     // Leaflet's CSS must live INSIDE the shadow root — a document-level
@@ -70,19 +120,7 @@ class DrMapView extends HTMLElement {
 
     const chip = document.createElement("div");
     chip.setAttribute("part", "divergence");
-    chip.style.position = "absolute";
-    chip.style.top = "8px";
-    chip.style.right = "8px";
-    chip.style.zIndex = "1000";
-    chip.style.display = "flex";
-    chip.style.gap = "8px";
-    chip.style.alignItems = "center";
-    chip.style.padding = "4px 8px";
-    chip.style.background = "rgba(13, 17, 23, 0.85)";
-    chip.style.border = "1px solid #30363d";
-    chip.style.borderRadius = "6px";
-    chip.style.color = "#c9d1d9";
-    chip.style.font = "12px/1.4 ui-monospace, monospace";
+    chip.className = "dr-chip";
 
     const chipText = document.createElement("span");
     chipText.textContent = "— nm";
@@ -90,6 +128,7 @@ class DrMapView extends HTMLElement {
     spark.width = 80;
     spark.height = 20;
     spark.style.display = "block";
+    spark.style.alignSelf = "center";
     chip.appendChild(chipText);
     chip.appendChild(spark);
 
@@ -375,7 +414,7 @@ class DrMapView extends HTMLElement {
     const unadvanced = vm.hasUnadvanced(candidate.advancements);
     L.circleMarker([candidate.latitude, candidate.longitude], {
       radius: 8,
-      color: unadvanced ? "#f85149" : "#ffcc00",
+      color: unadvanced ? "#c94b4b" : "#c77b28",
       fill: false,
       weight: 2,
       dashArray: "3 3",
@@ -410,7 +449,7 @@ class DrMapView extends HTMLElement {
       cpl: new Map((snap.cpls ?? []).map((c) => [c.cpl_id, c])),
     };
     for (const spec of vm.advancementLayerSpecs(advancements, rowsById)) {
-      const warn = spec.warning ? "#f85149" : null;
+      const warn = spec.warning ? "#c94b4b" : null;
       // Faded original point — where the observation was taken.
       L.circleMarker(spec.original, {
         radius: 3,
@@ -429,7 +468,7 @@ class DrMapView extends HTMLElement {
       if (spec.displacementNm == null) continue;
       // DR-run vector — the transport over the interval.
       L.polyline([spec.original, spec.advanced], {
-        color: "#b39ddb",
+        color: "#888899",
         weight: 1.5,
         opacity: 0.9,
         dashArray: "4 4",
@@ -613,7 +652,7 @@ class DrMapView extends HTMLElement {
     if (!ctx || !sparkStats || sparkStats.points.length < 2) return;
     const { width: w, height: h } = this.sparkCanvas;
     ctx.clearRect(0, 0, w, h);
-    ctx.strokeStyle = "#64b5f6";
+    ctx.strokeStyle = "#4b8b99";
     ctx.lineWidth = 1;
     ctx.beginPath();
     sparkStats.points.forEach((y, i) => {

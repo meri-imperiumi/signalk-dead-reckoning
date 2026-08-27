@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **"Tactical sci-fi" visual theme** applied across the webapp (the
+  Lille Ø Signal K UI spec): the GitHub-dark palette is replaced by the
+  semantic neon token system (`--color-green/teal/orange/red/grey`, dark
+  canvas tokens) declared at the document `:root` and shared into every
+  shadow-root component via a new `public/dr-theme.js` module — flat
+  geometry (no radii, no shadows), 2px corner brackets on `.sk-card`
+  panels, hardware-style controls (transparent buttons with theme
+  borders that invert on use, 2px-bottom-rule monospace inputs, sharp
+  square checkboxes) with ≥48 px touch targets, massive tabular-nums
+  telemetry values, and uppercase tracked headers. Map overlays
+  (divergence chip, chart-pick menu, Leaflet controls/tooltips) use the
+  semi-transparent dark overlay treatment; the map aggressively fills
+  the desktop viewport with a 50 vh mobile floor. Map geometry colors
+  remapped to the semantic palette (GPS green, DR/ghost teal, LOP
+  orange, consumed grey). `dr-app` now subscribes to
+  `vessels.self.environment.mode` and reflects it as
+  `data-mode="night"|"day"` on `<html>`, lifting the canvas tokens for
+  daylight legibility.
+- **"Fix at coordinates" uses the structured coordinate entry** — the
+  same deg/min/sec/hemisphere (or decimal) sub-fields as the sight
+  forms, driven by the server-configured position format. The fieldset
+  builder, seeding and reading logic now live in a shared
+  `public/dr-coord-fields.js` module used by both panels (the sight
+  panel's private copies were removed). Reading is now format-driven:
+  decimal mode reads the decimal field, DM/DMS assemble the visible
+  deg/min/sec/hem fields.
+
 ### Added
 - **Running-fix visualization & interactive resolve** (work doc #13):
   - `POST /fix/resolve` candidates now carry per-observation
@@ -102,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token plumbing is needed.
 
 ### Fixed
+- Sight panel assumed-position seeding threw on every DR/GPS position
+  update: the `seedCoord` sub-field selector was missing its closing
+  `]` (invalid selector), so the celestial form's assumed position
+  never tracked the boat. Fixed in the shared `dr-coord-fields.js`
+  module with a regression test.
+- Sight panel DM/DMS submissions could send a stale seeded decimal
+  value instead of the user-edited deg/min/sec fields: the form parser
+  preferred the (hidden) decimal field whenever it was non-empty.
+  Reading is now driven by the panel's `data-pos-format` attribute, so
+  only the fields the user actually sees are read.
 - Windows CI: the plugin smoke tests leaked open SQLite handles in the
   shared temp directory (four `makeStarted()` tests never called
   `plugin.stop()`). On Linux/macOS an open file can still be unlinked; on

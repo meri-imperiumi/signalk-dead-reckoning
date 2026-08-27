@@ -16,6 +16,7 @@
  * @file dr-pending-list.js
  */
 
+import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 
 /** Signal K plugin REST mount (kept in sync with dr-app.js). */
@@ -24,33 +25,38 @@ const API = "/plugins/signalk-dead-reckoning";
 const template = document.createElement("template");
 template.innerHTML = /* html */ `
   <style>
-    :host { display: block; }
-    .rows { display: flex; flex-direction: column; gap: 0.25rem; }
+    ${THEME_CSS}
+    :host {
+      display: block;
+      --theme-color: var(--color-teal);
+      --theme-color-rgb: var(--color-teal-rgb);
+    }
+    .rows { display: flex; flex-direction: column; gap: 0.4rem; }
     .row {
       display: flex;
       align-items: center;
-      gap: 0.5rem;
-      padding: 0.35rem 0.5rem;
-      border: 1px solid #1f2937;
-      border-radius: 6px;
-      background: #0d1117;
+      gap: 0.75rem;
+      padding: 0.35rem 0.6rem;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: var(--bg-panel-muted);
       font-size: 0.85rem;
-      color: var(--dr-fg, #e6edf3);
-      min-height: 44px; /* phone-first tap target */
+      color: var(--text-main);
+      min-height: 48px; /* phone-first tap target */
       box-sizing: border-box;
     }
     .row.selected {
-      border-color: var(--dr-accent, #003399);
-      background: #14203c;
+      border-color: var(--theme-color);
+      background: rgba(var(--theme-color-rgb), 0.12);
     }
-    .row input[type="checkbox"] {
-      width: 1.2rem;
-      height: 1.2rem;
+    .row input[type="checkbox"] { flex: 0 0 auto; }
+    .icon {
       flex: 0 0 auto;
+      width: 1.2rem;
+      text-align: center;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
-    .icon { flex: 0 0 auto; width: 1.2rem; text-align: center; }
-    .icon.lop { color: #ffcc00; }
-    .icon.cpl { color: #4dd0e1; }
+    .icon.lop { color: var(--color-orange); }
+    .icon.cpl { color: var(--color-teal); }
     .meta { flex: 1; min-width: 0; display: flex; flex-direction: column; }
     .meta .label {
       white-space: nowrap;
@@ -59,67 +65,38 @@ template.innerHTML = /* html */ `
     }
     .meta .time {
       font-size: 0.72rem;
-      color: var(--dr-muted, #8b949e);
+      color: var(--text-muted);
+      font-family: ui-monospace, "Fira Code", monospace;
     }
-    .actions { display: flex; gap: 0.25rem; flex: 0 0 auto; }
-    .actions button {
-      font: inherit;
-      min-width: 44px;
-      min-height: 44px;
-      padding: 0 0.5rem;
-      border: 1px solid #2d3748;
-      border-radius: 6px;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
-    .actions button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
+    .actions { display: flex; gap: 0.5rem; flex: 0 0 auto; }
+    .actions button { padding: 0 0.75rem; }
     .empty {
       font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
+      color: var(--text-muted);
       padding: 0.25rem 0;
     }
     .hint {
       font-size: 0.75rem;
-      color: #f0b429;
       margin: 0.25rem 0 0 0;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
     .footer {
       display: flex;
       gap: 0.5rem;
       align-items: center;
-      margin-top: 0.5rem;
+      margin-top: 0.75rem;
       flex-wrap: wrap;
     }
-    .footer button {
-      font: inherit;
-      padding: 0.5rem 0.9rem;
-      min-height: 44px;
-      border-radius: 6px;
-      border: 1px solid #2d3748;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
-    .footer button.primary {
-      background: #238636;
-      border-color: #238636;
-    }
-    .footer button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
+    .footer button.primary { --theme-color: var(--color-green); }
     .footer .status {
       font-size: 0.75rem;
-      color: var(--dr-muted, #8b949e);
+      color: var(--text-muted);
+      font-family: ui-monospace, "Fira Code", monospace;
     }
     .error {
-      color: #f85149;
       font-size: 0.8rem;
       margin-top: 0.5rem;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
   </style>
   <div class="rows" id="rows"></div>

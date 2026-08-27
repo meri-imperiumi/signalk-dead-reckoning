@@ -19,6 +19,7 @@
  */
 
 import * as posfmt from "./dr-position-format.js";
+import { THEME_CSS } from "./dr-theme.js";
 
 /** Signal K plugin REST mount (kept in sync with dr-app.js). */
 const API = "/plugins/signalk-dead-reckoning";
@@ -26,28 +27,9 @@ const API = "/plugins/signalk-dead-reckoning";
 const template = document.createElement("template");
 template.innerHTML = /* html */ `
   <style>
-    :host { display: block; padding: 1rem; }
-    h2 {
-      margin: 0 0 0.75rem 0;
-      font-size: 1rem;
-      color: var(--dr-muted, #8b949e);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    h2 button {
-      font: inherit;
-      padding: 0 0.4rem;
-      min-width: 44px;
-      min-height: 44px;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
+    ${THEME_CSS}
+    :host { display: block; padding: 1rem; --theme-color: var(--color-teal); }
+    h2 { justify-content: space-between; }
     dl {
       margin: 0 0 0.5rem 0;
       display: grid;
@@ -55,46 +37,40 @@ template.innerHTML = /* html */ `
       gap: 0.15rem 0.75rem;
       font-size: 0.85rem;
     }
-    dt { color: var(--dr-muted, #8b949e); }
-    dd { margin: 0; color: var(--dr-fg, #e6edf3); word-break: break-word; }
-    .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
-    .actions button {
-      font: inherit;
-      padding: 0.5rem 0.9rem;
-      min-height: 44px;
-      border-radius: 6px;
-      border: 1px solid #2d3748;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
+    dt {
+      color: var(--text-muted);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
     }
-    .actions button.danger { border-color: #f85149; color: #f85149; }
-    .actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+    dd { margin: 0; color: var(--text-main); word-break: break-word; }
+    .actions {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .actions button.danger { --theme-color: var(--color-red); }
     label {
       display: flex;
       flex-direction: column;
-      font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
       gap: 0.2rem;
       margin-top: 0.5rem;
-    }
-    input, textarea {
-      font: inherit;
-      padding: 0.4rem;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #0d1117;
-      color: var(--dr-fg, #e6edf3);
     }
     .warn {
       margin-top: 0.5rem;
       font-size: 0.78rem;
-      color: #f0b429;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
     .error {
-      color: #f85149;
       font-size: 0.8rem;
       margin-top: 0.5rem;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
   </style>
   <div class="panel">

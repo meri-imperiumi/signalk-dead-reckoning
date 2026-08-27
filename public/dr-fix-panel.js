@@ -8,15 +8,23 @@
  * location (a berth). Shows GNSS fix-quality stats (system, fix method,
  * satellites, HDOP + error estimate) when the receiver publishes them.
  *
- * Coordinate inputs are free text in any supported format (decimal / DM /
- * DMS) so values can be transcribed from paper exactly as written; parsing
- * and body shaping live in dr-viewmodel.js (pure, tested). This component
- * is the DOM adapter, mirroring `<dr-sight-panel>`.
+ * Coordinate entry uses the same structured deg/min/sec/hemisphere (or
+ * decimal) sub-fields as the sight panel's LOP/celestial forms
+ * (dr-coord-fields.js), driven by the server-configured position
+ * format; body shaping lives in dr-viewmodel.js (pure, tested). This
+ * component is the DOM adapter, mirroring `<dr-sight-panel>`.
  *
  * @file dr-fix-panel.js
  */
 
-import * as posfmt from "./dr-position-format.js";
+import {
+  buildCoordFieldset,
+  COORD_FIELD_CSS,
+  clearCoordDirty,
+  readCoordData,
+  seedCoord,
+} from "./dr-coord-fields.js";
+import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 
 /** Signal K plugin REST mount (kept in sync with dr-app.js). */
@@ -25,34 +33,18 @@ const API = "/plugins/signalk-dead-reckoning";
 const template = document.createElement("template");
 template.innerHTML = /* html */ `
   <style>
-    :host { display: block; padding: 1rem; }
-    h2 {
-      margin: 0 0 0.75rem 0;
-      font-size: 1rem;
-      color: var(--dr-muted, #8b949e);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    h2 button {
-      font: inherit;
-      padding: 0 0.4rem;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
-    }
+    ${THEME_CSS}
+    ${COORD_FIELD_CSS}
+    :host { display: block; padding: 1rem; --theme-color: var(--color-teal); }
+    h2 { justify-content: space-between; }
     .gnss {
       margin: 0 0 0.75rem 0;
-      padding: 0.5rem;
-      background: #0d1117;
-      border: 1px solid #1f2937;
-      border-radius: 4px;
+      padding: 0.6rem;
+      background: var(--bg-panel-muted);
+      border: 1px solid rgba(255, 255, 255, 0.1);
       font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
+      color: var(--text-muted);
+      font-family: ui-monospace, "Fira Code", monospace;
     }
     .gnss dl {
       margin: 0;
@@ -60,66 +52,53 @@ template.innerHTML = /* html */ `
       grid-template-columns: auto 1fr;
       gap: 0.15rem 0.75rem;
     }
-    .gnss dt { color: var(--dr-muted, #8b949e); }
-    .gnss dd { margin: 0; color: var(--dr-fg, #e6edf3); }
-    .form { display: grid; gap: 0.5rem; }
+    .gnss dt { color: var(--text-muted); }
+    .gnss dd { margin: 0; color: var(--text-main); }
+    .form { display: grid; gap: 0.75rem; }
     label {
       display: flex;
       flex-direction: column;
-      font-size: 0.8rem;
-      color: var(--dr-muted, #8b949e);
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
       gap: 0.2rem;
     }
-    input, select {
-      font: inherit;
-      padding: 0.3rem 0.4rem;
-      border: 1px solid #2d3748;
-      border-radius: 4px;
-      background: #0d1117;
-      color: var(--dr-fg, #e6edf3);
-    }
-    input[name="latitude"], input[name="longitude"] { font-family: ui-monospace, monospace; }
-    .row { display: flex; gap: 0.5rem; }
-    .row > label { flex: 1; }
-    .fix-time { display: flex; gap: 0.5rem; align-items: end; }
+    .row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .row > label { flex: 1; min-width: 8rem; }
+    .fix-time { display: flex; gap: 0.75rem; align-items: end; }
     .fix-time > label { flex: 1; }
+    .fix-time .tz-toggle select { min-width: 6rem; }
     .hint {
-      margin: -0.25rem 0 0 0;
+      margin: 0.25rem 0 0 0;
       font-size: 0.72rem;
-      color: var(--dr-muted, #8b949e);
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--text-muted);
     }
-    .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; align-items: center; }
-    .actions button {
-      font: inherit;
-      padding: 0.4rem 0.8rem;
-      border-radius: 6px;
-      border: 1px solid #2d3748;
-      background: #1a202c;
-      color: var(--dr-fg, #e6edf3);
-      cursor: pointer;
+    .actions {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
     }
-    .actions button.primary {
-      background: #238636;
-      border-color: #238636;
-    }
-    .actions button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
+    .actions button.primary { --theme-color: var(--color-green); }
     .result {
       margin-top: 0.5rem;
-      padding: 0.5rem;
-      background: #0d1117;
-      border: 1px solid #1f2937;
-      border-radius: 4px;
-      font-size: 0.8rem;
-      color: #56d364;
+      padding: 0.6rem;
+      background: var(--bg-panel-muted);
+      border: 1px solid rgba(107, 158, 120, 0.4);
+      font: 0.8rem/1.5 ui-monospace, "Fira Code", monospace;
+      color: var(--color-green);
       white-space: pre-wrap;
     }
     .error {
-      color: #f85149;
       font-size: 0.8rem;
       margin-top: 0.5rem;
+      font-family: ui-monospace, "Fira Code", monospace;
     }
   </style>
   <div class="panel">
@@ -128,15 +107,12 @@ template.innerHTML = /* html */ `
     </h2>
     <div class="gnss" id="gnss-stats"></div>
     <form class="form" id="form-fix">
-      <div class="row">
-        <label>Latitude
-          <input name="latitude" placeholder="60°09.300' N" required />
-        </label>
-        <label>Longitude
-          <input name="longitude" placeholder="024°57.100' E" required />
-        </label>
-      </div>
-      <p class="hint">Decimal degrees, DM or DMS — transcribe from paper as written.</p>
+      <fieldset class="coord" data-prefix="fix">
+        <legend>Position</legend>
+        <div class="coord-lat"></div>
+        <div class="coord-lon"></div>
+      </fieldset>
+      <p class="hint">Same entry as the sight forms — format follows the server configuration (decimal, DM or DMS).</p>
       <label>Source
         <select name="source_type">
           <option value="gps">GNSS (live fix, coordinates as received)</option>
@@ -175,8 +151,16 @@ template.innerHTML = /* html */ `
 class DrFixPanel extends HTMLElement {
   constructor() {
     super();
+    // Default to DMS (matches the plugin default); updated when the
+    // server config loads.
+    this.setAttribute("data-pos-format", "dms");
     const root = this.attachShadow({ mode: "open" });
     root.appendChild(template.content.cloneNode(true));
+
+    // Structured coordinate entry — same fields as the sight panel.
+    /** @type {HTMLFieldSetElement|null} */
+    this.coordFs = root.querySelector('fieldset.coord[data-prefix="fix"]');
+    if (this.coordFs) buildCoordFieldset(this.coordFs);
 
     /** @type {HTMLFormElement|null} */
     this.form = root.querySelector("#form-fix");
@@ -208,17 +192,15 @@ class DrFixPanel extends HTMLElement {
 
     // Editing a prefilled coordinate means the fix is no longer the
     // as-received GNSS position — switch the source to manual once (the
-    // watchkeeper can still override, e.g. to backfill).
-    for (const name of ["latitude", "longitude"]) {
-      this.form
-        .querySelector(`input[name="${name}"]`)
-        ?.addEventListener("input", (e) => {
-          e.target.dataset.dirty = "true";
-          if (this.sourceSel?.value === "gps" && !this.sourceTouched) {
-            this.sourceSel.value = "manual";
-          }
-        });
-    }
+    // watchkeeper can still override, e.g. to backfill). The per-field
+    // dirty flags also stop live GNSS re-seeding from overwriting the
+    // edit.
+    this.coordFs?.addEventListener("input", (e) => {
+      e.target.dataset.dirty = "true";
+      if (this.sourceSel?.value === "gps" && !this.sourceTouched) {
+        this.sourceSel.value = "manual";
+      }
+    });
     this.sourceSel?.addEventListener("change", () => {
       this.sourceTouched = true;
     });
@@ -284,6 +266,9 @@ class DrFixPanel extends HTMLElement {
     this.lastGnss = gnss;
     this.sourceTouched = false;
     this.form?.reset();
+    // form.reset() clears values but not our dirty flags — clear them
+    // so a re-opened dialog re-seeds everything.
+    if (this.coordFs) clearCoordDirty(this.coordFs);
     this.tzSel.value = this.loadTz();
     this.renderGnssStats(gnss);
     this.sourceSel.value = position ? "gps" : "manual";
@@ -309,13 +294,13 @@ class DrFixPanel extends HTMLElement {
     if (position) this.lastPosition = position;
     if (gnss) this.lastGnss = gnss;
     this.renderGnssStats(this.lastGnss);
-    const dirty = (name) =>
-      this.form?.querySelector(`input[name="${name}"]`)?.dataset.dirty ===
-      "true";
-    if (this.lastPosition && !dirty("latitude") && !dirty("longitude")) {
-      this.fillCoords(this.lastPosition);
-    }
-    if (!dirty("estimated_error_nm")) {
+    // Re-seed the structured fields — seedCoord skips any sub-field
+    // the user has edited, so partial edits survive live updates.
+    if (this.lastPosition) this.fillCoords(this.lastPosition);
+    const errDirty =
+      this.form?.querySelector('input[name="estimated_error_nm"]')?.dataset
+        .dirty === "true";
+    if (!errDirty) {
       const errNm = vm.hdopErrorNm(this.lastGnss?.hdop);
       this.form.querySelector('input[name="estimated_error_nm"]').value =
         errNm != null ? errNm.toFixed(3) : "";
@@ -324,34 +309,31 @@ class DrFixPanel extends HTMLElement {
 
   /**
    * Fills the coordinate inputs from a [lat, lon] pair in the
-   * configured position format.
+   * configured position format (per-field dirty skipping inside
+   * seedCoord).
    *
    * @param {[number, number]} position
    * @returns {void}
    */
   fillCoords(position) {
-    this.form.querySelector('input[name="latitude"]').value = posfmt.fmt(
-      position[0],
-      "lat",
-    );
-    this.form.querySelector('input[name="longitude"]').value = posfmt.fmt(
-      position[1],
-      "lon",
-    );
+    if (!this.coordFs) return;
+    seedCoord(this.coordFs, "lat", position[0]);
+    seedCoord(this.coordFs, "lon", position[1]);
   }
 
   /**
-   * Re-displays prefilled coordinates after a server-side format change
-   * (skipped when the user has edited them).
+   * Sets the position format shown in the coordinate fieldset
+   * (decimal / DM / DMS), mirroring the sight panel: toggles the
+   * data-pos-format host attribute and re-seeds non-dirty fields from
+   * the last known position.
    *
+   * @param {"decimal"|"dm"|"dms"} format
    * @returns {void}
    */
-  refreshFormat() {
-    const dirty = (name) =>
-      this.form?.querySelector(`input[name="${name}"]`)?.dataset.dirty ===
-      "true";
-    if (this.lastPosition && !dirty("latitude") && !dirty("longitude")) {
-      this.fillCoords(this.lastPosition);
+  applyFormat(format) {
+    if (format === "decimal" || format === "dm" || format === "dms") {
+      this.setAttribute("data-pos-format", format);
+      if (this.lastPosition) this.fillCoords(this.lastPosition);
     }
   }
 
@@ -405,15 +387,20 @@ class DrFixPanel extends HTMLElement {
     this.hideError();
     if (this.resultEl) this.resultEl.hidden = true;
     const data = this.readForm();
+    const format = this.getAttribute("data-pos-format") ?? "dms";
+    const latitude = readCoordData(data, "fix", "lat", format);
+    const longitude = readCoordData(data, "fix", "lon", format);
+    if (latitude == null || longitude == null) {
+      this.showError("latitude and longitude are required");
+      return;
+    }
+    data.latitude = latitude;
+    data.longitude = longitude;
     let body;
     try {
       body = vm.pointFixBody(data);
     } catch (err) {
       this.showError(err.message);
-      return;
-    }
-    if (!Number.isFinite(body.latitude) || !Number.isFinite(body.longitude)) {
-      this.showError("latitude and longitude are required");
       return;
     }
     const btn = this.shadowRoot.querySelector("#confirm-btn");

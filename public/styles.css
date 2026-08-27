@@ -1,11 +1,48 @@
+/*
+ * Signal K Dead Reckoning — document styles.
+ *
+ * Declares the "tactical sci-fi" token system (Lille Ø Signal K UI
+ * spec). The web components render in shadow roots and consume these
+ * custom properties via inheritance — see dr-theme.js for the shared
+ * component styles.
+ *
+ * Day/night mode: the host (or dr-app itself, listening to
+ * vessels.self.environment.mode) sets data-mode="night"|"day" on the
+ * root <html> tag. The default (no attribute) is the dark night look;
+ * day mode lifts the canvas tokens slightly for daylight legibility
+ * while keeping the semantic hues untouched.
+ */
+
 :root {
-  --dr-bg: #0a0f1a;
-  --dr-fg: #e6edf3;
-  --dr-accent: #003399;
-  --dr-lop: #ffcc00;
-  --dr-ghost: #4dd0e1;
-  --dr-muted: #8b949e;
-  --dr-panel: #111827;
+  color-scheme: dark;
+
+  /* Canvas */
+  --bg-base: #080a0c;
+  --bg-panel: #111414;
+  --bg-panel-muted: #0a0c0c;
+
+  /* Semantic themes */
+  --color-green: #6b9e78; /* Standard / Nominal operation */
+  --color-green-rgb: 107, 158, 120;
+  --color-teal: #4b8b99; /* Surplus / Primary active systems */
+  --color-teal-rgb: 75, 139, 153;
+  --color-orange: #c77b28; /* Warning / Degraded / Alternate power */
+  --color-orange-rgb: 199, 123, 40;
+  --color-red: #c94b4b; /* CRITICAL / Alarm / Danger */
+  --color-red-rgb: 201, 75, 75;
+  --color-grey: #444444; /* Offline / Inactive */
+  --color-grey-rgb: 68, 68, 68;
+
+  /* Typography */
+  --text-main: #ffffff;
+  --text-muted: #888899;
+}
+
+html[data-mode="day"] {
+  --bg-base: #101316;
+  --bg-panel: #16191b;
+  --bg-panel-muted: #101314;
+  --text-muted: #9a9aab;
 }
 
 * {
@@ -14,70 +51,11 @@
 
 body {
   margin: 0;
+  background: var(--bg-base);
+  color: var(--text-main);
   font-family: system-ui, -apple-system, sans-serif;
-  background: var(--dr-bg);
-  color: var(--dr-fg);
 }
 
 dr-app {
   display: block;
-  padding: 1rem;
-}
-
-.dr-panel {
-  background: var(--dr-panel);
-  border: 1px solid #1f2937;
-  border-radius: 8px;
-  padding: 1rem;
-  margin-bottom: 1rem;
-}
-
-.dr-panel h2 {
-  margin: 0 0 0.75rem 0;
-  font-size: 1rem;
-  color: var(--dr-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.dr-headline {
-  display: flex;
-  gap: 1.5rem;
-  flex-wrap: wrap;
-}
-
-.dr-figure {
-  display: flex;
-  flex-direction: column;
-}
-
-.dr-figure .value {
-  font-size: 1.75rem;
-  font-weight: 600;
-}
-
-.dr-figure .label {
-  font-size: 0.75rem;
-  color: var(--dr-muted);
-}
-
-.dr-override {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.dr-override button {
-  font: inherit;
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  border: 1px solid #2d3748;
-  background: #1a202c;
-  color: var(--dr-fg);
-  cursor: pointer;
-}
-
-.dr-override button.engaged {
-  background: var(--dr-accent);
-  border-color: var(--dr-accent);
 }
