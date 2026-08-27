@@ -88,6 +88,24 @@ export function isoToSightTimeInput(iso, tz = "local") {
 }
 
 /**
+ * Stopwatch-method conversion: "N minutes N seconds ago" → ISO
+ * timestamp, relative to `now` (defaults to the moment of the call —
+ * the conversion must happen at entry, not at submission, so the
+ * offset stays anchored to when the navigator stopped the watch).
+ * Blank or non-finite values count as 0; negative offsets are clamped.
+ *
+ * @param {number|string} minutes
+ * @param {number|string} seconds
+ * @param {Date} [now]
+ * @returns {string} ISO timestamp
+ */
+export function stopwatchToIso(minutes, seconds, now = new Date()) {
+  const mins = Math.max(0, Number(minutes) || 0);
+  const secs = Math.max(0, Number(seconds) || 0);
+  return new Date(now.getTime() - (mins * 60 + secs) * 1000).toISOString();
+}
+
+/**
  * Great-circle destination point from [lat, lon], bearing (deg true),
  * distance (nm). Mirrors plugin/geo.js (kept self-contained so this
  * module loads in the browser without a bundler).

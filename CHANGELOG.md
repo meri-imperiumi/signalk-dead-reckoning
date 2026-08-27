@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deg/min/sec/hem fields.
 
 ### Added
+- **Stopwatch sight-time entry ("N min N sec ago")**: each sight
+  form's time field gains an `ago` mode — enter the minutes/seconds
+  elapsed since the sight was taken (stopwatch method) and the offset
+  converts to clock time **at entry**: every keystroke re-bases
+  "now", so the committed instant is anchored to when the navigator
+  stopped the watch, not when the form is submitted. The converted
+  time lands in the regular sight-time field (still editable; the
+  local/UTC toggle re-expresses it). Pure conversion in
+  `vm.stopwatchToIso()`.
 - **Running-fix visualization & interactive resolve** (work doc #13):
   - `POST /fix/resolve` candidates now carry per-observation
     `advancements` — the original reference point as taken, the

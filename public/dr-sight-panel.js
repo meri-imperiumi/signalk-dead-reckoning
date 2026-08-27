@@ -54,10 +54,29 @@ template.innerHTML = /* html */ `
     }
     .row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
     .row > label { flex: 1; min-width: 8rem; }
-    .sight-time { display: flex; gap: 0.75rem; align-items: end; }
+    .sight-time { display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap; }
     .sight-time > label { flex: 1; }
     .sight-time .tz-toggle { flex: 0 0 auto; }
     .sight-time .tz-toggle select { min-width: 6rem; }
+    .sight-time .ago-toggle { flex: 0 0 auto; }
+    .sight-time .ago-toggle select { min-width: 5.5rem; }
+    /* Stopwatch method ("N min N sec ago") — shown when the time mode
+       select is on "ago"; the converted clock time lands in the
+       sight_time field above. */
+    .sight-ago {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .sight-ago[hidden] { display: none; }
+    .sight-ago label { flex: 0 0 auto; }
+    .sight-ago input { width: 5rem; }
+    .sight-ago .ago-note {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      font-family: ui-monospace, "Fira Code", monospace;
+    }
     .check {
       display: flex;
       align-items: center;
@@ -138,6 +157,21 @@ template.innerHTML = /* html */ `
             <option value="utc">UTC</option>
           </select>
         </label>
+        <label class="ago-toggle" title="Stopwatch method: start a watch at the sight, then enter the minutes/seconds elapsed — converted to clock time as you type">
+          <select name="sight_time_mode">
+            <option value="clock">clock</option>
+            <option value="ago">ago</option>
+          </select>
+        </label>
+      </div>
+      <div class="sight-ago" hidden>
+        <label>Min ago
+          <input name="sight_ago_min" type="number" min="0" step="1" inputmode="numeric" placeholder="0" />
+        </label>
+        <label>Sec ago
+          <input name="sight_ago_sec" type="number" min="0" step="0.1" inputmode="numeric" placeholder="0" />
+        </label>
+        <span class="ago-note">converted on entry</span>
       </div>
       <fieldset class="coord" data-prefix="object">
         <legend>Object position (charted)</legend>
@@ -174,6 +208,21 @@ template.innerHTML = /* html */ `
             <option value="utc">UTC</option>
           </select>
         </label>
+        <label class="ago-toggle" title="Stopwatch method: start a watch at the sight, then enter the minutes/seconds elapsed — converted to clock time as you type">
+          <select name="sight_time_mode">
+            <option value="clock">clock</option>
+            <option value="ago">ago</option>
+          </select>
+        </label>
+      </div>
+      <div class="sight-ago" hidden>
+        <label>Min ago
+          <input name="sight_ago_min" type="number" min="0" step="1" inputmode="numeric" placeholder="0" />
+        </label>
+        <label>Sec ago
+          <input name="sight_ago_sec" type="number" min="0" step="0.1" inputmode="numeric" placeholder="0" />
+        </label>
+        <span class="ago-note">converted on entry</span>
       </div>
       <fieldset class="coord" data-prefix="center">
         <legend>Object position</legend>
@@ -217,6 +266,21 @@ template.innerHTML = /* html */ `
             <option value="utc">UTC</option>
           </select>
         </label>
+        <label class="ago-toggle" title="Stopwatch method: start a watch at the sight, then enter the minutes/seconds elapsed — converted to clock time as you type">
+          <select name="sight_time_mode">
+            <option value="clock">clock</option>
+            <option value="ago">ago</option>
+          </select>
+        </label>
+      </div>
+      <div class="sight-ago" hidden>
+        <label>Min ago
+          <input name="sight_ago_min" type="number" min="0" step="1" inputmode="numeric" placeholder="0" />
+        </label>
+        <label>Sec ago
+          <input name="sight_ago_sec" type="number" min="0" step="0.1" inputmode="numeric" placeholder="0" />
+        </label>
+        <span class="ago-note">converted on entry</span>
       </div>
       <label class="check" title="Meridian-altitude sight → latitude LOP only. Combine with a longitude source (another LOP/CPL) for a full fix.">
         <input type="checkbox" name="noon" />
@@ -316,6 +380,41 @@ class DrSightPanel extends HTMLElement {
         el.dataset.dirty = "true";
       });
     });
+
+    // Stopwatch method ("N min N sec ago"): entering an elapsed offset
+    // converts it into the sight_time field AT ENTRY — every keystroke
+    // re-bases "now", so the committed value is anchored to the moment
+    // the offset was entered, not to when the form is submitted.
+    for (const form of root.querySelectorAll(".form")) {
+      const modeSel = form.querySelector('select[name="sight_time_mode"]');
+      const agoRow = form.querySelector(".sight-ago");
+      const timeInput = form.querySelector('input[name="sight_time"]');
+      const tzSel = form.querySelector('select[name="sight_tz"]');
+      const minInput = form.querySelector('input[name="sight_ago_min"]');
+      const secInput = form.querySelector('input[name="sight_ago_sec"]');
+      if (
+        !modeSel ||
+        !agoRow ||
+        !timeInput ||
+        !tzSel ||
+        !minInput ||
+        !secInput
+      ) {
+        continue;
+      }
+      modeSel.addEventListener("change", () => {
+        agoRow.hidden = modeSel.value !== "ago";
+      });
+      const convert = () => {
+        // Wait until at least one offset field holds a value.
+        if (minInput.value === "" && secInput.value === "") return;
+        const iso = vm.stopwatchToIso(minInput.value, secInput.value);
+        timeInput.value = vm.isoToSightTimeInput(iso, tzSel.value);
+        timeInput.dataset.dirty = "true";
+      };
+      minInput.addEventListener("input", convert);
+      secInput.addEventListener("input", convert);
+    }
 
     root.querySelector("#close-btn")?.addEventListener("click", () => {
       this.endEdit();
@@ -559,6 +658,9 @@ class DrSightPanel extends HTMLElement {
       const wasEditing = this.editing != null;
       this.endEdit();
       form.reset();
+      // form.reset() restores the time-mode select's first option
+      // ("clock") — re-hide the stopwatch row to match.
+      for (const row of form.querySelectorAll(".sight-ago")) row.hidden = true;
       // Clear dirty flags so the next sight re-seeds from the boat.
       form.querySelectorAll('[data-dirty="true"]').forEach((el) => {
         delete el.dataset.dirty;
