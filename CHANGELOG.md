@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- The "Active method" headline shows a short watchkeeper-sized label
+  (`STW` for `inertial-paddlewheel`, `Polar`/`Zero` for the spec's
+  reserved methods) with the full token on hover — one of five figures,
+  it previously gave a full spec token permanent large-type real estate
+  despite having exactly one possible value today.
+
 ## [0.2.0] - 2026-08-27
 
 ### Fixed

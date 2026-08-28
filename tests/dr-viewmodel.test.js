@@ -197,6 +197,16 @@ test("divergenceText: no bearing below display resolution — it is the directio
   );
 });
 
+test("methodLabel: short watchkeeper-sized labels for the spec tokens", async () => {
+  const vm = await loadVm();
+  assert.strictEqual(vm.methodLabel("inertial-paddlewheel"), "STW");
+  assert.strictEqual(vm.methodLabel("inertial-polar"), "Polar");
+  assert.strictEqual(vm.methodLabel("fallback-zero"), "Zero");
+  assert.strictEqual(vm.methodLabel("something-new"), "—");
+  assert.strictEqual(vm.methodLabel(null), "—");
+  assert.strictEqual(vm.methodLabel(undefined), "—");
+});
+
 test("uncertaintySpec: passes radius/method with DR center", async () => {
   const vm = await loadVm();
   const u = vm.uncertaintySpec([60, 24], {

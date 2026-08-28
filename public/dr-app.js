@@ -576,11 +576,14 @@ class DrApp extends HTMLElement {
         this.shadowRoot.querySelector("#dr-log").textContent =
           `${Number(value ?? 0).toFixed(2)} nm`;
         break;
-      case "navigation.deadReckoning.method":
-        this.shadowRoot.querySelector("#dr-method").textContent = String(
-          value ?? "—",
-        );
+      case "navigation.deadReckoning.method": {
+        const methodEl = this.shadowRoot.querySelector("#dr-method");
+        methodEl.textContent = vm.methodLabel(value);
+        // Full spec token on hover — the short label is for the glance,
+        // the tooltip for the manual.
+        methodEl.title = typeof value === "string" ? value : "";
         break;
+      }
       case "navigation.deadReckoning.active":
         this.renderOverride(Boolean(value));
         break;

@@ -404,6 +404,27 @@ export function divergenceText(d) {
 }
 
 /**
+ * Short display label for the DR calculation method (SPEC §3.1). The
+ * wire value stays the spec token (`inertial-paddlewheel` etc.); the
+ * headline shows the watchkeeper-sized word for it.
+ *
+ * @param {string|null|undefined} method
+ * @returns {string}
+ */
+export function methodLabel(method) {
+  switch (method) {
+    case "inertial-paddlewheel":
+      return "STW";
+    case "inertial-polar":
+      return "Polar";
+    case "fallback-zero":
+      return "Zero";
+    default:
+      return "—";
+  }
+}
+
+/**
  * Formats seconds since the last confirmed fix for the headline figure —
  * the watchkeeper's fix-cadence cue ("how stale is my DR origin?").
  *
