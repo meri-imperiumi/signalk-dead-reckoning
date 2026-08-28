@@ -1740,7 +1740,17 @@ module.exports = (app) => {
               path: PATHS.log,
               value: {
                 units: "m",
-                displayUnits: { formula: "value/1852", symbol: "NM" },
+                // category: "custom" keeps the server's unit-preference
+                // system (ws.js rewrites displayUnits for category-less
+                // meta) from re-styling this as the user's global
+                // distance preference — a water-track log reads in NM.
+                displayUnits: {
+                  category: "custom",
+                  targetUnit: "NM",
+                  formula: "value/1852",
+                  inverseFormula: "value*1852",
+                  symbol: "NM",
+                },
                 displayName: "DR water-track log",
                 description:
                   "Cumulative water-track distance from STW (metres; NM via display units)",
@@ -1750,7 +1760,13 @@ module.exports = (app) => {
               path: PATHS.tripLog,
               value: {
                 units: "m",
-                displayUnits: { formula: "value/1852", symbol: "NM" },
+                displayUnits: {
+                  category: "custom",
+                  targetUnit: "NM",
+                  formula: "value/1852",
+                  inverseFormula: "value*1852",
+                  symbol: "NM",
+                },
                 displayName: "DR trip log",
                 description:
                   "Water-track distance since trip start (metres; NM via display units)",
@@ -1771,7 +1787,11 @@ module.exports = (app) => {
                 // Duration formatting for glance consumers (status
                 // tiles' headline/footers evaluate this formula to
                 // render "3h 05m" instead of raw seconds).
-                displayUnits: { formula: "formatDurationCompact(value)" },
+                displayUnits: {
+                  category: "custom",
+                  targetUnit: "duration",
+                  formula: "formatDurationCompact(value)",
+                },
                 displayName: "Time since last fix",
                 description:
                   "Seconds since the DR origin was last snapped to a confirmed fix — the watchkeeper's fix-cadence cue.",
@@ -1789,7 +1809,13 @@ module.exports = (app) => {
               path: PATHS.uncertaintyRadius,
               value: {
                 units: "m",
-                displayUnits: { formula: "value/1852", symbol: "NM" },
+                displayUnits: {
+                  category: "custom",
+                  targetUnit: "NM",
+                  formula: "value/1852",
+                  inverseFormula: "value*1852",
+                  symbol: "NM",
+                },
                 displayName: "DR uncertainty radius",
                 description:
                   "Scalar radius (m) of the DR uncertainty circle — sibling of navigation.deadReckoning.uncertainty for threshold checks and tile readouts that cannot read object subfields.",
@@ -1799,7 +1825,13 @@ module.exports = (app) => {
               path: PATHS.divergenceDistance,
               value: {
                 units: "m",
-                displayUnits: { formula: "value/1852", symbol: "NM" },
+                displayUnits: {
+                  category: "custom",
+                  targetUnit: "NM",
+                  formula: "value/1852",
+                  inverseFormula: "value*1852",
+                  symbol: "NM",
+                },
                 displayName: "DR-GPS divergence distance",
                 description:
                   "Scalar DR-to-GPS distance (m) — sibling of navigation.deadReckoning.divergence; null while suppressed (moored/anchored or no GPS) so consumers drop stale figures.",

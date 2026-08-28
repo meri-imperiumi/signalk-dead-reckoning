@@ -225,6 +225,10 @@ test("meta declares SI units, NM display conversion, and duration formatting", a
   const radiusMeta = metaByPath.get(SCALAR_RADIUS);
   assert.ok(radiusMeta, "no meta for uncertainty radius scalar");
   assert.strictEqual(radiusMeta.units, "m");
+  // category: "custom" pins our conversion — the server's unit-preference
+  // system rewrites category-less displayUnits to the user's global
+  // preference ("0.0 hour" on a seconds path).
+  assert.strictEqual(radiusMeta.displayUnits?.category, "custom");
   assert.strictEqual(radiusMeta.displayUnits?.formula, "value/1852");
   assert.strictEqual(radiusMeta.displayUnits?.symbol, "NM");
 
@@ -243,6 +247,7 @@ test("meta declares SI units, NM display conversion, and duration formatting", a
   );
   assert.ok(elapsedMeta, "no meta for elapsedSinceFix");
   assert.strictEqual(elapsedMeta.units, "s");
+  assert.strictEqual(elapsedMeta.displayUnits?.category, "custom");
   assert.strictEqual(
     elapsedMeta.displayUnits?.formula,
     "formatDurationCompact(value)",

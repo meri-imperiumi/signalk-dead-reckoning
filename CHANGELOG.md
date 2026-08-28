@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `navigation.deadReckoning.elapsedSinceFix` gains duration
     display-unit meta so glance consumers render "3h 05m", not
     seconds.
+  - All display-unit meta declares `category: "custom"` — the
+    server's unit-preference system rewrites category-less
+    `displayUnits` to the user's global preference (a seconds path
+    rendered as "0.0 hour"); custom keeps the nautical styling.
 - **Inbound sensor deltas are now interpreted per the Signal K unit
   conventions** (breaking for feeds that were publishing non-SI):
   `speedThroughWater`/`speedApparent` are read as m/s and heading paths
