@@ -79,6 +79,7 @@ const {
 const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
 const { reduceSight, reduceNoonSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
+const { registerPlotterExtension } = require("./plotterext.js");
 const { computeRadius } = require("./uncertainty.js");
 const {
   DEFAULT_FACTOR,
@@ -396,6 +397,9 @@ module.exports = (app) => {
 
   /** @type {WeatherCurrentClient|null} §6.2 tier-3 weather current poller */
   let weatherClient = null;
+
+  /** @type {(() => void)|null} plotter-extension provider teardown (work doc #19) */
+  let plotterExtTeardown = null;
 
   /**
    * Manual set-and-drift override (§6.2 tier 1): watchstander input,
@@ -738,6 +742,13 @@ module.exports = (app) => {
       publishMeta();
       setStatus("Dead reckoning started");
 
+      // Plotter-extension host integration (work doc #19): advertise
+      // the status-tile manifest to chart plotters (Freeboard-SK ≥3.0)
+      // and serve the iframe assets at a public, non-admin-gated route.
+      plotterExtTeardown = registerPlotterExtension(app, {
+        id: PLUGIN_ID,
+      });
+
       // Public config endpoint (CONFIG_PATH): mounted on the app so
       // anonymous / read-only clients can read the plugin config
       // (incl. positionFormat) without admin auth. Mirrors
@@ -793,6 +804,8 @@ module.exports = (app) => {
       weatherClient?.stop();
       weatherClient = null;
       training = null;
+      plotterExtTeardown?.();
+      plotterExtTeardown = null;
       // Hygiene: clear a live advisory so it doesn't linger after the
       // plugin stops monitoring.
       if (divergence?.active) {

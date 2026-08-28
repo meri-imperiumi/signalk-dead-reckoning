@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Plotter-extension status tile for Freeboard-SK (work doc #19)** —
+  the plugin now registers a `plotterExtensions` resource provider
+  (Plotter Extensions API v1) so chart plotters that host the
+  mechanism (Freeboard-SK ≥ 3.0) offer a "Dead Reckoning" widget:
+  a 2×1 glanceable tile showing GPS↔DR divergence, the DR uncertainty
+  radius, fix cadence and DR health (tracking / maneuver / fouled /
+  stale / warm), colored by severity like the webapp status line, with
+  an OVERRIDE badge when DR is authoritative and an amber night-mode
+  palette following the host's `nightMode` capability. Live values
+  arrive through the host's multiplexed Signal K relay (the tile opens
+  no connection of its own). The iframe assets are served from a new
+  publicly readable `/plotterext/signalk-dead-reckoning/` route (a
+  minimal in-repo static handler — the plugin stays zero-dependency);
+  discovery is the authenticated resources API, enablement is the
+  plugin's own enable switch. The bus client
+  (`signalk-plotterext-bus` 0.11.0, MIT) is vendored under
+  `public/vendor/plotterext-bus/` like Leaflet. The standalone webapp
+  is unaffected.
+
 ## [0.3.0] - 2026-08-27
 
 ### Added

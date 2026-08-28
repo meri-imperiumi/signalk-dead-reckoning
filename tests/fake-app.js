@@ -34,6 +34,10 @@ class FakeSignalKApp extends EventEmitter {
     this.errors = [];
     /** @type {Array<{path: string, handler: Function}>} app-level GET routes (e.g. public config endpoint) */
     this.appRoutes = [];
+    /** @type {Array<{type: string, methods: object}>} registered resource providers */
+    this.resourceProviders = [];
+    /** @type {Array<{path: string, handler: Function}>} app-level middleware mounts (e.g. plotterext static) */
+    this.middleware = [];
   }
 
   /**
@@ -43,6 +47,23 @@ class FakeSignalKApp extends EventEmitter {
    */
   get(path, handler) {
     this.appRoutes.push({ path, handler });
+  }
+
+  /**
+   * Records an Express middleware/static mount (e.g. plotterext assets).
+   * @param {string} path
+   * @param {Function} handler
+   */
+  use(path, handler) {
+    this.middleware.push({ path, handler });
+  }
+
+  /**
+   * Records a resource provider registration.
+   * @param {{type: string, methods: object}} provider
+   */
+  registerResourceProvider(provider) {
+    this.resourceProviders.push(provider);
   }
 
   getDataDirPath() {

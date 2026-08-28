@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- Plotter-extension status tile (Freeboard-SK & Plotter Extensions API
+     v1 hosts). Loaded inside the host's sandboxed widget iframe; all data
+     arrives over the host bus — no direct server connection is made. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dead Reckoning</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+      dr-ext-widget {
+        display: block;
+        height: 100%;
+      }
+    </style>
+    <script type="module" src="./dr-ext-widget.js"></script>
+  </head>
+  <body>
+    <dr-ext-widget></dr-ext-widget>
+  </body>
+</html>
