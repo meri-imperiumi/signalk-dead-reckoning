@@ -13,7 +13,9 @@
  *
  * Geometry/style decisions live in dr-viewmodel.js (pure); this file
  * is the Leaflet adapter. Leaflet is vendored at ./vendor/leaflet/
- * (BSD-2) — no CDN, no build tooling.
+ * (BSD-2) — no CDN, no build tooling. Vector `.pbf` charts render
+ * through MapLibre GL, vendored at ./vendor/maplibre-gl/ and mounted
+ * as one Leaflet layer via the official bridge (work doc #20).
  *
  * @file dr-map-view.js
  */
@@ -116,10 +118,16 @@ class DrMapView extends HTMLElement {
     root.appendChild(style);
     // Leaflet's CSS must live INSIDE the shadow root — a document-level
     // <link> can't reach the .leaflet-* classes Leaflet creates here.
+    // Same for MapLibre's: its canvas container (mounted by L.maplibreGL
+    // inside a Leaflet pane) needs .maplibregl-map etc. scoped here.
     const leafletCss = document.createElement("link");
     leafletCss.rel = "stylesheet";
     leafletCss.href = "./vendor/leaflet/leaflet.css";
     root.appendChild(leafletCss);
+    const maplibreCss = document.createElement("link");
+    maplibreCss.rel = "stylesheet";
+    maplibreCss.href = "./vendor/maplibre-gl/maplibre-gl.css";
+    root.appendChild(maplibreCss);
     const wrap = document.createElement("div");
     wrap.setAttribute("part", "map");
     wrap.className = "map-wrap";
@@ -225,6 +233,8 @@ class DrMapView extends HTMLElement {
     // when available, else the OSM online fallback. The first provider is
     // auto-selected either way — a blank chart on open reads as broken
     // (user feedback 2026-09); switching offline is one tap in the control.
+    // Vector charts (`format: 'pbf'`, work doc #20) mount MapLibre GL as
+    // one Leaflet layer via the vendored bridge; raster stay L.tileLayer.
     fetch("/signalk/v1/api/resources/charts")
       .then((r) => (r.ok ? r.json() : null))
       .then((resource) => {
@@ -233,11 +243,8 @@ class DrMapView extends HTMLElement {
           configured.length > 0 ? configured : [vm.DEFAULT_OSM_LAYER];
         const bases = {};
         for (const c of charts) {
-          const layer = L.tileLayer(c.url, {
-            minZoom: c.minZoom,
-            maxZoom: c.maxZoom,
-            maxNativeZoom: c.maxZoom,
-          });
+          const layer = this.chartLayer(c);
+          if (!layer) continue;
           this.tileLayers[c.identifier] = layer;
           // The control is keyed by display name — dedupe so two charts
           // sharing a name don't clobber each other's radio entry.
@@ -255,6 +262,34 @@ class DrMapView extends HTMLElement {
       .catch(() => {
         /* tile-less stays */
       });
+  }
+
+  /**
+   * Builds the Leaflet layer for a parsed chart: `L.maplibreGL` with a
+   * client-built vector style for `.pbf` charts (work doc #20), plain
+   * `L.tileLayer` for raster. Returns null when a vector chart can't be
+   * rendered (bridge or engine failed to load — script blocked/missing):
+   * adding it as an image layer would decode garbage, so it's skipped
+   * rather than shipped broken.
+   *
+   * @param {object} c - parsed chart layer (vm.parseChartLayers entry)
+   * @returns {object|null} Leaflet layer
+   */
+  chartLayer(c) {
+    if (vm.isVectorChart(c)) {
+      if (typeof L.maplibreGL !== "function") {
+        console.warn(
+          `vector chart ${c.identifier} skipped: MapLibre bridge not loaded`,
+        );
+        return null;
+      }
+      return L.maplibreGL({ style: vm.maplibreStyleFor(c) });
+    }
+    return L.tileLayer(c.url, {
+      minZoom: c.minZoom,
+      maxZoom: c.maxZoom,
+      maxNativeZoom: c.maxZoom,
+    });
   }
 
   /** @returns {void} */

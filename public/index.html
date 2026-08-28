@@ -9,6 +9,11 @@
       src="./vendor/leaflet/leaflet.js"
       onerror="console.error('failed to load leaflet.js')"
     ></script>
+    <!-- Vector (pbf) chart rendering: MapLibre GL engine + the
+         Leaflet bridge that binds it as one map layer (work doc #20).
+         Classic scripts like Leaflet — no build tooling. -->
+    <script src="./vendor/maplibre-gl/maplibre-gl.js"></script>
+    <script src="./vendor/maplibre-gl/leaflet-maplibre-gl.js"></script>
     <script type="module" src="./dr-signalk-stream.js"></script>
     <script type="module" src="./dr-app.js"></script>
   </head>

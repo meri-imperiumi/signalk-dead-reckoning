@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Vector chart tiles in the webapp map (work doc #20)** — charts
+  with `format: 'pbf'` in the server's configured charts resource
+  (NOAA ENC-derived S-57 MBTiles, an Open Waters passage cache, any
+  vector MBTiles served by `signalk-charts-provider-simple`) now
+  render instead of failing silently as broken image tiles. MapLibre
+  GL JS 5.24.0 and the official Leaflet bridge are vendored under
+  `public/vendor/maplibre-gl/` (same policy as Leaflet — no CDN, no
+  build step) and mounted via `L.maplibreGL`, so all DR overlays stay
+  plain Leaflet. The MapLibre style is built client-side by the pure
+  `maplibreStyleFor` (view-model): one vector source on the chart's
+  tile URL with native max zoom — vector charts keep rendering past
+  the raster maxNativeZoom ceiling — plus a dark sea background and
+  geometry-only fill/line/circle layers with marine styling for known
+  source-layer families (LNDARE/DEPARE/DEPCNT/COALNE/SOUNDG, generic
+  land/water/contour names, neutral palette otherwise). No symbol
+  layers, so no glyphs/sprite endpoints are ever requested — labels
+  remain the future corridor-downloader side of the blueprint.
 - **Plotter-extension status tile for Freeboard-SK (work doc #19)** —
   the plugin now registers a `plotterExtensions` resource provider
   (Plotter Extensions API v1) so chart plotters that host the

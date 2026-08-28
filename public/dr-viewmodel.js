@@ -510,10 +510,14 @@ export function elapsedText(s) {
  * to serve (often offline MBTiles); the fallback lives in
  * DEFAULT_OSM_LAYER / chartLayersWithFallback.
  *
+ * Vector charts (`format: 'pbf'`, work doc #20) carry their format and
+ * the resource's vector source-layer ids (`chartLayers`) through so the
+ * map view can render them with MapLibre instead of an image tileLayer.
+ *
  * Ported from signalk-logbook's src/helpers/charts.js (same server API).
  *
  * @param {object|null|undefined} resource - GET /signalk/v1/api/resources/charts
- * @returns {Array<{identifier: string, name: string, url: string, minZoom: number, maxZoom: number}>}
+ * @returns {Array<{identifier: string, name: string, url: string, minZoom: number, maxZoom: number, format?: string, chartLayers?: string[]}>}
  */
 export function parseChartLayers(resource) {
   if (!resource || typeof resource !== "object") {
@@ -525,16 +529,208 @@ export function parseChartLayers(resource) {
       if (!chart?.tilemapUrl) {
         return null;
       }
-      return {
+      const layer = {
         identifier: chart.identifier || key,
         name: chart.name || chart.identifier || key,
         url: chart.tilemapUrl,
         minZoom: typeof chart.minzoom === "number" ? chart.minzoom : 0,
         maxZoom: typeof chart.maxzoom === "number" ? chart.maxzoom : 19,
       };
+      if (typeof chart.format === "string" && chart.format.length > 0) {
+        layer.format = chart.format.toLowerCase();
+      }
+      if (Array.isArray(chart.chartLayers)) {
+        layer.chartLayers = chart.chartLayers.filter(
+          (id) => typeof id === "string" && id.length > 0,
+        );
+      }
+      return layer;
     })
     .filter((layer) => layer !== null)
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Whether a parsed chart layer is a vector (Mapbox/MapLibre `.pbf`) tile
+ * set that Leaflet's raster engine can't draw — the cue for
+ * `<dr-map-view>` to mount it via `L.maplibreGL` instead (work doc #20).
+ *
+ * @param {{format?: string}|null|undefined} chart - parsed chart layer
+ * @returns {boolean}
+ */
+export function isVectorChart(chart) {
+  return chart?.format === "pbf";
+}
+
+/**
+ * Marine-tactical palette for the generated vector style: dark sea
+ * background to match the app theme, land/depth families keyed by the
+ * source-layer names chart producers actually use (S-57 ENC layer ids
+ * from NOAA-converted MBTiles, generic OSM-ish names otherwise).
+ * Geometry-only — no symbol layers, so no glyphs/sprite endpoints are
+ * ever requested (offline-first; labels are the downloader-side seam).
+ *
+ * @typedef {{kind: "land"|"water"|"coastline"|"contour"|"point", styles: object}} VectorLayerFamily
+ */
+const VECTOR_LAYER_FAMILIES = [
+  // Land masses and built-up areas → solid dark-olive fills.
+  {
+    kind: "land",
+    match: [/^land$/i, /^landcover$/i, /^landuse$/i, /^lndare$/i],
+    styles: {
+      fill: { "fill-color": "#2a3a2e", "fill-opacity": 0.9 },
+      line: { "line-color": "#3d4f40", "line-width": 0.6 },
+    },
+  },
+  // Depth / water areas → translucent deep-blue fills.
+  {
+    kind: "water",
+    match: [/^water$/i, /^depare$/i, /^sea$/i, /^ocean$/i],
+    styles: {
+      fill: { "fill-color": "#102a3d", "fill-opacity": 0.55 },
+      line: { "line-color": "#1c3c52", "line-width": 0.5 },
+    },
+  },
+  // Coastlines → the crisp reference edge over the fills.
+  {
+    kind: "coastline",
+    match: [/^coalne$/i, /^coastline$/i, /^shoreline$/i],
+    styles: {
+      line: { "line-color": "#7fa3b0", "line-width": 1.2 },
+    },
+  },
+  // Depth contours / bathymetry → thin mid-blue lines.
+  {
+    kind: "contour",
+    match: [/^depcnt$/i, /^contour/i, /^depth_contour$/i],
+    styles: {
+      line: { "line-color": "#2f5a70", "line-width": 0.8 },
+    },
+  },
+  // Soundings / spot points → tiny dots.
+  {
+    kind: "point",
+    match: [/^soundg$/i, /^sounding/i, /^soundings$/i],
+    styles: {
+      circle: { "circle-color": "#4b8b99", "circle-radius": 1.5 },
+    },
+  },
+];
+
+/** Fallback family for source layers no pattern matches. */
+const VECTOR_DEFAULT_FAMILY = {
+  kind: "default",
+  match: [],
+  styles: {
+    fill: { "fill-color": "#1c2830", "fill-opacity": 0.35 },
+    line: { "line-color": "#6a7a86", "line-width": 0.8 },
+    circle: { "circle-color": "#6a7a86", "circle-radius": 1.5 },
+  },
+};
+
+/**
+ * Classifies a vector source-layer id into its styling family.
+ *
+ * @param {string} layerId
+ * @returns {VectorLayerFamily}
+ */
+function vectorLayerFamily(layerId) {
+  for (const family of VECTOR_LAYER_FAMILIES) {
+    if (family.match.some((re) => re.test(layerId))) return family;
+  }
+  return VECTOR_DEFAULT_FAMILY;
+}
+
+/**
+ * Builds a complete MapLibre style for a vector chart layer, entirely
+ * client-side: one vector source on the chart's `tilemapUrl` (relative
+ * URLs resolve against the app origin), a dark sea background, and a
+ * fill/line/circle trio per source layer — a line layer only draws line
+ * features, fills only polygons, circles only points, so the trio covers
+ * any geometry without knowing the schema. The source's `maxzoom` is the
+ * *native* tile max, so MapLibre keeps overzooming vector data past it
+ * (the raster path's maxNativeZoom behaviour, but sharper). No symbol
+ * layers: without a glyphs endpoint they can't render, and hosting one
+ * is the corridor-downloader side of the blueprint, not ours.
+ *
+ * @param {{identifier: string, name: string, url: string, minZoom: number, maxZoom: number, format?: string, chartLayers?: string[]}} chart
+ * @returns {{version: number, name: string, sources: object, layers: Array<object>}} MapLibre style spec object
+ */
+export function maplibreStyleFor(chart) {
+  const sourceId = `${chart.identifier.replace(/[^\w.-]/g, "_")}`;
+  // Without the resource's vector_layers metadata, guess the conventional
+  // single-layer name (the chart identifier) — best-effort, documented.
+  // Duplicated ids in the metadata table would yield duplicate MapLibre
+  // layer ids (undefined rendering), so they're deduped first.
+  const sourceLayers = [
+    ...new Set(
+      chart.chartLayers && chart.chartLayers.length > 0
+        ? chart.chartLayers
+        : [chart.identifier],
+    ),
+  ];
+
+  const families = sourceLayers.map((id) => ({
+    id,
+    family: vectorLayerFamily(id),
+  }));
+
+  const layers = [
+    {
+      id: "background",
+      type: "background",
+      paint: { "background-color": "#0b1b26" },
+    },
+  ];
+  // Paint order matters: area fills under lines under points; land
+  // before water so islands don't drown (both translucent otherwise).
+  const byKind = (kind) => families.filter((f) => f.family.kind === kind);
+  for (const kind of ["land", "water", "default", "coastline", "contour"]) {
+    for (const { id, family } of byKind(kind)) {
+      if (!family.styles.fill) continue;
+      layers.push({
+        id: `${sourceId}-${id}-fill`,
+        type: "fill",
+        source: sourceId,
+        "source-layer": id,
+        paint: family.styles.fill,
+      });
+    }
+  }
+  for (const { id, family } of families) {
+    if (!family.styles.line) continue;
+    layers.push({
+      id: `${sourceId}-${id}-line`,
+      type: "line",
+      source: sourceId,
+      "source-layer": id,
+      paint: family.styles.line,
+    });
+  }
+  for (const { id, family } of families) {
+    if (!family.styles.circle) continue;
+    layers.push({
+      id: `${sourceId}-${id}-circle`,
+      type: "circle",
+      source: sourceId,
+      "source-layer": id,
+      paint: family.styles.circle,
+    });
+  }
+
+  return {
+    version: 8,
+    name: chart.name,
+    sources: {
+      [sourceId]: {
+        type: "vector",
+        tiles: [chart.url],
+        minzoom: chart.minZoom,
+        maxzoom: chart.maxZoom,
+      },
+    },
+    layers,
+  };
 }
 
 /**
