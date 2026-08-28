@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`inertial-polar` DR speed fallback (SPEC §3.1, work doc #18)** —
+  when the paddlewheel is unusable (`navigation.speedThroughWater`
+  missing, or the debounced §6.3 fouling verdict active), DR integrates
+  speed from the polar performance plugin's `performance.polarSpeed`
+  delta instead of freezing: requires `signalk-polar-performance-plugin`
+  installed and configured with its polar speed output enabled; the
+  super-jittery raw delta is running-averaged (default 60 s window,
+  30 s staleness cutoff) before integration. Gated to underway+sailing
+  (no wind-on-mast drift at the dock, no meaningless polar under
+  power); no matrix corrections while on polar (bins were trained on
+  real STW — a model estimate is circular input); uncertainty grows at
+  the fallback rate; Training Mode and maneuver detection suspended;
+  the divergence advisory keeps watching. `navigation.speedThroughWater`
+  stays silent while on polar (a model estimate is not a measurement).
+  The DR state value gains `speedSource: "paddlewheel"|"polar"`, and a
+  §3.1 sensor-health alert names the switch (paddlewheel
+  unavailable/fouled — DR on polar-derived speed).
+
 ### Changed
+- `navigation.deadReckoning.method` now reflects the actual speed
+  source every tick, completing the SPEC §3.1 enum: the idle branch
+  (no usable speed at all) publishes `fallback-zero` instead of
+  inheriting the constructor's `inertial-paddlewheel` — the `Polar`/
+  `Zero` headline labels added earlier are now driven by real values.
+  SPEC §3.1/§3.2/§6.1 aligned with the implemented fallback hierarchy
+  (polar first, fault-based selection, speed output silent on polar).
 - The "Active method" headline shows a short watchkeeper-sized label
   (`STW` for `inertial-paddlewheel`, `Polar`/`Zero` for the spec's
   reserved methods) with the full token on hover — one of five figures,

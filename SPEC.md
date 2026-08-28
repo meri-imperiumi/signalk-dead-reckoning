@@ -38,10 +38,10 @@ The three motivations are causally linked: (1) generates the fix data and crew e
 |---|---|---|
 | `navigation.deadReckoning.position` | `{ latitude, longitude, altitude }` | **Always-on** 1Hz inertial "shadow boat" position — computed continuously regardless of mode. |
 | `navigation.deadReckoning.active` | boolean | Whether DR is currently the *authoritative* source feeding `navigation.position` (i.e. OVERRIDE engaged), as distinct from merely running in the background. |
-| `navigation.deadReckoning.method` | string: `inertial-polar` \| `inertial-paddlewheel` \| `fallback-zero` | Active state calculation mode. |
+| `navigation.deadReckoning.method` | string: `inertial-polar` \| `inertial-paddlewheel` \| `fallback-zero` | Active speed-source mode, re-published every tick: `inertial-paddlewheel` while the paddlewheel serves (raw STW present, not fouled); `inertial-polar` when it doesn't and the polar fallback can engage (§6.1); `fallback-zero` when no usable speed source exists (DR holds position). Selection is fault-based, never merit-based — a working measurement always outranks a model. |
 | `navigation.deadReckoning.log` | number (nm) | Cumulative **water-track** distance, integrated from STW. Independent of GPS. |
 | `navigation.deadReckoning.trip.log` | number (nm) | Same, reset at trip boundaries (see §9.2). |
-| `navigation.speedThroughWater` | number | Calibrated STW output (matrix-corrected). |
+| `navigation.speedThroughWater` | number | Calibrated STW output (matrix-corrected). Silent while the polar fallback is active — a model estimate must not masquerade as a measurement. |
 | `navigation.headingTrue` | number | Calibrated true heading (corrected for dynamic deviation). |
 | `environment.current` | `{ setTrue, drift, meta: { source, expiresAt } }` | Current vector broadcast, per §6.2 hierarchy. |
 | `notifications.navigation.gpsSpoofed` | alarm state | High-severity: sudden position discontinuity inconsistent with DR/physics, or at-anchor/moored displacement beyond plausible bound. See §7. |
@@ -55,6 +55,7 @@ The three motivations are causally linked: (1) generates the fix data and crew e
 | `navigation.position` | GPS baseline for training mode and anomaly detection. |
 | `navigation.speedThroughWater`, `navigation.headingMagnetic`, `navigation.attitude` | Raw sensor inputs (heel/pitch). |
 | `environment.wind.angleApparent`, `environment.wind.speedApparent` | Wind inputs for leeway/upwash modeling. |
+| `performance.polarSpeed` | Polar-derived boat speed (m/s) from `signalk-polar-performance-plugin` — requirement for the §6.1 `inertial-polar` fallback: that plugin installed and configured with its polar-speed output enabled. The raw delta is a step-function polar lookup driven by gusty wind and is **running-averaged** before integration; sustained nulls (wind out-of-table) age the average out to staleness rather than decaying it toward zero. |
 | `navigation.sails` | Active sail configuration, from `signalk-logbook`. |
 | `environment.seaState` | Sea state tier, from logbook watch entries. |
 | `navigation.state` | `anchored` \| `moored` \| `sailing` \| `motoring` \| ... — trip boundaries, and the anchored/moored anomaly-detection gates. |
@@ -273,7 +274,14 @@ Worker Thread (DR Physics)
 
 **Inference Mode** — active when `isGpsReliable = false` OR OVERRIDE is manually engaged:
 - Freezes matrix learning. Reads raw sensors, looks up matching bins, applies corrections, integrates the resolved current vector, publishes `navigation.deadReckoning.position` as authoritative (`navigation.deadReckoning.active = true`).
-- If the paddlewheel is fouled during Inference Mode, falls back to GPS-SOG-derived speed (if GPS is at least partially available) or holds last-known-good STW with explicitly faster-growing uncertainty (if not) — distinct fallback branch from the "GPS unreliable" case, since the two can occur independently or together.
+
+**Speed-source fallback** — mode-independent (the shadow boat integrates regardless of GPS trust, §5, so a sensor lost in NORMAL mode is handled the same way as one lost in Inference/OVERRIDE). A fouled or silent paddlewheel degrades the speed source by preference:
+
+1. **Polar-derived speed** — the running-averaged `performance.polarSpeed` (§3.2). Gated to underway + sailing: wind on a moored mast must not sail the shadow boat off the dock, and a polar is meaningless under power. While on this source: no matrix corrections (leeway/speed-loss bins were trained on real paddlewheel STW — feeding them a model estimate is circular), uncertainty grows at the fallback rate, and matrix training / maneuver detection are suspended (never train on synthetic input — same principle as the §6.3/§6.4 write gates). The divergence advisory (§7.3) keeps watching: model drift must be detected even though it never re-selects the method.
+2. **GPS-SOG-derived speed** — if no polar source is available and GPS is at least partially available.
+3. **Hold last-known-good STW** — with explicitly faster-growing uncertainty, if neither.
+
+The paddlewheel-failure fallback is a distinct branch from the "GPS unreliable" case, since the two can occur independently or together.
 
 ### 6.2 Current Hierarchy of Truth
 

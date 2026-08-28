@@ -75,6 +75,7 @@ test("start subscribes to the SPEC §3.2 sensor paths", () => {
     "environment.wind.angleApparent",
     "navigation.state",
     "propulsion.main.state",
+    "performance.polarSpeed",
   ]) {
     assert.ok(subscribed.includes(path), `not subscribed to ${path}`);
   }
@@ -2599,6 +2600,29 @@ async function emitMovingGps(app, speedKn, fixes = 6) {
   }
 }
 
+/** m/s value for a knot figure — `performance.polarSpeed` unit (§3.1). */
+function polarMs(kn) {
+  return (kn * 1852) / 3600;
+}
+
+/**
+ * Emits a `performance.polarSpeed` delta stream (m/s), as the polar
+ * performance plugin does on every wind update.
+ *
+ * @param {FakeSignalKApp} app
+ * @param {number[]} msValues
+ * @param {number} [intervalMs]
+ */
+async function emitPolarSpeed(app, msValues, intervalMs = 50) {
+  for (const v of msValues) {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [{ values: [{ path: "performance.polarSpeed", value: v }] }],
+    });
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 function lastValues(app, path) {
   return app.handledMessages
     .filter((m) =>
@@ -2752,6 +2776,348 @@ test("fouled paddlewheel: STW 0 while making way raises fouling alert + state fl
     // Elapsed-since-fix figure is published for the UI headline.
     const elapsed = lastValues(app, "navigation.deadReckoning.elapsedSinceFix");
     assert.ok(elapsed.length > 0, "no elapsedSinceFix delta");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+// --- inertial-polar: polar-derived STW fallback (SPEC §3.1, work doc #18) --
+
+test("inertial-polar: missing STW + polar deltas → integrates averaged polar speed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-missing-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    // No STW, no polar yet → honest idle with the fallback-zero token.
+    await new Promise((r) => setTimeout(r, 250));
+    let methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.ok(methods.length > 0, "no method delta published");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "fallback-zero",
+      JSON.stringify(methods.slice(-3)),
+    );
+
+    await emitPolarSpeed(app, Array(8).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 300));
+
+    methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "inertial-polar",
+      JSON.stringify(methods.slice(-3)),
+    );
+
+    const states = lastValues(app, "navigation.deadReckoning.state").filter(
+      (s) => s.status === "underway",
+    );
+    assert.ok(states.length > 0, "no underway state on polar");
+    assert.strictEqual(
+      states[states.length - 1].speedSource,
+      "polar",
+      JSON.stringify(states[states.length - 1]),
+    );
+
+    // DR advanced on the averaged polar speed (heading 90° → east).
+    const positions = lastValues(app, "navigation.deadReckoning.position");
+    assert.ok(positions.length > 1, "no DR positions on polar");
+    assert.ok(
+      positions[positions.length - 1].longitude > positions[0].longitude,
+      `DR did not advance: ${JSON.stringify(positions.map((p) => p.longitude))}`,
+    );
+
+    // The sensor STW output stays silent — a polar estimate is a model,
+    // not a measurement, and must not masquerade as one.
+    assert.strictEqual(
+      lastValues(app, "navigation.speedThroughWater").length,
+      0,
+      "plugin published navigation.speedThroughWater while on polar",
+    );
+
+    // Uncertainty grows at the fallback rate: no trusted bin for a
+    // model-derived speed.
+    const unc = lastValues(app, "navigation.deadReckoning.uncertainty");
+    assert.strictEqual(unc[unc.length - 1].method, "fallback");
+
+    // Sensor-health alert names the missing paddlewheel and the switch.
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.ok(
+      alerts.some(
+        (a) => a.state === "alert" && /polar-derived/.test(a.message),
+      ),
+      `no polar alert: ${JSON.stringify(alerts)}`,
+    );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("inertial-polar: fouled paddlewheel switches DR onto polar speed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-fouled-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 50,
+    saveIntervalMs: 60000,
+    sensorHealth: { sustainS: 0.1, clearS: 0.1 },
+  });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 0 },
+            { path: "navigation.headingTrue", value: 90 },
+            // Wind corroborates making-way (§6.3's AWS path) — constant,
+            // unlike a GPS-derived SOG whose EMA drains once fixes stop
+            // changing, which would clear the fouling verdict mid-test.
+            { path: "environment.wind.speedApparent", value: 12 },
+          ],
+        },
+      ],
+    });
+    // Fouled STW reads 0 (a number) — the underway branch would
+    // integrate near-zero speed without the polar fallback. Feed the
+    // polar stream until the debounced fouling verdict lands and the
+    // source switches.
+    await emitPolarSpeed(app, Array(20).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 300));
+
+    const methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.ok(
+      methods.includes("inertial-polar"),
+      `method never switched to polar: ${JSON.stringify(methods.slice(-5))}`,
+    );
+
+    // The fouling verdict stays live and the alert names the switch.
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.fouled, true, JSON.stringify(last));
+    assert.strictEqual(last.speedSource, "polar");
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.ok(
+      alerts.some(
+        (a) =>
+          a.state === "alert" &&
+          /fouled/.test(a.message) &&
+          /polar/.test(a.message),
+      ),
+      `no fouled+switch alert: ${JSON.stringify(alerts)}`,
+    );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("inertial-polar: stale polar feed drops DR to the honest idle branch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-stale-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 50,
+    saveIntervalMs: 60000,
+    polar: { windowS: 60, staleS: 0.3 },
+  });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    await emitPolarSpeed(app, Array(5).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 200));
+    const methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(methods[methods.length - 1], "inertial-polar");
+
+    // Feed goes quiet past the staleness cutoff → idle, fallback-zero.
+    await new Promise((r) => setTimeout(r, 600));
+    const methods2 = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods2[methods2.length - 1],
+      "fallback-zero",
+      JSON.stringify(methods2.slice(-3)),
+    );
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "idle");
+    assert.strictEqual(last.reason, "no speed through water");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("inertial-polar: moored gate — wind on the mast must not sail the shadow boat", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-moored-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "navigation.state", value: "moored" },
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    await emitPolarSpeed(app, Array(6).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 250));
+    const methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.ok(
+      !methods.includes("inertial-polar"),
+      `polar engaged while moored: ${JSON.stringify(methods)}`,
+    );
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "idle");
+    assert.strictEqual(last.reason, "moored");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("inertial-polar: motoring gate — a polar is meaningless under power", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-motoring-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "propulsion.main.state", value: "started" },
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    await emitPolarSpeed(app, Array(6).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 250));
+    const methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.ok(
+      !methods.includes("inertial-polar"),
+      `polar engaged while motoring: ${JSON.stringify(methods)}`,
+    );
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "idle");
+    assert.strictEqual(last.reason, "no speed through water");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("inertial-polar: paddlewheel recovery flips method back and clears the alert", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-recover-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    await emitPolarSpeed(app, Array(6).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 200));
+    let methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(methods[methods.length - 1], "inertial-polar");
+
+    // The paddlewheel comes back → paddlewheel authority restored.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        { values: [{ path: "navigation.speedThroughWater", value: 5 }] },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "inertial-paddlewheel",
+      JSON.stringify(methods.slice(-3)),
+    );
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    assert.strictEqual(states[states.length - 1].speedSource, "paddlewheel");
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.ok(
+      alerts.some(
+        (a) => a.state === "normal" && /sensor health nominal/.test(a.message),
+      ),
+      `no clear transition: ${JSON.stringify(alerts)}`,
+    );
   } finally {
     plugin.stop();
   }

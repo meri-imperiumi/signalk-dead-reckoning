@@ -52,7 +52,16 @@ const {
   detectManeuver,
   SOG_MOVING_KN,
 } = require("./training.js");
-const { resolveCurrent, WeatherCurrentClient } = require("./current.js");
+const {
+  resolveCurrent,
+  WeatherCurrentClient,
+  MS_TO_KN,
+} = require("./current.js");
+const {
+  createPolarSpeedState,
+  polarSpeedSample,
+  polarSpeedAverage,
+} = require("./polar.js");
 const { distanceNm, bearingDeg } = require("./geo.js");
 const {
   recordLineOfPosition,
@@ -192,6 +201,11 @@ const SUBSCRIPTION_PATHS = [
   "navigation.attitude",
   "environment.wind.angleApparent",
   "environment.wind.speedApparent",
+  // §3.1 inertial-polar fallback: polar-derived STW from the polar
+  // performance plugin (requirement: installed & configured with the
+  // "polar speed" output enabled). Running-averaged before use — the
+  // raw delta flaps gust-by-gust (work doc #18).
+  "performance.polarSpeed",
   "navigation.state",
   "propulsion.main.state",
   // Sea state: SPEC §3.2 subscribes environment.seaState; the logbook
@@ -231,6 +245,23 @@ const DEFAULT_CONFIG = {
   sensorHealth: {
     sustainS: 10,
     clearS: 10,
+  },
+  /**
+   * §3.1 inertial-polar fallback (work doc #18): running-average window
+   * and staleness cutoff for `performance.polarSpeed`. The raw delta is
+   * a step-function polar lookup driven by gusty wind — averaged over
+   * windowS before integration. Once the feed is quiet for staleS
+   * (e.g. wind out-of-table → nulls), DR falls to the honest idle
+   * branch instead of holding a frozen speed.
+   */
+  polar: {
+    enabled: true,
+    windowS: 60,
+    // Shorter than the averaging window on purpose: a quiet feed drops
+    // DR off polar promptly, before the window has fully emptied —
+    // raising it above windowS can only loosen, never extend, the
+    // effective cutoff (window eviction empties the average first).
+    staleS: 30,
   },
   logbook: {
     enabled: false,
@@ -305,6 +336,9 @@ const deps = {
   WeatherCurrentClient,
   trainingTick,
   detectManeuver,
+  createPolarSpeedState,
+  polarSpeedSample,
+  polarSpeedAverage,
   distanceNm,
   bearingDeg,
 };
@@ -381,12 +415,22 @@ module.exports = (app) => {
   let prevLogNm = 0;
 
   /**
-   * Active sensor-health issue ("idle-moving" | "fouled" | null) —
-   * tracked so the §3.1 status notification publishes on transitions
-   * only, mirroring the divergence advisory's hysteresis.
+   * Active sensor-health issue ("idle-moving" | "fouled" | "polar" |
+   * null) — tracked so the §3.1 status notification publishes on
+   * transitions only, mirroring the divergence advisory's hysteresis.
    * @type {string|null}
    */
   let sensorHealthIssue = null;
+
+  /**
+   * Last sensor-health message published. Re-publishing on a message
+   * change (same issue) matters when the situation evolves under a
+   * live alert — e.g. the fouling verdict lands a tick before the
+   * inertial-polar fallback engages, and the watchkeeper must not be
+   * left reading "integrating near-zero speed" while DR is on polar.
+   * @type {string|null}
+   */
+  let sensorHealthMessage = null;
 
   /** @type {TrainingState|null} */
   let training = null;
@@ -407,6 +451,21 @@ module.exports = (app) => {
 
   /** @type {ReturnType<typeof createFlagState>|null} */
   let movingFlag = null;
+
+  /**
+   * §3.1 inertial-polar (work doc #18): running average of
+   * `performance.polarSpeed` deltas from the polar performance plugin —
+   * sampled on arrival in feedDelta, read once per tick.
+   * @type {ReturnType<typeof createPolarSpeedState>|null}
+   */
+  let polarState = null;
+
+  /**
+   * Previous tick's debounced fouling verdict — the inertial-polar
+   * source decision reads it before this tick's training pass runs.
+   * @type {boolean}
+   */
+  let fouledActive = false;
 
   /** @type {object|null} §9.5 logbook write-through client */
   let logbook = null;
@@ -491,6 +550,23 @@ module.exports = (app) => {
           title: "Weather current poll interval (ms)",
           default: DEFAULT_CONFIG.weatherCurrent.intervalMs,
         },
+        "polar.enabled": {
+          type: "boolean",
+          title: "Use polar-derived speed when the paddlewheel is unavailable",
+          description:
+            "When speed through water is missing or the paddlewheel is fouled, integrate the running-averaged performance.polarSpeed from signalk-polar-performance-plugin (SPEC §3.1 inertial-polar). Requires that plugin installed and configured with its polar speed output enabled.",
+          default: DEFAULT_CONFIG.polar.enabled,
+        },
+        "polar.windowS": {
+          type: "integer",
+          title: "Polar speed running-average window (s)",
+          default: DEFAULT_CONFIG.polar.windowS,
+        },
+        "polar.staleS": {
+          type: "integer",
+          title: "Polar speed staleness cutoff (s)",
+          default: DEFAULT_CONFIG.polar.staleS,
+        },
       },
     },
 
@@ -516,6 +592,10 @@ module.exports = (app) => {
       config.weatherCurrent = {
         ...DEFAULT_CONFIG.weatherCurrent,
         ...(options?.weatherCurrent ?? {}),
+      };
+      config.polar = {
+        ...DEFAULT_CONFIG.polar,
+        ...(options?.polar ?? {}),
       };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
@@ -580,6 +660,8 @@ module.exports = (app) => {
       divergence = deps.createDivergenceState();
       fouledFlag = deps.createFlagState();
       movingFlag = deps.createFlagState();
+      polarState = deps.createPolarSpeedState();
+      fouledActive = false;
       clockS = 0;
 
       // Seed the engine origin from the last known good position, if any.
@@ -704,6 +786,8 @@ module.exports = (app) => {
       divergence = null;
       fouledFlag = null;
       movingFlag = null;
+      polarState = null;
+      fouledActive = false;
       if (sensorHealthIssue) {
         publishNotification(PATHS.sensorHealth, {
           state: "normal",
@@ -711,6 +795,7 @@ module.exports = (app) => {
         });
         sensorHealthIssue = null;
       }
+      sensorHealthMessage = null;
       gpsMotion = { lastGps: null, speedKn: null };
       idleRunNm = 0;
       prevLogNm = 0;
@@ -748,6 +833,17 @@ module.exports = (app) => {
             if (pos)
               snapToFix(pos, "gps", { confirmed_by: null, resets: true });
           }
+        }
+        // §3.1 inertial-polar: sample each polar-speed delta (m/s → kn)
+        // into the running average. Nulls (wind out-of-table) sample
+        // nothing — the average must age out, not decay toward zero.
+        if (v.path === "performance.polarSpeed" && polarState) {
+          const ms = unwrapNumber(v.value);
+          deps.polarSpeedSample(
+            polarState,
+            { tsMs: Date.now(), speedKn: ms == null ? null : ms * MS_TO_KN },
+            { windowMs: config.polar.windowS * 1000 },
+          );
         }
       }
     }
@@ -844,7 +940,32 @@ module.exports = (app) => {
     // Heading: prefer true heading; fall back to magnetic (WMM correction
     // applied upstream in v1 — see SPEC §12). If neither, hold position.
     const headingTrueDeg = headingTrue ?? headingMag;
-    if (headingTrueDeg == null || rawStw == null) {
+
+    // §3.1 `inertial-polar` (work doc #18): polar-derived STW fallback.
+    // When the paddlewheel is missing (null) or sustained-fouled (§6.3
+    // verdict — the previous tick's debounced value, since this tick's
+    // training pass hasn't run yet), the polar performance plugin's
+    // `performance.polarSpeed` — running-averaged, since the raw delta
+    // flaps gust-by-gust — keeps the shadow boat tracking instead of
+    // freezing. Gates: underway (wind on a moored mast must not sail the
+    // shadow boat off the dock), sailing (a polar is meaningless under
+    // power), a live non-stale average, and a heading to steer it by.
+    const polar = config.polar.enabled
+      ? deps.polarSpeedAverage(polarState, {
+          nowMs: Date.now(),
+          windowMs: config.polar.windowS * 1000,
+          staleMs: config.polar.staleS * 1000,
+        })
+      : { averageKn: null, sampleCount: 0, stale: true };
+    const onPolar =
+      polar.averageKn != null &&
+      !polar.stale &&
+      underway &&
+      deltaState.get("propulsion.main.state") !== "started" &&
+      headingTrueDeg != null &&
+      (rawStw == null || fouledActive);
+
+    if (headingTrueDeg == null || (rawStw == null && !onPolar)) {
       // Publish why DR is idle so the UI (SPEC §14.1) can explain the empty
       // readout instead of leaving the user to guess. The vessel isn't
       // necessarily broken — moored/anchored with no STW/heading is normal.
@@ -898,8 +1019,10 @@ module.exports = (app) => {
           : null,
       );
 
+      engine.method = "fallback-zero";
       publish({
         [PATHS.state]: { status: "idle", reason, moving },
+        [PATHS.method]: engine.method,
         ...(uncertaintyValue ? { [PATHS.uncertainty]: uncertaintyValue } : {}),
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
       });
@@ -908,17 +1031,27 @@ module.exports = (app) => {
 
     // Look up learned corrections for the current condition. Sail/sea state
     // come from the logbook peer when available; absent here they fall to
-    // 'unknown' (SPEC §4.1).
+    // 'unknown' (SPEC §4.1). Skipped entirely on the polar fallback: the
+    // bins were trained on real paddlewheel STW — looking them up with a
+    // model estimate is circular, and the polar already encodes the
+    // boat's steady-state performance.
     const sailState = resolveSailState();
     const seaState = resolveSeaState();
     const awaDeg = awaRad != null ? (awaRad * 180) / Math.PI : 0;
-    const corrections = matrix.lookup({
-      sail_state: sailState,
-      sea_state: seaState,
-      stwKn: rawStw,
-      awaDeg,
-      heelDeg: heel ?? 0,
-    });
+    const corrections = onPolar
+      ? { leeway_angle: 0, speed_loss: 0, hit_count: 0 }
+      : matrix.lookup({
+          sail_state: sailState,
+          sea_state: seaState,
+          stwKn: rawStw,
+          awaDeg,
+          heelDeg: heel ?? 0,
+        });
+
+    // Speed source for this tick: the real paddlewheel when it reads,
+    // the running-averaged polar estimate otherwise (§3.1 method token).
+    const stwKn = onPolar ? polar.averageKn : rawStw;
+    engine.method = onPolar ? "inertial-polar" : "inertial-paddlewheel";
 
     // Resolve the best available current vector (SPEC §6.2). v1 ships
     // tier 5 (zero); the resolver has a hook for tier 4 pilot charts.
@@ -935,7 +1068,7 @@ module.exports = (app) => {
 
     const pos = engine.tick(
       {
-        stwKn: rawStw,
+        stwKn,
         headingTrueDeg,
         leewayDeg: corrections.leeway_angle,
         speedLoss: corrections.speed_loss,
@@ -964,8 +1097,15 @@ module.exports = (app) => {
     // and GPS wanders at the dock — running the trainer there would
     // flag a phantom fouled paddlewheel, write GPS-jitter observations
     // into the matrix, and log mooring-yaw wind shifts as fake tacks.
+    // On the polar fallback without a paddlewheel reading there is no
+    // honest STW, so no error vectors either: Training Mode, tack
+    // detection and the fouling detector stay suspended (same principle
+    // as the §6.3/§6.4 write gates — never train on synthetic input).
+    // With a fouled-but-reading paddlewheel the trainer still runs on
+    // the real sensors so the §6.3 verdict (and its recovery) stays
+    // fresh.
     let tr = { transient: false, fouled: false };
-    if (underway) {
+    if (underway && rawStw != null) {
       tr = deps.trainingTick(training, {
         timestampS: clockS,
         gps,
@@ -1007,23 +1147,37 @@ module.exports = (app) => {
       config.tickIntervalMs / 1000,
       config.sensorHealth,
     ).active;
-    setSensorHealth(
-      fouled ? "fouled" : null,
-      fouled
-        ? "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR is integrating near-zero speed; verify position by other means"
-        : null,
-    );
+    fouledActive = fouled;
+    // Sensor-health surfacing (§3.1): the fouling verdict as before, plus
+    // the missing-paddlewheel case while DR runs on the polar fallback.
+    // Both are transition-published by setSensorHealth.
+    if (onPolar && rawStw == null) {
+      setSensorHealth(
+        "polar",
+        `Paddlewheel speed unavailable — DR is integrating polar-derived speed (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`,
+      );
+    } else if (fouled) {
+      setSensorHealth(
+        "fouled",
+        onPolar
+          ? "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR has switched to polar-derived speed; verify position by other means"
+          : "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR is integrating near-zero speed; verify position by other means",
+      );
+    } else {
+      setSensorHealth(null, null);
+    }
 
     // §9.4: auto tack/gybe logbook entries. The transient window's close
     // edge is a completed maneuver; classify from the AWA change across
     // the window. Debounced so a beat's rapid back-to-back maneuvers
     // (or a botched tack immediately redone) log as one event.
-    const maneuver = underway
-      ? deps.detectManeuver(training, {
-          awaDeg,
-          headingDeg: headingTrueDeg,
-        })
-      : null;
+    const maneuver =
+      underway && rawStw != null
+        ? deps.detectManeuver(training, {
+            awaDeg,
+            headingDeg: headingTrueDeg,
+          })
+        : null;
     if (maneuver) {
       const now = Date.now();
       const debounceMs = (config.logbook?.tackDebounceS ?? 120) * 1000;
@@ -1055,7 +1209,7 @@ module.exports = (app) => {
         elapsedDistanceNm: engine.logNmSinceOrigin,
         effectiveHitCount: corrections.hit_count,
         deviationRows: devRows,
-        stwKn: rawStw,
+        stwKn,
       });
 
       // §7.3 band 2: gradual DR-vs-GPS divergence vs the polygon's
@@ -1106,7 +1260,10 @@ module.exports = (app) => {
         [PATHS.method]: engine.method,
         [PATHS.log]: engine.logNm,
         [PATHS.tripLog]: engine.tripLogNm,
-        [PATHS.stw]: rawStw,
+        // A polar estimate is not an STW measurement: the sensor output
+        // path stays silent while on the fallback rather than publishing
+        // a model value that masquerades as one (work doc #18).
+        ...(onPolar ? {} : { [PATHS.stw]: rawStw }),
         [PATHS.headingTrue]: headingTrueDeg,
         [PATHS.current]: current,
         [PATHS.uncertainty]: {
@@ -1126,6 +1283,7 @@ module.exports = (app) => {
           status: underway ? "underway" : "warm",
           transient: tr.transient,
           fouled,
+          speedSource: onPolar ? "polar" : "paddlewheel",
         },
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
         // Always published: null while suppressed (moored/anchored or no
@@ -1458,16 +1616,19 @@ module.exports = (app) => {
   /**
    * Publishes the §3.1 sensor-health notification on *transitions only*
    * (raise when an issue appears, clear when it resolves) — the same
-   * hysteresis discipline as the divergence advisory. No issue → null.
+   * hysteresis discipline as the divergence advisory — plus a refresh
+   * when a live alert's message changes (see sensorHealthMessage). No
+   * issue → null.
    *
-   * @param {string|null} issue - "idle-moving" | "fouled" | null
+   * @param {string|null} issue - "idle-moving" | "fouled" | "polar" | null
    * @param {string|null} message - human explanation for the raise
    * @returns {void}
    */
   function setSensorHealth(issue, message) {
-    if (issue === sensorHealthIssue) return;
+    if (issue === sensorHealthIssue && message === sensorHealthMessage) return;
     const wasIssue = sensorHealthIssue;
     sensorHealthIssue = issue;
+    sensorHealthMessage = message;
     if (issue) {
       publishNotification(PATHS.sensorHealth, { state: "alert", message });
     } else if (wasIssue) {
