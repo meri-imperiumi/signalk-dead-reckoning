@@ -177,7 +177,10 @@ test("Sparkline: flat series normalizes to 0.5 line, non-finite ignored", async 
 test("divergenceText: formats distance and zero-padded bearing", async () => {
   const vm = await loadVm();
   assert.strictEqual(
-    vm.divergenceText({ distance_nm: 0.423, bearing_true: 3 }),
+    vm.divergenceText({
+      distance_m: 0.423 * 1852,
+      bearing_true: (3 * Math.PI) / 180,
+    }),
     "0.42 nm / 003°",
   );
   assert.strictEqual(vm.divergenceText(null), "— nm");
@@ -188,11 +191,14 @@ test("divergenceText: no bearing below display resolution — it is the directio
   // A few metres of DR-GPS offset: bearing is meaningless, distance is
   // honest at "0.00 nm".
   assert.strictEqual(
-    vm.divergenceText({ distance_nm: 0.004, bearing_true: 248 }),
+    vm.divergenceText({ distance_m: 0.004 * 1852, bearing_true: 248 }),
     "0.00 nm",
   );
   assert.strictEqual(
-    vm.divergenceText({ distance_nm: 0.006, bearing_true: 97 }),
+    vm.divergenceText({
+      distance_m: 0.006 * 1852,
+      bearing_true: (97 * Math.PI) / 180,
+    }),
     "0.01 nm / 097°",
   );
 });
@@ -242,7 +248,7 @@ test("drStatusText: engine-warm on a tied-up boat is its own status, not 'underw
 test("uncertaintySpec: passes radius/method with DR center", async () => {
   const vm = await loadVm();
   const u = vm.uncertaintySpec([60, 24], {
-    radius_nm: 1.5,
+    radius_m: 1.5 * 1852,
     method: "empirical",
   });
   assert.deepStrictEqual(u.center, [60, 24]);

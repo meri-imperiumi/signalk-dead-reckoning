@@ -68,7 +68,8 @@ test("dr-app: header figure, button, dialog and stream subscription wired", () =
   assert.match(src, /id="dr-current"/);
   assert.match(src, /id="btn-current"/);
   assert.match(src, /dr-current-panel/);
-  assert.match(src, /"environment\.current"/);
+  assert.match(src, /"environment\.current\.setTrue"/);
+  assert.match(src, /"environment\.current\.drift"/);
   assert.match(src, /renderCurrent\(\)/);
   // Changes from the panel re-read /status (works while idle too).
   assert.match(src, /dr-current-changed/);

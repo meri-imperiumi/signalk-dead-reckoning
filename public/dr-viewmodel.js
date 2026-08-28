@@ -40,6 +40,25 @@ export const STYLE = {
 const RAD = Math.PI / 180;
 const EARTH_RADIUS_NM = 3440.065;
 
+/** Metres per nautical mile — Signal K bus values are SI (m, m/s, rad);
+ * the DR displays are nautical (NM, kn, °). */
+export const METRES_PER_NM = 1852;
+
+/** @param {number} m @returns {number} */
+export function metresToNm(m) {
+  return m / METRES_PER_NM;
+}
+
+/** @param {number} ms @returns {number} */
+export function msToKn(ms) {
+  return (ms * 3600) / METRES_PER_NM;
+}
+
+/** @param {number} r @returns {number} */
+export function radToDeg(r) {
+  return (r * 180) / Math.PI;
+}
+
 /**
  * Parses a `<input type="datetime-local">` value (a naive string like
  * "2026-06-21T17:00:00") into an ISO-8601 UTC timestamp. `datetime-local`
@@ -336,13 +355,13 @@ export function correctionSegmentSpec(c) {
  * season).
  *
  * @param {[number, number]} drPosition
- * @param {{radius_nm: number, method: string}} uncertainty
+ * @param {{radius_m: number, method: string}} uncertainty
  * @returns {{center: [number, number], radiusNm: number, method: string}}
  */
 export function uncertaintySpec(drPosition, uncertainty) {
   return {
     center: drPosition,
-    radiusNm: uncertainty?.radius_nm ?? 0,
+    radiusNm: metresToNm(uncertainty?.radius_m ?? 0),
     method: uncertainty?.method ?? "fallback",
   };
 }
@@ -391,16 +410,18 @@ export class Sparkline {
 /**
  * Human-readable divergence readout (SPEC §14.1 "distance + bearing").
  *
- * @param {{distance_nm: number, bearing_true: number}|null} d
+ * @param {{distance_m: number, bearing_true: number}|null} d - SI bus
+ *   values (metres, radians)
  * @returns {string}
  */
 export function divergenceText(d) {
-  if (!d || !Number.isFinite(d.distance_nm)) return "— nm";
+  if (!d || !Number.isFinite(d.distance_m)) return "— nm";
+  const nm = metresToNm(d.distance_m);
   // Below display resolution the bearing is the direction of noise on a
   // zero-length vector — meaningless, don't show it.
-  if (d.distance_nm < 0.005) return `${d.distance_nm.toFixed(2)} nm`;
-  const brg = String(Math.round(d.bearing_true)).padStart(3, "0");
-  return `${d.distance_nm.toFixed(2)} nm / ${brg}°`;
+  if (nm < 0.005) return `${nm.toFixed(2)} nm`;
+  const brg = String(Math.round(radToDeg(d.bearing_true))).padStart(3, "0");
+  return `${nm.toFixed(2)} nm / ${brg}°`;
 }
 
 /**

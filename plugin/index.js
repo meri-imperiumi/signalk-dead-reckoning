@@ -62,7 +62,15 @@ const {
   polarSpeedSample,
   polarSpeedAverage,
 } = require("./polar.js");
-const { distanceNm, bearingDeg } = require("./geo.js");
+const {
+  distanceNm,
+  bearingDeg,
+  METRES_PER_NM,
+  knotsToMs,
+  msToKnots,
+  radToDeg,
+  degToRad,
+} = require("./geo.js");
 const {
   recordLineOfPosition,
   recordCircularPositionLine,
@@ -176,9 +184,19 @@ const PATHS = {
   tripLog: "navigation.deadReckoning.trip.log",
   stw: "navigation.speedThroughWater",
   headingTrue: "navigation.headingTrue",
-  current: "environment.current",
+  // §6.2 resolved current vector on the standard paths (setTrue rad,
+  // drift m/s). The DR-specific tier/source enrichment stays on
+  // REST /status.
+  currentSetTrue: "environment.current.setTrue",
+  currentDrift: "environment.current.drift",
   uncertainty: "navigation.deadReckoning.uncertainty",
   divergence: "navigation.deadReckoning.divergence",
+  // Scalar siblings of the object paths above, for simple consumers
+  // (rule engines, status tiles): a threshold check can't read a
+  // subfield of an object-valued path, and subscribing to the subfield
+  // path itself never sees a delta — only the parent path updates.
+  uncertaintyRadius: "navigation.deadReckoning.uncertainty.radius",
+  divergenceDistance: "navigation.deadReckoning.divergence.distance",
   state: "navigation.deadReckoning.state",
   elapsedSinceFix: "navigation.deadReckoning.elapsedSinceFix",
   divergenceAdvisory:
@@ -910,15 +928,23 @@ module.exports = (app) => {
 
     clockS += config.tickIntervalMs / 1000;
 
-    const rawStw = unwrapNumber(deltaState.get("navigation.speedThroughWater"));
-    const headingMag = unwrapNumber(
+    // Signal K bus units are SI (speed m/s, angles rad); the DR engine
+    // works in nautical units (kn, deg, nm). Convert once, here.
+    const stwMs = unwrapNumber(deltaState.get("navigation.speedThroughWater"));
+    const stwKn = conv(stwMs, msToKnots);
+    const headingMagRad = unwrapNumber(
       deltaState.get("navigation.headingMagnetic"),
     );
-    const headingTrue = unwrapNumber(deltaState.get("navigation.headingTrue"));
+    const headingTrueRad = unwrapNumber(
+      deltaState.get("navigation.headingTrue"),
+    );
     const awaRad = unwrapNumber(
       deltaState.get("environment.wind.angleApparent"),
     );
-    const aws = unwrapNumber(deltaState.get("environment.wind.speedApparent"));
+    const awsMs = unwrapNumber(
+      deltaState.get("environment.wind.speedApparent"),
+    );
+    const awsKn = conv(awsMs, msToKnots);
     const heel = unwrapHeel(deltaState.get("navigation.attitude"));
     const gps = unwrapPosition(deltaState.get("navigation.position"));
     // One underway verdict for the whole tick (§7.1–2: moored/anchored is
@@ -939,7 +965,12 @@ module.exports = (app) => {
 
     // Heading: prefer true heading; fall back to magnetic (WMM correction
     // applied upstream in v1 — see SPEC §12). If neither, hold position.
-    const headingTrueDeg = headingTrue ?? headingMag;
+    const headingTrueDeg =
+      headingTrueRad == null
+        ? headingMagRad == null
+          ? null
+          : radToDeg(headingMagRad)
+        : radToDeg(headingTrueRad);
 
     // §3.1 `inertial-polar` (work doc #18): polar-derived STW fallback.
     // When the paddlewheel is missing (null) or sustained-fouled (§6.3
@@ -963,18 +994,18 @@ module.exports = (app) => {
       underway &&
       deltaState.get("propulsion.main.state") !== "started" &&
       headingTrueDeg != null &&
-      (rawStw == null || fouledActive);
+      (stwKn == null || fouledActive);
 
-    if (headingTrueDeg == null || (rawStw == null && !onPolar)) {
+    if (headingTrueDeg == null || (stwKn == null && !onPolar)) {
       // Publish why DR is idle so the UI (SPEC §14.1) can explain the empty
       // readout instead of leaving the user to guess. The vessel isn't
       // necessarily broken — moored/anchored with no STW/heading is normal.
       let reason;
       if (navState === "moored" || navState === "anchored") {
         reason = navState;
-      } else if (rawStw == null && headingTrueDeg == null) {
+      } else if (stwKn == null && headingTrueDeg == null) {
         reason = "no speed or heading";
-      } else if (rawStw == null) {
+      } else if (stwKn == null) {
         reason = "no speed through water";
       } else {
         reason = "no heading";
@@ -1023,8 +1054,18 @@ module.exports = (app) => {
       publish({
         [PATHS.state]: { status: "idle", reason, moving },
         [PATHS.method]: engine.method,
-        ...(uncertaintyValue ? { [PATHS.uncertainty]: uncertaintyValue } : {}),
+        ...(uncertaintyValue
+          ? {
+              [PATHS.uncertainty]: {
+                radius_m: uncertaintyValue.radius_nm * METRES_PER_NM,
+                method: uncertaintyValue.method,
+              },
+              [PATHS.uncertaintyRadius]:
+                uncertaintyValue.radius_nm * METRES_PER_NM,
+            }
+          : { [PATHS.uncertaintyRadius]: null }),
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
+        [PATHS.divergenceDistance]: null,
       });
       return;
     }
@@ -1043,14 +1084,14 @@ module.exports = (app) => {
       : matrix.lookup({
           sail_state: sailState,
           sea_state: seaState,
-          stwKn: rawStw,
+          stwKn,
           awaDeg,
           heelDeg: heel ?? 0,
         });
 
     // Speed source for this tick: the real paddlewheel when it reads,
     // the running-averaged polar estimate otherwise (§3.1 method token).
-    const stwKn = onPolar ? polar.averageKn : rawStw;
+    const effectiveStwKn = onPolar ? polar.averageKn : stwKn;
     engine.method = onPolar ? "inertial-polar" : "inertial-paddlewheel";
 
     // Resolve the best available current vector (SPEC §6.2). v1 ships
@@ -1068,7 +1109,7 @@ module.exports = (app) => {
 
     const pos = engine.tick(
       {
-        stwKn,
+        stwKn: effectiveStwKn,
         headingTrueDeg,
         leewayDeg: corrections.leeway_angle,
         speedLoss: corrections.speed_loss,
@@ -1105,14 +1146,14 @@ module.exports = (app) => {
     // the real sensors so the §6.3 verdict (and its recovery) stays
     // fresh.
     let tr = { transient: false, fouled: false };
-    if (underway && rawStw != null) {
+    if (underway && stwKn != null) {
       tr = deps.trainingTick(training, {
         timestampS: clockS,
         gps,
-        stwKn: rawStw,
+        stwKn,
         headingTrueDeg,
         awaDeg,
-        awsKn: aws,
+        awsKn,
         heelDeg: heel ?? 0,
         propulsionState: deltaState.get("propulsion.main.state"),
         current,
@@ -1124,7 +1165,7 @@ module.exports = (app) => {
           {
             sail_state: sailState,
             sea_state: seaState,
-            stwKn: rawStw,
+            stwKn,
             awaDeg,
             heelDeg: heel ?? 0,
           },
@@ -1151,7 +1192,7 @@ module.exports = (app) => {
     // Sensor-health surfacing (§3.1): the fouling verdict as before, plus
     // the missing-paddlewheel case while DR runs on the polar fallback.
     // Both are transition-published by setSensorHealth.
-    if (onPolar && rawStw == null) {
+    if (onPolar && stwKn == null) {
       setSensorHealth(
         "polar",
         `Paddlewheel speed unavailable — DR is integrating polar-derived speed (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`,
@@ -1172,7 +1213,7 @@ module.exports = (app) => {
     // the window. Debounced so a beat's rapid back-to-back maneuvers
     // (or a botched tack immediately redone) log as one event.
     const maneuver =
-      underway && rawStw != null
+      underway && stwKn != null
         ? deps.detectManeuver(training, {
             awaDeg,
             headingDeg: headingTrueDeg,
@@ -1258,16 +1299,20 @@ module.exports = (app) => {
         [PATHS.position]: pos,
         [PATHS.active]: engine.active,
         [PATHS.method]: engine.method,
-        [PATHS.log]: engine.logNm,
-        [PATHS.tripLog]: engine.tripLogNm,
+        [PATHS.log]: engine.logNm * METRES_PER_NM,
+        [PATHS.tripLog]: engine.tripLogNm * METRES_PER_NM,
         // A polar estimate is not an STW measurement: the sensor output
         // path stays silent while on the fallback rather than publishing
         // a model value that masquerades as one (work doc #18).
-        ...(onPolar ? {} : { [PATHS.stw]: rawStw }),
-        [PATHS.headingTrue]: headingTrueDeg,
-        [PATHS.current]: current,
+        ...(onPolar ? {} : { [PATHS.stw]: stwMs }),
+        [PATHS.headingTrue]: headingTrueRad ?? headingMagRad,
+        // §6.2 resolved vector on the standard current paths, in SI
+        // units (setTrue rad, drift m/s). The DR-specific enrichment
+        // (tier, source, manual-override TTL) rides REST /status.
+        [PATHS.currentSetTrue]: degToRad(current.setTrue),
+        [PATHS.currentDrift]: knotsToMs(current.drift),
         [PATHS.uncertainty]: {
-          radius_nm: u.radius_nm,
+          radius_m: u.radius_nm * METRES_PER_NM,
           method: u.method,
         },
         // §6.4: transient flags a tack/gybe in progress — the moment when
@@ -1287,8 +1332,21 @@ module.exports = (app) => {
         },
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
         // Always published: null while suppressed (moored/anchored or no
-        // GPS) so consumers drop any stale underway figure.
-        [PATHS.divergence]: dvg,
+        // GPS) so consumers drop any stale underway figure. distance_m /
+        // bearing_true (rad) per the SI bus convention.
+        [PATHS.divergence]: dvg
+          ? {
+              distance_m: dvg.distance_nm * METRES_PER_NM,
+              bearing_true: degToRad(dvg.bearing_true),
+            }
+          : null,
+        // Scalar siblings (see PATHS): the same figures as flat metre
+        // values for consumers that cannot read object subfields
+        // (threshold checks, status tiles).
+        [PATHS.uncertaintyRadius]: u.radius_nm * METRES_PER_NM,
+        [PATHS.divergenceDistance]: dvg
+          ? dvg.distance_nm * METRES_PER_NM
+          : null,
       });
     }
   }
@@ -1681,17 +1739,21 @@ module.exports = (app) => {
             {
               path: PATHS.log,
               value: {
-                units: "nm",
+                units: "m",
+                displayUnits: { formula: "value/1852", symbol: "NM" },
                 displayName: "DR water-track log",
-                description: "Cumulative water-track distance from STW",
+                description:
+                  "Cumulative water-track distance from STW (metres; NM via display units)",
               },
             },
             {
               path: PATHS.tripLog,
               value: {
-                units: "nm",
+                units: "m",
+                displayUnits: { formula: "value/1852", symbol: "NM" },
                 displayName: "DR trip log",
-                description: "Water-track distance since trip start",
+                description:
+                  "Water-track distance since trip start (metres; NM via display units)",
               },
             },
             {
@@ -1699,13 +1761,17 @@ module.exports = (app) => {
               value: {
                 displayName: "DR uncertainty polygon",
                 description:
-                  "Confidence-weighted circular error region around the DR position; radius scales with distance run and tightens as the matching matrix bin accumulates hits.",
+                  "Confidence-weighted circular error region around the DR position (radius_m in metres); radius scales with distance run and tightens as the matching matrix bin accumulates hits.",
               },
             },
             {
               path: PATHS.elapsedSinceFix,
               value: {
                 units: "s",
+                // Duration formatting for glance consumers (status
+                // tiles' headline/footers evaluate this formula to
+                // render "3h 05m" instead of raw seconds).
+                displayUnits: { formula: "formatDurationCompact(value)" },
                 displayName: "Time since last fix",
                 description:
                   "Seconds since the DR origin was last snapped to a confirmed fix — the watchkeeper's fix-cadence cue.",
@@ -1716,7 +1782,27 @@ module.exports = (app) => {
               value: {
                 displayName: "DR-GPS divergence",
                 description:
-                  "Live distance and true bearing from the shadow-boat DR position to the last GPS fix — the at-a-glance model-quality diagnostic.",
+                  "Live distance (distance_m, metres) and true bearing (bearing_true, radians) from the shadow-boat DR position to the last GPS fix — the at-a-glance model-quality diagnostic.",
+              },
+            },
+            {
+              path: PATHS.uncertaintyRadius,
+              value: {
+                units: "m",
+                displayUnits: { formula: "value/1852", symbol: "NM" },
+                displayName: "DR uncertainty radius",
+                description:
+                  "Scalar radius (m) of the DR uncertainty circle — sibling of navigation.deadReckoning.uncertainty for threshold checks and tile readouts that cannot read object subfields.",
+              },
+            },
+            {
+              path: PATHS.divergenceDistance,
+              value: {
+                units: "m",
+                displayUnits: { formula: "value/1852", symbol: "NM" },
+                displayName: "DR-GPS divergence distance",
+                description:
+                  "Scalar DR-to-GPS distance (m) — sibling of navigation.deadReckoning.divergence; null while suppressed (moored/anchored or no GPS) so consumers drop stale figures.",
               },
             },
           ],
@@ -2298,11 +2384,21 @@ module.exports = (app) => {
           observation_count:
             (candidate.observationIds?.lopIds?.length ?? 0) +
             (candidate.observationIds?.cplIds?.length ?? 0),
-          stw_kn: unwrapNumber(deltaState.get("navigation.speedThroughWater")),
-          sog_kn: unwrapNumber(deltaState.get("navigation.speedOverGround")),
-          heading_deg: unwrapNumber(deltaState.get("navigation.headingTrue")),
-          course_deg: unwrapNumber(
-            deltaState.get("navigation.courseOverGround"),
+          stw_kn: conv(
+            unwrapNumber(deltaState.get("navigation.speedThroughWater")),
+            msToKnots,
+          ),
+          sog_kn: conv(
+            unwrapNumber(deltaState.get("navigation.speedOverGround")),
+            msToKnots,
+          ),
+          heading_deg: conv(
+            unwrapNumber(deltaState.get("navigation.headingTrue")),
+            radToDeg,
+          ),
+          course_deg: conv(
+            unwrapNumber(deltaState.get("navigation.courseOverGround")),
+            radToDeg,
           ),
           sea_state: seaState !== "unknown" ? Number(seaState) : null,
         }),
@@ -2585,6 +2681,11 @@ function unwrapNumber(v) {
  * @param {unknown} v
  * @returns {number|null}
  */
+/** Null-safe bus-unit conversion: `f` applied only to non-null values. */
+function conv(v, f) {
+  return v == null ? null : f(v);
+}
+
 function unwrapHeel(v) {
   if (v == null || typeof v !== "object") return null;
   const roll = v.roll ?? v.value?.roll;

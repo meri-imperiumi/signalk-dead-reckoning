@@ -25,8 +25,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The DR state value gains `speedSource: "paddlewheel"|"polar"`, and a
   §3.1 sensor-health alert names the switch (paddlewheel
   unavailable/fouled — DR on polar-derived speed).
+- Scalar sibling paths `navigation.deadReckoning.uncertainty.radius`
+  and `navigation.deadReckoning.divergence.distance` (metres, with
+  nautical-mile display-unit meta) for rule/display engines
+  (signalk-status-tiles threshold checks) that cannot read subfields of
+  object-valued paths — subscribing to a subfield path never sees a
+  delta.
 
 ### Changed
+- **All published deltas now follow the Signal K SI unit conventions**
+  (breaking):
+  - `navigation.deadReckoning.log` / `trip.log` publish metres (was
+    nautical miles), with `value/1852` NM display-unit meta.
+  - The `environment.current` object is replaced by the standard
+    `environment.current.setTrue` (radians) and
+    `environment.current.drift` (m/s) paths; the DR-specific
+    tier/source enrichment rides REST `/status` instead of the bus.
+  - The uncertainty object field `radius_nm` becomes `radius_m`; the
+    divergence object fields `distance_nm`/`bearing_true` (deg) become
+    `distance_m`/`bearing_true` (rad).
+  - `navigation.deadReckoning.elapsedSinceFix` gains duration
+    display-unit meta so glance consumers render "3h 05m", not
+    seconds.
+- **Inbound sensor deltas are now interpreted per the Signal K unit
+  conventions** (breaking for feeds that were publishing non-SI):
+  `speedThroughWater`/`speedApparent` are read as m/s and heading paths
+  as radians, converting to the engine's internal knots/degrees at the
+  boundary. Previously m/s and radian values were treated as knots and
+  degrees — DR under-travelled ~5× and mis-steered on standard feeds.
+  The standard-path passthroughs (`navigation.speedThroughWater`,
+  `navigation.headingTrue`) publish what they received, unchanged.
+- Logbook fix/tack entries convert SOG/COG/heading at the boundary
+  (`_kn`/`_deg` REST fields previously received raw m/s/radians).
+- The webapp converts SI bus values (m, m/s, rad) to nautical displays
+  centrally in the view model (`metresToNm`/`msToKn`/`radToDeg`).
+- REST `/status` and `/current/manual` keep the plugin's internal
+  nautical units (`logNm`, `current.setTrue` deg, `drift` kn) — they
+  are the plugin's own API, not the Signal K bus.
 - `navigation.deadReckoning.method` now reflects the actual speed
   source every tick, completing the SPEC §3.1 enum: the idle branch
   (no usable speed at all) publishes `fallback-zero` instead of

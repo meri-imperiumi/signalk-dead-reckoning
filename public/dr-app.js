@@ -423,7 +423,8 @@ class DrApp extends HTMLElement {
       "navigation.gnss.satellitesVisible",
       "navigation.gnss.horizontalDilution",
       "environment.mode",
-      "environment.current",
+      "environment.current.setTrue",
+      "environment.current.drift",
     ]);
     stream.on((delta) => this.onDelta(delta));
     stream.onStatus((s) => this.renderLinkStatus(s));
@@ -577,12 +578,14 @@ class DrApp extends HTMLElement {
         break;
       case "navigation.deadReckoning.divergence":
         this.snap.divergence = value;
-        this.spark.push(value?.distance_nm);
+        // Bus value is metres; the sparkline normalizes to its own
+        // min/max so the unit only matters for consistency.
+        this.spark.push(value?.distance_m);
         this.snap.sparkStats = this.spark.stats();
         break;
       case "navigation.deadReckoning.log":
         this.shadowRoot.querySelector("#dr-log").textContent =
-          `${Number(value ?? 0).toFixed(2)} nm`;
+          `${vm.metresToNm(Number(value ?? 0)).toFixed(2)} nm`;
         break;
       case "navigation.deadReckoning.method": {
         const methodEl = this.shadowRoot.querySelector("#dr-method");
@@ -641,8 +644,21 @@ class DrApp extends HTMLElement {
           document.documentElement.setAttribute("data-mode", value);
         }
         break;
-      case "environment.current":
-        this.snap.current = value;
+      case "environment.current.setTrue":
+        // Bus value is radians; the snap (and /status) carry degrees.
+        if (Number.isFinite(value)) {
+          this.snap.current = {
+            ...this.snap.current,
+            setTrue: vm.radToDeg(value),
+          };
+        }
+        this.renderCurrent();
+        break;
+      case "environment.current.drift":
+        // Bus value is m/s; the snap (and /status) carry knots.
+        if (Number.isFinite(value)) {
+          this.snap.current = { ...this.snap.current, drift: vm.msToKn(value) };
+        }
         this.renderCurrent();
         break;
       default:

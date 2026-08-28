@@ -315,22 +315,31 @@ test("manual current outranks automatic sources in the tick", async () => {
   });
   await new Promise((r) => setTimeout(r, 1100));
   const currentDeltas = app.handledMessages
-    .filter((m) =>
-      m.message?.updates?.some((u) =>
-        u.values?.some((v) => v.path === "environment.current"),
-      ),
-    )
-    .flatMap((m) =>
-      m.message.updates.flatMap((u) =>
-        u.values.filter((v) => v.path === "environment.current"),
-      ),
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter(
+      (v) =>
+        v.path === "environment.current.setTrue" ||
+        v.path === "environment.current.drift",
     );
   assert.ok(currentDeltas.length > 0, "no current delta published");
-  const c = currentDeltas[currentDeltas.length - 1].value;
-  assert.strictEqual(c.source, "manual");
-  assert.strictEqual(c.tier, 1);
-  assert.strictEqual(c.setTrue, 67);
-  assert.strictEqual(c.drift, 1.2);
+  const last = (p) => {
+    const vals = currentDeltas.filter((v) => v.path === p);
+    return vals[vals.length - 1].value;
+  };
+  // SI units on the bus: set 67° → radians, drift 1.2 kn → m/s.
+  assert.ok(
+    Math.abs(last("environment.current.setTrue") - (67 * Math.PI) / 180) < 1e-6,
+    `setTrue ${last("environment.current.setTrue")}`,
+  );
+  assert.ok(
+    Math.abs(last("environment.current.drift") - (1.2 * 1852) / 3600) < 1e-6,
+    `drift ${last("environment.current.drift")}`,
+  );
+  // The DR-specific tier/source enrichment rides REST /status.
+  const status = router.invoke("get", "/status").body;
+  assert.strictEqual(status.current.source, "manual");
+  assert.strictEqual(status.current.tier, 1);
   plugin.stop();
 });
 
@@ -985,8 +994,8 @@ test("uncertainty polygon publishes fallback method with no correction history",
     .find((v) => v.path === "navigation.deadReckoning.uncertainty");
   assert.ok(uDelta, "uncertainty delta not published");
   assert.strictEqual(uDelta.value.method, "fallback");
-  assert.ok(typeof uDelta.value.radius_nm === "number");
-  assert.ok(uDelta.value.radius_nm >= 0);
+  assert.ok(typeof uDelta.value.radius_m === "number");
+  assert.ok(uDelta.value.radius_m >= 0);
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -1037,10 +1046,11 @@ test("uncertainty polygon radius grows monotonically with distance run", async (
   // time" claim is tested precisely at the unit level; here we confirm the
   // live path publishes growing radii).
   assert.ok(
-    r2.radius_nm > r1.radius_nm,
-    `radius should grow: r1=${r1.radius_nm} r2=${r2.radius_nm}`,
+    r2.radius_m > r1.radius_m,
+    `radius should grow: r1=${r1.radius_m} r2=${r2.radius_m}`,
   );
-  assert.ok(r1.radius_nm > 0.02, "seeded run should exceed the floor");
+  // 0.02 nm GNSS-noise floor, in metres.
+  assert.ok(r1.radius_m > 0.02 * 1852, "seeded run should exceed the floor");
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -1100,7 +1110,7 @@ test("uncertainty polygon tightens toward empirical after corrections + bin hits
             path: "navigation.position",
             value: { latitude: 60, longitude: 24 },
           },
-          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.speedThroughWater", value: 2.5722 }, // 5 kn in m/s — must land in the seeded stw_bin=5
           { path: "navigation.headingTrue", value: 0 },
         ],
       },
@@ -1122,8 +1132,8 @@ test("uncertainty polygon tightens toward empirical after corrections + bin hits
     stwKn: 5,
   }).radius_nm;
   assert.ok(
-    u.radius_nm < fallbackOnly,
-    `empirical/blend radius ${u.radius_nm} should be below fallback ${fallbackOnly}`,
+    u.radius_m < fallbackOnly * 1852,
+    `empirical/blend radius ${u.radius_m} should be below fallback ${fallbackOnly}`,
   );
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
@@ -1171,7 +1181,7 @@ test("uncertainty polygon radius drops after a snap-to-fix resets the excursion"
   });
   await new Promise((r) => setTimeout(r, 3200));
   const before = latestUncertainty(app);
-  assert.ok(before.radius_nm > 0, "radius should be non-zero before snap");
+  assert.ok(before.radius_m > 0, "radius should be non-zero before snap");
 
   // Confirm a fix → snapToFix resets logNmSinceOrigin to 0; the next tick
   // re-grows it from one tick of distance, so `after` reflects far less
@@ -1184,8 +1194,8 @@ test("uncertainty polygon radius drops after a snap-to-fix resets the excursion"
   await new Promise((r) => setTimeout(r, 1200));
   const after = latestUncertainty(app);
   assert.ok(
-    after.radius_nm < before.radius_nm,
-    `radius should drop after snap (excursion reset): before=${before.radius_nm} after=${after.radius_nm}`,
+    after.radius_m < before.radius_m,
+    `radius should drop after snap (excursion reset): before=${before.radius_m} after=${after.radius_m}`,
   );
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
@@ -1235,7 +1245,7 @@ test("divergence advisory raises on sustained DR-GPS divergence and publishes th
   await new Promise((r) => setTimeout(r, 2000));
   // Divergence readout published and growing.
   const dvg = latestDivergence(app);
-  assert.ok(dvg.distance_nm > 0, "divergence readout should be non-zero");
+  assert.ok(dvg.distance_m > 0, "divergence readout should be non-zero");
   // Advisory raised at alert severity, visual method.
   const notif = latestNotification(
     app,
@@ -2558,15 +2568,27 @@ test("tick integrates the Weather API current into the DR solution (tier 3)", as
     await new Promise((r) => setTimeout(r, 1200));
     const currentVals = app.handledMessages.flatMap((m) =>
       m.message?.updates?.flatMap((u) =>
-        (u.values ?? []).filter((v) => v.path === "environment.current"),
+        (u.values ?? []).filter(
+          (v) =>
+            v.path === "environment.current.setTrue" ||
+            v.path === "environment.current.drift",
+        ),
       ),
     );
     assert.ok(currentVals.length > 0, "no environment.current published");
-    const last = currentVals[currentVals.length - 1].value;
-    assert.strictEqual(last.tier, 3);
-    assert.strictEqual(last.source, "weather-api");
-    assert.ok(Math.abs(last.setTrue - 90) < 1e-6, `setTrue ${last.setTrue}`);
-    assert.ok(Math.abs(last.drift - 3600 / 1852) < 1e-6, `drift ${last.drift}`);
+    const last = (p) => {
+      const vals = currentVals.filter((v) => v.path === p);
+      return vals[vals.length - 1].value;
+    };
+    // Weather tier 3 in SI bus units: 90° → π/2 rad, 1 m/s stays m/s.
+    assert.ok(
+      Math.abs(last("environment.current.setTrue") - Math.PI / 2) < 1e-6,
+      `setTrue ${last("environment.current.setTrue")}`,
+    );
+    assert.ok(
+      Math.abs(last("environment.current.drift") - 1) < 1e-6,
+      `drift ${last("environment.current.drift")}`,
+    );
   } finally {
     globalThis.fetch = realFetch;
     plugin.stop();
@@ -2671,8 +2693,8 @@ test("idle while making way: uncertainty grows, state carries moving, alert rais
     const unc = lastValues(app, "navigation.deadReckoning.uncertainty");
     assert.ok(unc.length >= 2, "expected uncertainty deltas while idle-moving");
     assert.ok(
-      unc[unc.length - 1].radius_nm > unc[0].radius_nm,
-      `radius should grow: ${unc[0].radius_nm} → ${unc[unc.length - 1].radius_nm}`,
+      unc[unc.length - 1].radius_m > unc[0].radius_m,
+      `radius should grow: ${unc[0].radius_m} → ${unc[unc.length - 1].radius_m}`,
     );
 
     const alerts = lastValues(
