@@ -183,6 +183,20 @@ test("divergenceText: formats distance and zero-padded bearing", async () => {
   assert.strictEqual(vm.divergenceText(null), "— nm");
 });
 
+test("divergenceText: no bearing below display resolution — it is the direction of noise", async () => {
+  const vm = await loadVm();
+  // A few metres of DR-GPS offset: bearing is meaningless, distance is
+  // honest at "0.00 nm".
+  assert.strictEqual(
+    vm.divergenceText({ distance_nm: 0.004, bearing_true: 248 }),
+    "0.00 nm",
+  );
+  assert.strictEqual(
+    vm.divergenceText({ distance_nm: 0.006, bearing_true: 97 }),
+    "0.01 nm / 097°",
+  );
+});
+
 test("uncertaintySpec: passes radius/method with DR center", async () => {
   const vm = await loadVm();
   const u = vm.uncertaintySpec([60, 24], {

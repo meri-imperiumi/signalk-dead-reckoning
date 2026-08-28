@@ -993,6 +993,21 @@ test("uncertainty polygon publishes fallback method with no correction history",
 test("uncertainty polygon radius grows monotonically with distance run", async () => {
   // Isolated DB so no leftover dr_corrections push it into empirical mode.
   const dir = await mkdtemp(join(tmpdir(), "dr-unc-grow-"));
+  // Pre-seed the restored per-excursion distance well above the GNSS
+  // noise floor (0.02 nm) so both samples measure growth, not the floor.
+  const seedDb = require("../plugin/db.js").openDatabase(
+    join(dir, "dead-reckoning.sqlite"),
+  );
+  const { setState } = require("../plugin/db.js");
+  setState(seedDb, "dr_log_since_origin", "5");
+  // Seed the origin too, or the first GPS delta snaps to it and resets
+  // the excursion distance back to zero.
+  setState(
+    seedDb,
+    "last_known_good_fix",
+    JSON.stringify({ latitude: 60, longitude: 24 }),
+  );
+  seedDb.close();
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
@@ -1024,12 +1039,21 @@ test("uncertainty polygon radius grows monotonically with distance run", async (
     r2.radius_nm > r1.radius_nm,
     `radius should grow: r1=${r1.radius_nm} r2=${r2.radius_nm}`,
   );
+  assert.ok(r1.radius_nm > 0.02, "seeded run should exceed the floor");
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
 
 test("uncertainty polygon tightens toward empirical after corrections + bin hits", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-unc-emp-"));
+  // Seed the restored per-excursion distance so both regimes measure
+  // rates, not the GNSS-noise floor.
+  const seedDb = require("../plugin/db.js").openDatabase(
+    join(dir, "dead-reckoning.sqlite"),
+  );
+  const { setState } = require("../plugin/db.js");
+  setState(seedDb, "dr_log_since_origin", "5");
+  seedDb.close();
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
@@ -1091,7 +1115,7 @@ test("uncertainty polygon tightens toward empirical after corrections + bin hits
   // radius at the same distance (the tightening signal).
   const { computeRadius } = require("../plugin/uncertainty.js");
   const fallbackOnly = computeRadius({
-    elapsedDistanceNm: 5 / 3600,
+    elapsedDistanceNm: 5,
     effectiveHitCount: 0,
     deviationRows: [],
     stwKn: 5,
@@ -1106,6 +1130,20 @@ test("uncertainty polygon tightens toward empirical after corrections + bin hits
 
 test("uncertainty polygon radius drops after a snap-to-fix resets the excursion", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-unc-snap-"));
+  // Seed the restored per-excursion distance so `before` is well above
+  // the GNSS-noise floor; after the snap it must drop to the floor.
+  const seedDb = require("../plugin/db.js").openDatabase(
+    join(dir, "dead-reckoning.sqlite"),
+  );
+  const { setState } = require("../plugin/db.js");
+  setState(seedDb, "dr_log_since_origin", "10");
+  // Seed the origin so the first GPS delta doesn't reset the excursion.
+  setState(
+    seedDb,
+    "last_known_good_fix",
+    JSON.stringify({ latitude: 60, longitude: 24 }),
+  );
+  seedDb.close();
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
@@ -1174,8 +1212,10 @@ test("divergence advisory raises on sustained DR-GPS divergence and publishes th
   });
   const router = new FakeRouter();
   plugin.registerWithRouter(router);
-  // GPS held fixed at (60, 24) while the boat sails north at 6 kn from it
-  // — divergence grows far faster than the fallback polygon radius.
+  // GPS held fixed at (60, 24) while the boat sails north at a
+  // synthetic 120 kn from it — divergence must outrun the GNSS-noise
+  // radius floor (0.02 nm) within the fast-hysteresis window; a real
+  // 6 kn would take ~20 s to cross it.
   app.emitDelta({
     context: "vessels.self",
     updates: [
@@ -1185,13 +1225,13 @@ test("divergence advisory raises on sustained DR-GPS divergence and publishes th
             path: "navigation.position",
             value: { latitude: 60, longitude: 24 },
           },
-          { path: "navigation.speedThroughWater", value: 6 },
+          { path: "navigation.speedThroughWater", value: 120 },
           { path: "navigation.headingTrue", value: 0 },
         ],
       },
     ],
   });
-  await new Promise((r) => setTimeout(r, 1000));
+  await new Promise((r) => setTimeout(r, 2000));
   // Divergence readout published and growing.
   const dvg = latestDivergence(app);
   assert.ok(dvg.distance_nm > 0, "divergence readout should be non-zero");
@@ -1228,13 +1268,13 @@ test("divergence advisory clears after a confirmed fix snaps DR back to GPS", as
             path: "navigation.position",
             value: { latitude: 60, longitude: 24 },
           },
-          { path: "navigation.speedThroughWater", value: 6 },
+          { path: "navigation.speedThroughWater", value: 120 },
           { path: "navigation.headingTrue", value: 0 },
         ],
       },
     ],
   });
-  await new Promise((r) => setTimeout(r, 900));
+  await new Promise((r) => setTimeout(r, 2000));
   const raised = latestNotification(
     app,
     "notifications.navigation.deadReckoning.divergenceAdvisory",
@@ -1292,23 +1332,260 @@ test("divergence monitor is suppressed at anchor", async () => {
     ],
   });
   await new Promise((r) => setTimeout(r, 900));
+  // Suppression now means an explicit null readout (so connected UIs drop
+  // any stale underway figure), not silence.
   const vals = app.handledMessages
     .flatMap((m) => m.message?.updates ?? [])
     .flatMap((u) => u.values ?? [])
     .filter((v) => v.path === "navigation.deadReckoning.divergence");
+  assert.ok(vals.length > 0, "null divergence readout should be published");
   assert.strictEqual(
-    vals.length,
-    0,
-    "divergence readout should be suppressed at anchor",
+    vals[vals.length - 1].value,
+    null,
+    "divergence readout should be null at anchor",
   );
   const notif = app.handledMessages
     .flatMap((m) => m.message?.updates ?? [])
     .flatMap((u) => u.values ?? [])
     .find(
       (v) =>
-        v.path === "notifications.navigation.deadReckoning.divergenceAdvisory",
+        v.path ===
+          "notifications.navigation.deadReckoning.divergenceAdvisory" &&
+        v.value.state === "alert",
     );
   assert.ok(!notif, "advisory should not fire at anchor");
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("moored with wind: no fouled paddlewheel alert, advisory withdrawn, null divergence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-moored-fouled-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 100,
+    divergence: { sustainS: 0.3, clearS: 0.3 },
+  });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+
+  // Phase 1 — underway, sailing away from a fixed GPS at a synthetic
+  // 120 kn (divergence outruns the 0.02 nm radius floor quickly):
+  // advisory raises.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 120 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 2000));
+  assert.strictEqual(
+    latestNotification(
+      app,
+      "notifications.navigation.deadReckoning.divergenceAdvisory",
+    ).state,
+    "alert",
+  );
+
+  // Phase 2 — tie up: STW reads 0 (a moored paddlewheel's honest value),
+  // wind blows 12 kn on the mast, GPS wanders a few metres. The old
+  // behaviour: phantom "paddlewheel fouled" alert + stuck advisory.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          { path: "navigation.state", value: "moored" },
+          { path: "navigation.speedThroughWater", value: 0 },
+          { path: "environment.wind.speedApparent", value: 12 },
+          {
+            path: "navigation.position",
+            value: { latitude: 60.0005, longitude: 24.0005 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 900));
+
+  // The advisory raised just before mooring is withdrawn, not stuck.
+  const notif = latestNotification(
+    app,
+    "notifications.navigation.deadReckoning.divergenceAdvisory",
+  );
+  assert.strictEqual(notif.state, "normal");
+  assert.ok(/suspended while moored/.test(notif.message));
+
+  // Divergence readout is an explicit null — no stale underway figure.
+  assert.strictEqual(latestDivergence(app), null);
+
+  // No phantom fouled paddlewheel: wind on a tied-up boat is not making way.
+  const health = latestNotification(
+    app,
+    "notifications.navigation.deadReckoning.status",
+  );
+  assert.ok(health?.state !== "alert", `got ${health?.message}`);
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("moored from the start: DR state clean (no fouled, no transient), fouled detector idle", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-moored-clean-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 100 });
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          { path: "navigation.state", value: "moored" },
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 0 },
+          { path: "navigation.headingTrue", value: 10 },
+          { path: "environment.wind.speedApparent", value: 15 },
+          { path: "environment.wind.angleApparent", value: 1.2 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 500));
+  const stateDeltas = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === "navigation.deadReckoning.state");
+  assert.ok(stateDeltas.length > 0, "no DR state delta published");
+  const last = stateDeltas[stateDeltas.length - 1].value;
+  assert.strictEqual(last.fouled, false);
+  assert.strictEqual(last.transient, false);
+  const health = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .find(
+      (v) =>
+        v.path === "notifications.navigation.deadReckoning.status" &&
+        v.value.state === "alert",
+    );
+  assert.ok(!health, "no sensor-health alert while moored");
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("fouling alert is debounced: threshold-hovering STW doesn't flap, sustained fouling raises", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-fouled-debounce-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 100,
+    sensorHealth: { sustainS: 1, clearS: 1 },
+  });
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.headingTrue", value: 0 },
+          { path: "environment.wind.speedApparent", value: 12 },
+        ],
+      },
+    ],
+  });
+
+  // STW hovers at the detector's stop threshold, strictly alternating
+  // every 37 ms (incommensurate with the 100 ms tick so consecutive
+  // ticks never sample a stable parity — paddlewheel spinner
+  // sticking/slipping): raw verdict flips far faster than the 1 s
+  // sustain window, so the alert must not raise.
+  let flip = 0;
+  const flap = setInterval(() => {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.speedThroughWater",
+              value: flip++ % 2 === 0 ? 0 : 0.4,
+            },
+          ],
+        },
+      ],
+    });
+  }, 37);
+  await new Promise((r) => setTimeout(r, 1500));
+  clearInterval(flap);
+  const healthAlerts = () =>
+    app.handledMessages
+      .flatMap((m) => m.message?.updates ?? [])
+      .flatMap((u) => u.values ?? [])
+      .filter(
+        (v) =>
+          v.path === "notifications.navigation.deadReckoning.status" &&
+          v.value.state === "alert",
+      );
+  assert.strictEqual(
+    healthAlerts().length,
+    0,
+    "fouling alert flapped during threshold hover",
+  );
+
+  // A real fault — STW pinned at 0 while wind says 12 kn — must still
+  // surface after the sustain window.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [{ path: "navigation.speedThroughWater", value: 0 }],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1600));
+  const alerts = healthAlerts();
+  assert.strictEqual(alerts.length, 1, "sustained fouling did not raise");
+  assert.ok(/fouled/.test(alerts[0].value.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("water-track log survives restart via dr_log_nm state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-log-restore-"));
+  // Pre-seed the persisted state a previous run's flush would have left.
+  const db = require("../plugin/db.js").openDatabase(
+    join(dir, "dead-reckoning.sqlite"),
+  );
+  const { setState } = require("../plugin/db.js");
+  setState(db, "dr_log_nm", "12.5");
+  setState(db, "dr_trip_log_nm", "3.25");
+  db.close();
+
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { body } = router.invoke("get", "/status");
+  assert.strictEqual(body.logNm, 12.5);
+  assert.strictEqual(body.tripLogNm, 3.25);
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -2331,13 +2608,31 @@ function lastValues(app, path) {
 
 test("idle while making way: uncertainty grows, state carries moving, alert raised", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-idle-moving-"));
+  // Seed the restored per-excursion distance above the GNSS-noise floor
+  // so idle-run growth is observable above it within the test window.
+  const seedDb = require("../plugin/db.js").openDatabase(
+    join(dir, "dead-reckoning.sqlite"),
+  );
+  const { setState } = require("../plugin/db.js");
+  setState(seedDb, "dr_log_since_origin", "1.5");
+  // Seed the origin so the first GPS delta doesn't reset the excursion.
+  setState(
+    seedDb,
+    "last_known_good_fix",
+    JSON.stringify({ latitude: 60, longitude: 24 }),
+  );
+  seedDb.close();
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
-  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  plugin.start({
+    tickIntervalMs: 20,
+    saveIntervalMs: 60000,
+    sensorHealth: { sustainS: 0.1, clearS: 0.1 },
+  });
   try {
-    // No STW/heading (idle), but GPS shows ~6 kn over ground.
-    await emitMovingGps(app, 6, 6);
+    // No STW/heading (idle), but GPS shows ~60 kn over ground.
+    await emitMovingGps(app, 60, 20);
 
     const states = lastValues(app, "navigation.deadReckoning.state");
     assert.ok(states.length > 0, "no state deltas");
@@ -2414,7 +2709,11 @@ test("fouled paddlewheel: STW 0 while making way raises fouling alert + state fl
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
-  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  plugin.start({
+    tickIntervalMs: 20,
+    saveIntervalMs: 60000,
+    sensorHealth: { sustainS: 0.1, clearS: 0.1 },
+  });
   try {
     // STW reads 0, heading present → underway branch; GPS moving ~6 kn.
     app.emitDelta({

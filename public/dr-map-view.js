@@ -41,10 +41,15 @@ class DrMapView extends HTMLElement {
       .map-host { position: relative; width: 100%; height: 100%; }
       .map-wrap { width: 100%; height: 100%; background: var(--bg-base, #080a0c); }
       /* Floating overlays: semi-transparent dark panels with sharp 1px
-         borders so they stay legible over any tileset (UI spec §7). */
+         borders so they stay legible over any tileset (UI spec §7).
+         Bottom-right: the top-right corner belongs to Leaflet's layers
+         control — stacking the chip there covered the control's toggle
+         (same z-index, later sibling wins), which both looked broken and
+         swallowed the clicks that were meant to switch chart providers.
+         The bottom-right corner is free here: attribution is off. */
       .dr-chip {
         position: absolute;
-        top: 8px;
+        bottom: 8px;
         right: 8px;
         z-index: 1000;
         display: flex;
@@ -216,17 +221,19 @@ class DrMapView extends HTMLElement {
     );
 
     // Basemap: Signal K configured charts (offline MBTiles / tile proxies)
-    // when available, falling back to online OSM when the server has none
-    // configured (route 404s or returns empty). The first available layer
-    // is added to the map so the plot has context immediately; the rest
-    // are registered in the layers control for switching.
+    // when available. The first *configured* chart is added to the map so
+    // the plot has context immediately; the rest are registered in the
+    // layers control for switching. When the server has no charts the
+    // online OSM fallback is offered in the control but NEVER auto-added
+    // (offline-first: the DR plot stays tile-less until the watchkeeper
+    // opts in — vm.DEFAULT_OSM_LAYER's documented contract).
     fetch("/signalk/v1/api/resources/charts")
       .then((r) => (r.ok ? r.json() : null))
       .then((resource) => {
-        const charts = vm.chartLayersWithFallback(resource);
-        if (charts.length === 0) return;
+        const configured = vm.parseChartLayers(resource);
+        const charts =
+          configured.length > 0 ? configured : [vm.DEFAULT_OSM_LAYER];
         const bases = {};
-        let first = null;
         for (const c of charts) {
           const layer = L.tileLayer(c.url, {
             minZoom: c.minZoom,
@@ -235,10 +242,12 @@ class DrMapView extends HTMLElement {
           });
           this.tileLayers[c.identifier] = layer;
           bases[c.name] = layer;
-          if (!first) first = layer;
         }
-        first.addTo(this.map);
-        if (Object.keys(bases).length > 1) {
+        if (configured.length > 0) {
+          // Auto-select only a real configured chart, never the fallback.
+          Object.values(bases)[0].addTo(this.map);
+        }
+        if (Object.keys(bases).length > 1 || configured.length === 0) {
           L.control.layers(bases, {}, { collapsed: true }).addTo(this.map);
         }
       })

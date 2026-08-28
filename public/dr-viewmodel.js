@@ -396,6 +396,9 @@ export class Sparkline {
  */
 export function divergenceText(d) {
   if (!d || !Number.isFinite(d.distance_nm)) return "— nm";
+  // Below display resolution the bearing is the direction of noise on a
+  // zero-length vector — meaningless, don't show it.
+  if (d.distance_nm < 0.005) return `${d.distance_nm.toFixed(2)} nm`;
   const brg = String(Math.round(d.bearing_true)).padStart(3, "0");
   return `${d.distance_nm.toFixed(2)} nm / ${brg}°`;
 }

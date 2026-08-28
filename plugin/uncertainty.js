@@ -34,6 +34,16 @@
  */
 
 /**
+ * Minimum published radius (nm) ≈ 37 m: GNSS position noise at the
+ * dock. With zero distance run the model would otherwise report a
+ * point-exact DR position (radius 0), and any GPS wander — however
+ * small — then "exceeds expected uncertainty", firing the divergence
+ * advisory on a moored boat. DR error can never honestly be smaller
+ * than the GPS it was seeded from.
+ */
+const MIN_RADIUS_NM = 0.02;
+
+/**
  * Conservative angular-error margin (degrees of DR error per nautical
  * mile run) used by the fallback regime. ~1° over a mile is a deliberately
  * wide starting point (≈1 nm of error per 57 nm run); the polygon tightens
@@ -166,7 +176,7 @@ function computeRadius(input) {
 
   const w = blendWeight(hits);
   const rate = w * empiricalRate + (1 - w) * fallbackRate;
-  const radius_nm = rate * elapsed;
+  const radius_nm = Math.max(rate * elapsed, MIN_RADIUS_NM);
 
   let method;
   if (w <= 0) method = "fallback";
@@ -185,6 +195,7 @@ function computeRadius(input) {
 
 module.exports = {
   FALLBACK_DEG_PER_NM,
+  MIN_RADIUS_NM,
   MIN_HITS_FOR_EMPIRICAL,
   EWMA_N,
   EWMA_ALPHA,

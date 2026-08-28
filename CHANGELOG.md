@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Dockside false positives while moored/anchored** — three alerts
+  that misfire on a tied-up boat are now suppressed in the moored/
+  anchored regime (consistent with the divergence monitor's existing
+  §7.1–2 suppression):
+  - *Divergence advisory* no longer raises on GPS wander at the dock:
+    the uncertainty radius previously collapsed to exactly 0.0 nm at
+    zero distance run, so a few metres of marina multipath "exceeded
+    expected uncertainty × 1.5" and sustained for 30 s raised
+    `DR-GPS divergence 0.00 nm exceeds expected 0.00 nm`. The radius
+    now floors at `MIN_RADIUS_NM` (0.02 nm ≈ 37 m, GNSS noise scale)
+    — DR error can never honestly be smaller than the GPS it was
+    seeded from.
+  - *Phantom "paddlewheel fouled" alert* — the fouling detector saw
+    STW≈0 (a moored paddlewheel's honest reading) plus wind on the
+    mast or GPS jitter and concluded the boat was making way. The
+    detector (and the whole training/matrix path, incl. auto tack
+    logging) is skipped while moored/anchored, and any earlier verdict
+    is withdrawn.
+  - *Sticky advisories* — a divergence advisory raised just before
+    mooring could never clear (the monitor isn't fed while suppressed).
+    It is now withdrawn with a `DR monitoring suspended while
+    moored/anchored` notification, and the divergence readout publishes
+    an explicit `null` while suppressed so the UI drops the stale
+    figure instead of showing a frozen `0.00 nm / 306°`.
+- **Sensor-health alerts no longer flap** — the fouling and
+  idle-but-making-way verdicts are raw per-tick threshold comparisons
+  (STW vs 0.3 kn, wind vs 3 kn, SOG vs 1 kn); a sensor hovering at a
+  threshold toggled the alert on and off every tick. Both now pass
+  through a reusable symmetric hysteresis
+  (`plugin/hysteresis.js`, `sensorHealth.sustainS`/`clearS`, default
+  10 s/10 s): a real fault still surfaces after the sustain window,
+  threshold hover raises nothing.
+- **Water-track log survives restart** — `navigation.deadReckoning.log`
+  and the trip log were persisted every flush but never restored at
+  start, resetting the headline to 0.00 nm on every server restart
+  mid-passage. Both are now restored from the `dr_state_store`.
+- **Map layers control usable again** — the divergence chip overlay sat
+  at the top-right corner on top of Leaflet's layers control (equal
+  z-index, later sibling wins), covering its toggle: broken-looking
+  styling and swallowed clicks meant selecting a chart provider did
+  nothing. The chip now lives at the bottom-right (attribution is off,
+  so the corner is free).
+- The DR vs GPS headline no longer shows a bearing below display
+  resolution (`0.00 nm / 306°` → `0.00 nm`): the bearing of a
+  zero-length noise vector is meaningless.
+
+### Changed
+- When the server has no charts configured, the online OpenStreetMap
+  fallback layer is offered in the layers control but no longer
+  auto-added to the map (it was documented as opt-in; the tile-less
+  offline-first plot is the default again until selected).
+
+### Added
+- `plugin/hysteresis.js` — generic symmetric sustain/clear debounce for
+  boolean conditions, extracted from the divergence advisory's shape
+  and unit-tested; also used for the sensor-health alerts.
+- Work doc #17 on the rngit board tracks this batch (dockside false
+  positives: divergence advisory, fouled paddlewheel, layers control).
+
 ## [0.1.0] - 2026-08-27
 
 ### Changed

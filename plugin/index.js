@@ -70,6 +70,7 @@ const {
   createDivergenceState,
   divergenceTick,
 } = require("./divergence.js");
+const { createFlagState, flagTick } = require("./hysteresis.js");
 const {
   composeFixEntry,
   composeTackEntry,
@@ -220,6 +221,17 @@ const DEFAULT_CONFIG = {
     sustainS: DEFAULT_SUSTAIN_S,
     clearS: DEFAULT_CLEAR_S,
   },
+  /**
+   * Sensor-health alert hysteresis (§6.3 fouling, idle-moving): the raw
+   * per-tick verdicts compare live sensors against fixed thresholds, so
+   * a gust or GPS wander hovering at a threshold would flap the alert
+   * on every tick. Both windows are symmetric — a real fault surfaces
+   * after sustainS, withdraws after clearS.
+   */
+  sensorHealth: {
+    sustainS: 10,
+    clearS: 10,
+  },
   logbook: {
     enabled: false,
     url: "http://localhost:3000/plugins/signalk-logbook/logs",
@@ -257,6 +269,8 @@ const deps = {
   computeRadius,
   createDivergenceState,
   divergenceTick,
+  createFlagState,
+  flagTick,
   composeFixEntry,
   composeTackEntry,
   composeObservationEntry,
@@ -383,6 +397,17 @@ module.exports = (app) => {
   /** @type {ReturnType<typeof createDivergenceState>|null} §7.3 divergence monitor */
   let divergence = null;
 
+  /**
+   * §6.3 sensor-health alert hysteresis: raw fouling / idle-moving
+   * verdicts debounce through these so threshold-hovering sensors
+   * can't flap notifications on every tick.
+   * @type {ReturnType<typeof createFlagState>|null}
+   */
+  let fouledFlag = null;
+
+  /** @type {ReturnType<typeof createFlagState>|null} */
+  let movingFlag = null;
+
   /** @type {object|null} §9.5 logbook write-through client */
   let logbook = null;
 
@@ -476,6 +501,10 @@ module.exports = (app) => {
         ...DEFAULT_CONFIG.divergence,
         ...(options?.divergence ?? {}),
       };
+      config.sensorHealth = {
+        ...DEFAULT_CONFIG.sensorHealth,
+        ...(options?.sensorHealth ?? {}),
+      };
       config.logbook = {
         ...DEFAULT_CONFIG.logbook,
         ...(options?.logbook ?? {}),
@@ -492,7 +521,15 @@ module.exports = (app) => {
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
       db = deps.openDatabase(dbPath);
       matrix = new deps.MatrixStore(db);
-      engine = new deps.DeadReckoningEngine();
+      // Restart survival: the cumulative water-track logs are persisted
+      // every flush — restore them so the headline log doesn't reset to
+      // 0.00 on every server restart mid-passage.
+      const savedLogNm = Number(deps.getState(db, "dr_log_nm"));
+      const savedTripNm = Number(deps.getState(db, "dr_trip_log_nm"));
+      engine = new deps.DeadReckoningEngine({
+        logNm: Number.isFinite(savedLogNm) ? savedLogNm : 0,
+        tripLogNm: Number.isFinite(savedTripNm) ? savedTripNm : 0,
+      });
       groundTrack = new deps.GroundTrack({
         capacity: Math.max(
           60,
@@ -541,6 +578,8 @@ module.exports = (app) => {
         settleSustainS: config.training.settleSustainS,
       });
       divergence = deps.createDivergenceState();
+      fouledFlag = deps.createFlagState();
+      movingFlag = deps.createFlagState();
       clockS = 0;
 
       // Seed the engine origin from the last known good position, if any.
@@ -663,6 +702,8 @@ module.exports = (app) => {
         });
       }
       divergence = null;
+      fouledFlag = null;
+      movingFlag = null;
       if (sensorHealthIssue) {
         publishNotification(PATHS.sensorHealth, {
           state: "normal",
@@ -784,6 +825,12 @@ module.exports = (app) => {
     const aws = unwrapNumber(deltaState.get("environment.wind.speedApparent"));
     const heel = unwrapHeel(deltaState.get("navigation.attitude"));
     const gps = unwrapPosition(deltaState.get("navigation.position"));
+    // One underway verdict for the whole tick (§7.1–2: moored/anchored is
+    // a different regime — divergence advisories, fouling suspicion and
+    // training are all suppressed there). Unknown state is treated as
+    // underway: not every install runs an autostate source.
+    const navState = deltaState.get("navigation.state");
+    const underway = navState !== "anchored" && navState !== "moored";
 
     // GPS-derived motion (independent of the water-track sensors):
     // updated every tick, used to detect "idle but making way" below.
@@ -801,7 +848,6 @@ module.exports = (app) => {
       // Publish why DR is idle so the UI (SPEC §14.1) can explain the empty
       // readout instead of leaving the user to guess. The vessel isn't
       // necessarily broken — moored/anchored with no STW/heading is normal.
-      const navState = deltaState.get("navigation.state");
       let reason;
       if (navState === "moored" || navState === "anchored") {
         reason = navState;
@@ -819,12 +865,25 @@ module.exports = (app) => {
       // polygon must keep growing — by the ground distance travelled with
       // no water track — or it falsely advertises confidence. GPS stays
       // authoritative until proven faulty or OVERRIDE (§7), so the
-      // watchkeeper is alerted, not left guessing.
-      const moving =
-        gpsMotion.speedKn != null && gpsMotion.speedKn > SOG_MOVING_KN;
+      // watchkeeper is alerted, not left guessing. Moored/anchored is the
+      // honest-stopped regime — dockside GPS wander is not "making way".
+      // The alert itself is debounced (config.sensorHealth): GPS wander
+      // hovering at the threshold must not flap it on and off.
+      const movingRaw =
+        underway &&
+        gpsMotion.speedKn != null &&
+        gpsMotion.speedKn > SOG_MOVING_KN;
+      const moving = deps.flagTick(
+        movingFlag,
+        movingRaw,
+        config.tickIntervalMs / 1000,
+        config.sensorHealth,
+      ).active;
+      if (movingRaw) {
+        idleRunNm += (gpsMotion.speedKn * config.tickIntervalMs) / 3600000;
+      }
       let uncertaintyValue = null;
       if (moving) {
-        idleRunNm += (gpsMotion.speedKn * config.tickIntervalMs) / 3600000;
         const u = deps.computeRadius({
           elapsedDistanceNm: engine.logNmSinceOrigin + idleRunNm,
           effectiveHitCount: 0, // unknown bin while idle — fallback growth
@@ -900,40 +959,57 @@ module.exports = (app) => {
     // When GPS is reliable and we're sailing (not motoring, paddlewheel
     // not fouled, not in a tack/gybe transient), compute the error vector
     // vs. GPS ground truth and EMA-merge it into the matching bin.
-    const tr = deps.trainingTick(training, {
-      timestampS: clockS,
-      gps,
-      stwKn: rawStw,
-      headingTrueDeg,
-      awaDeg,
-      awsKn: aws,
-      heelDeg: heel ?? 0,
-      propulsionState: deltaState.get("propulsion.main.state"),
-      current,
-      lookupLeewayDeg: corrections.leeway_angle,
-      lookupSpeedLoss: corrections.speed_loss,
-    });
-    if (tr.observation) {
-      matrix.update(
-        {
-          sail_state: sailState,
-          sea_state: seaState,
-          stwKn: rawStw,
-          awaDeg,
-          heelDeg: heel ?? 0,
-        },
-        tr.observation,
-        { source: "live" },
-      );
+    // Moored/anchored is excluded entirely (§7.1–2 different regime):
+    // a tied-up boat has STW≈0 by design while wind blows on the mast
+    // and GPS wanders at the dock — running the trainer there would
+    // flag a phantom fouled paddlewheel, write GPS-jitter observations
+    // into the matrix, and log mooring-yaw wind shifts as fake tacks.
+    let tr = { transient: false, fouled: false };
+    if (underway) {
+      tr = deps.trainingTick(training, {
+        timestampS: clockS,
+        gps,
+        stwKn: rawStw,
+        headingTrueDeg,
+        awaDeg,
+        awsKn: aws,
+        heelDeg: heel ?? 0,
+        propulsionState: deltaState.get("propulsion.main.state"),
+        current,
+        lookupLeewayDeg: corrections.leeway_angle,
+        lookupSpeedLoss: corrections.speed_loss,
+      });
+      if (tr.observation) {
+        matrix.update(
+          {
+            sail_state: sailState,
+            sea_state: seaState,
+            stwKn: rawStw,
+            awaDeg,
+            heelDeg: heel ?? 0,
+          },
+          tr.observation,
+          { source: "live" },
+        );
+      }
     }
 
     // §6.3: the fouling detector's verdict (STW≈0 while SOG/wind say
     // the boat moves) is surfaced, not just used to gate training — a
     // fouled paddlewheel silently integrating 0 speed is the classic
-    // way DR freezes while the vessel sails on.
+    // way DR freezes while the vessel sails on. While moored/anchored
+    // the detector doesn't run, so any earlier verdict is withdrawn.
+    // Debounced through config.sensorHealth: a paddlewheel or gust
+    // hovering at a threshold must not flap the alert on and off.
+    const fouled = deps.flagTick(
+      fouledFlag,
+      Boolean(tr.fouled),
+      config.tickIntervalMs / 1000,
+      config.sensorHealth,
+    ).active;
     setSensorHealth(
-      tr.fouled ? "fouled" : null,
-      tr.fouled
+      fouled ? "fouled" : null,
+      fouled
         ? "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR is integrating near-zero speed; verify position by other means"
         : null,
     );
@@ -942,10 +1018,12 @@ module.exports = (app) => {
     // edge is a completed maneuver; classify from the AWA change across
     // the window. Debounced so a beat's rapid back-to-back maneuvers
     // (or a botched tack immediately redone) log as one event.
-    const maneuver = deps.detectManeuver(training, {
-      awaDeg,
-      headingDeg: headingTrueDeg,
-    });
+    const maneuver = underway
+      ? deps.detectManeuver(training, {
+          awaDeg,
+          headingDeg: headingTrueDeg,
+        })
+      : null;
     if (maneuver) {
       const now = Date.now();
       const debounceMs = (config.logbook?.tackDebounceS ?? 120) * 1000;
@@ -984,9 +1062,11 @@ module.exports = (app) => {
       // expected growth (§8), with sustained-interval hysteresis so a
       // single jittery fix neither raises nor flaps the advisory.
       // §14.1's live divergence readout (distance + bearing) is published
-      // alongside. Suppressed at anchor/moored (different regime, §7.1–2).
-      const navState = deltaState.get("navigation.state");
-      const underway = navState !== "anchored" && navState !== "moored";
+      // alongside. Suppressed at anchor/moored (different regime, §7.1–2):
+      // while suppressed the monitor is not fed, an advisory raised just
+      // before the transition is withdrawn (it can never clear on its own
+      // otherwise), and the readout is nulled so the UI doesn't show a
+      // stale figure from the last underway tick.
       let dvg = null;
       if (gps && underway) {
         const distNm = deps.distanceNm(pos, gps);
@@ -1012,6 +1092,12 @@ module.exports = (app) => {
             message: `DR-GPS divergence back within expected uncertainty (${d.divergenceNm.toFixed(2)} nm)`,
           });
         }
+      } else if (divergence.active) {
+        divergence = deps.createDivergenceState();
+        publishNotification(PATHS.divergenceAdvisory, {
+          state: "normal",
+          message: "DR monitoring suspended while moored/anchored",
+        });
       }
 
       publish({
@@ -1033,10 +1119,12 @@ module.exports = (app) => {
         [PATHS.state]: {
           status: "underway",
           transient: tr.transient,
-          fouled: tr.fouled,
+          fouled,
         },
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
-        ...(dvg ? { [PATHS.divergence]: dvg } : {}),
+        // Always published: null while suppressed (moored/anchored or no
+        // GPS) so consumers drop any stale underway figure.
+        [PATHS.divergence]: dvg,
       });
     }
   }

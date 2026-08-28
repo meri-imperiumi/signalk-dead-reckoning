@@ -130,14 +130,37 @@ test("computeRadius: radius scales with elapsed distance, not time", () => {
   assert.ok(Math.abs(b.radius_nm - 2 * a.radius_nm) < 1e-9);
 });
 
-test("computeRadius: radius is 0 at excursion start (no distance run)", () => {
+test("computeRadius: radius floors at GNSS noise at excursion start (no distance run)", () => {
+  // Zero distance run must not report a point-exact DR position: the
+  // radius can never honestly be smaller than the GPS noise the origin
+  // was seeded from, or any dockside GPS wander "exceeds expected
+  // uncertainty" and trips the divergence advisory on a moored boat.
   const out = u.computeRadius({
     elapsedDistanceNm: 0,
     effectiveHitCount: 100,
     deviationRows: [{ deviation_nm: 1, dr_elapsed_seconds: 1000 }],
     stwKn: 5,
   });
-  assert.strictEqual(out.radius_nm, 0);
+  assert.strictEqual(out.radius_nm, u.MIN_RADIUS_NM);
+  assert.ok(u.MIN_RADIUS_NM >= 0.02, "floor below GNSS noise scale");
+});
+
+test("computeRadius: floor only applies below it — growth is unchanged above", () => {
+  const far = u.computeRadius({
+    elapsedDistanceNm: 10,
+    effectiveHitCount: 0,
+    deviationRows: [],
+    stwKn: 5,
+  });
+  assert.ok(Math.abs(far.radius_nm - u.fallbackRateNmPerNm() * 10) < 1e-9);
+  const near = u.computeRadius({
+    elapsedDistanceNm: 0.01,
+    effectiveHitCount: 0,
+    deviationRows: [],
+    stwKn: 5,
+  });
+  // 0.01 nm run × 0.01745 ≈ 0.00017 nm — below floor → floored.
+  assert.strictEqual(near.radius_nm, u.MIN_RADIUS_NM);
 });
 
 test("computeRadius: blend regime between fallback and empirical", () => {
