@@ -211,6 +211,11 @@ class DrApp extends HTMLElement {
     const root = this.attachShadow({ mode: "open" });
     root.appendChild(template.content.cloneNode(true));
 
+    /** @type {string|null} vessel's navigation.state ("moored", …) */
+    this.vesselNavState = null;
+    /** @type {object|null} last navigation.deadReckoning.state value */
+    this.drStateValue = null;
+
     /** @type {HTMLButtonElement|null} */
     this.btn = root.querySelector("#dr-override-btn");
     /** @type {HTMLElement|null} */
@@ -410,6 +415,7 @@ class DrApp extends HTMLElement {
       "navigation.deadReckoning.divergence",
       "navigation.deadReckoning.state",
       "navigation.deadReckoning.elapsedSinceFix",
+      "navigation.state",
       "navigation.position",
       "navigation.gnss.type",
       "navigation.gnss.method",
@@ -466,6 +472,8 @@ class DrApp extends HTMLElement {
       const self = await res.json();
       const nav = self?.vessels?.self ?? self;
       const pos = nav?.navigation?.position?.value ?? nav?.navigation?.position;
+      const navState = nav?.navigation?.state?.value ?? nav?.navigation?.state;
+      if (navState != null) this.applyValue("navigation.state", navState);
       if (pos?.latitude != null) {
         this.applyValue("navigation.position", pos);
       }
@@ -587,7 +595,14 @@ class DrApp extends HTMLElement {
       case "navigation.deadReckoning.active":
         this.renderOverride(Boolean(value));
         break;
+      case "navigation.state":
+        this.vesselNavState = typeof value === "string" ? value : null;
+        // Re-render the DR status line — its wording depends on the
+        // vessel state ("DR warm — moored").
+        if (this.drStateValue) this.renderDrState(this.drStateValue);
+        break;
       case "navigation.deadReckoning.state":
+        this.drStateValue = value;
         this.renderDrState(value);
         break;
       case "navigation.deadReckoning.elapsedSinceFix":
@@ -866,29 +881,17 @@ class DrApp extends HTMLElement {
     }
     if (value.status === "idle") {
       panel.classList.add("idle");
-      const reason = value.reason ?? "waiting for speed and heading";
-      if (value.moving) {
-        // Idle while making way — the dangerous case (fouled paddlewheel,
-        // sensor dropout): DR is stale, not merely paused.
-        panel.classList.add("alert");
-        text.textContent = `⚠ DR stale — ${reason}, but the vessel is making way. DR position is NOT tracking; uncertainty is growing.`;
-      } else {
-        text.textContent = `Dead reckoning idle — ${reason}. GPS position still shown on map.`;
-      }
+      if (value.moving) panel.classList.add("alert");
     } else if (value.status === "underway") {
       panel.classList.add("underway");
-      if (value.fouled) {
-        panel.classList.add("alert");
-        text.textContent =
-          "⚠ Paddlewheel appears fouled — STW≈0 while making way. DR is integrating near-zero speed.";
-      } else if (value.transient) {
-        panel.classList.add("transient");
-        text.textContent =
-          "Dead reckoning active — tack/gybe in progress, divergence may spike temporarily.";
-      } else {
-        text.textContent = "Dead reckoning active";
-      }
+      if (value.fouled) panel.classList.add("alert");
+      else if (value.transient) panel.classList.add("transient");
+    } else if (value.status === "warm") {
+      // Engine alive, boat tied up — muted, no status color crying wolf.
+      if (value.fouled) panel.classList.add("alert");
     }
+    const next = vm.drStatusText({ ...value, navState: this.vesselNavState });
+    if (next != null) text.textContent = next;
   }
 
   /**

@@ -1117,7 +1117,13 @@ module.exports = (app) => {
         // a large DR divergence is expected (unsteady flow over the
         // paddlewheel, rapid heading changes) and not yet a fault signal.
         [PATHS.state]: {
-          status: "underway",
+          // "underway" = integrating and the vessel is believed making
+          // way; "warm" = integrating on a moored/anchored boat (SPEC §5
+          // keeps the shadow boat ticking for instant OVERRIDE handoff —
+          // that is not being under way). The vessel's own
+          // `navigation.state` already carries moored/anchored; it is
+          // not duplicated here.
+          status: underway ? "underway" : "warm",
           transient: tr.transient,
           fouled,
         },

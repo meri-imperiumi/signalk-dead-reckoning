@@ -207,6 +207,38 @@ test("methodLabel: short watchkeeper-sized labels for the spec tokens", async ()
   assert.strictEqual(vm.methodLabel(undefined), "—");
 });
 
+test("drStatusText: engine-warm on a tied-up boat is its own status, not 'underway'", async () => {
+  const vm = await loadVm();
+  assert.strictEqual(
+    vm.drStatusText({ status: "warm", navState: "moored" }),
+    "DR warm — moored, integrating sensors",
+  );
+  assert.strictEqual(
+    vm.drStatusText({ status: "warm", navState: "anchored" }),
+    "DR warm — anchored, integrating sensors",
+  );
+  // Fouling outranks the warm wording.
+  assert.match(
+    vm.drStatusText({ status: "warm", navState: "moored", fouled: true }),
+    /fouled/,
+  );
+  assert.strictEqual(
+    vm.drStatusText({ status: "underway" }),
+    "Dead reckoning active",
+  );
+  assert.strictEqual(
+    vm.drStatusText({ status: "underway", transient: true }),
+    "Dead reckoning active — tack/gybe in progress, divergence may spike temporarily.",
+  );
+  assert.match(vm.drStatusText({ status: "idle", reason: "moored" }), /idle/);
+  assert.match(
+    vm.drStatusText({ status: "idle", moving: true, reason: "no heading" }),
+    /DR stale/,
+  );
+  assert.strictEqual(vm.drStatusText(null), "No dead-reckoning data");
+  assert.strictEqual(vm.drStatusText({ status: "???" }), null);
+});
+
 test("uncertaintySpec: passes radius/method with DR center", async () => {
   const vm = await loadVm();
   const u = vm.uncertaintySpec([60, 24], {

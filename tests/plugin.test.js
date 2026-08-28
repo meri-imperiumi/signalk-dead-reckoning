@@ -1470,8 +1470,12 @@ test("moored from the start: DR state clean (no fouled, no transient), fouled de
     .filter((v) => v.path === "navigation.deadReckoning.state");
   assert.ok(stateDeltas.length > 0, "no DR state delta published");
   const last = stateDeltas[stateDeltas.length - 1].value;
+  // Engine warm on a tied-up boat: its own status, not "underway" —
+  // and no navState duplication (navigation.state already flows).
+  assert.strictEqual(last.status, "warm");
   assert.strictEqual(last.fouled, false);
   assert.strictEqual(last.transient, false);
+  assert.ok(!("navState" in last), "navState must not be republished");
   const health = app.handledMessages
     .flatMap((m) => m.message?.updates ?? [])
     .flatMap((u) => u.values ?? [])

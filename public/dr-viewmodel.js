@@ -404,6 +404,47 @@ export function divergenceText(d) {
 }
 
 /**
+ * Status-line text for the DR state panel. Pure — the panel's CSS
+ * classes stay in the adapter.
+ *
+ * @param {object|null|undefined} s - navigation.deadReckoning.state value
+ *   ({status: "underway"|"warm"|"idle", …}); the app merges in `navState`
+ *   from the vessel's own navigation.state subscription.
+ * @returns {string|null} null when the state isn't recognized (caller
+ *   keeps the previous text)
+ */
+export function drStatusText(s) {
+  if (!s) return "No dead-reckoning data";
+  if (s.status === "idle") {
+    const reason = s.reason ?? "waiting for speed and heading";
+    if (s.moving) {
+      // Idle while making way — the dangerous case (fouled paddlewheel,
+      // sensor dropout): DR is stale, not merely paused.
+      return `⚠ DR stale — ${reason}, but the vessel is making way. DR position is NOT tracking; uncertainty is growing.`;
+    }
+    return `Dead reckoning idle — ${reason}. GPS position still shown on map.`;
+  }
+  if (s.status === "underway") {
+    if (s.fouled) {
+      return "⚠ Paddlewheel appears fouled — STW≈0 while making way. DR is integrating near-zero speed.";
+    }
+    if (s.transient) {
+      return "Dead reckoning active — tack/gybe in progress, divergence may spike temporarily.";
+    }
+    return "Dead reckoning active";
+  }
+  if (s.status === "warm") {
+    // The engine runs warm on a tied-up boat (SPEC §5 — instant OVERRIDE
+    // handoff): integrating an honest 0 kn is not "underway".
+    if (s.fouled) {
+      return "⚠ Paddlewheel appears fouled — STW≈0 while making way. DR is integrating near-zero speed.";
+    }
+    return `DR warm — ${s.navState ?? "moored"}, integrating sensors`;
+  }
+  return null;
+}
+
+/**
  * Short display label for the DR calculation method (SPEC §3.1). The
  * wire value stays the spec token (`inertial-paddlewheel` etc.); the
  * headline shows the watchkeeper-sized word for it.

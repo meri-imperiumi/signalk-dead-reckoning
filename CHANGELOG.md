@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reserved methods) with the full token on hover — one of five figures,
   it previously gave a full spec token permanent large-type real estate
   despite having exactly one possible value today.
+- The DR status no longer claims the vessel is `underway` while
+  moored: `navigation.deadReckoning.state.status` gains a `"warm"`
+  value (engine integrating on a tied-up boat, SPEC §5 runs it warm for
+  instant OVERRIDE handoff — that is not being under way) alongside
+  `"underway"` and `"idle"`. The webapp subscribes to the vessel's own
+  `navigation.state` (already in the system — nothing is republished
+  inside our deltas) and words the line accordingly:
+  `DR warm — moored/anchored, integrating sensors` vs
+  `Dead reckoning active`. Text logic moved to the pure `drStatusText()`
+  view-model helper.
 
 ## [0.2.0] - 2026-08-27
 
