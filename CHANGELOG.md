@@ -88,6 +88,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] - 2026-08-27
 
 ### Fixed
+- **Map no longer opens blank — defaults to the first chart provider.**
+  The webapp previously kept its tile-less offline-first default unless
+  the server had *configured* charts, so on servers without any (the
+  common case: the layers control showed only "OpenStreetMap (online)",
+  unselected) the plot opened on an empty dark canvas. The first entry
+  of the chart list — first configured chart when the server has them,
+  otherwise the OSM online fallback — is now auto-selected on load, and
+  duplicate chart names no longer clobber each other's entry in the
+  layers control.
 - **Dockside false positives while moored/anchored** — three alerts
   that misfire on a tied-up boat are now suppressed in the moored/
   anchored regime (consistent with the divergence monitor's existing

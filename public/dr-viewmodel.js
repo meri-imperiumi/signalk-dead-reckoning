@@ -506,9 +506,9 @@ export function elapsedText(s) {
  * Parses Signal K's `resources/charts` object into tile layers the map
  * can render (chart identifier/name + a `{z}/{x}/{y}`-template URL).
  * Charts without a `tilemapUrl` (WMS, S-57, PDFs…) are dropped. No OSM
- * fallback — an offline-first plugin defaults to the tile-less vector
- * plot; basemaps come from whatever the server is configured to serve
- * (often offline MBTiles).
+ * fallback here — basemaps come from whatever the server is configured
+ * to serve (often offline MBTiles); the fallback lives in
+ * DEFAULT_OSM_LAYER / chartLayersWithFallback.
  *
  * Ported from signalk-logbook's src/helpers/charts.js (same server API).
  *
@@ -538,11 +538,12 @@ export function parseChartLayers(resource) {
 }
 
 /**
- * Last-resort basemap when the server has no charts configured (e.g.
- * `/signalk/v1/api/resources/charts` 404s). Offered as an *opt-in*
- * layer in the control — never auto-selected — so the DR plot stays
- * tile-less by default (offline-first), and the user can turn a
- * basemap on when online. Mirrors signalk-logbook's DEFAULT_LAYER.
+ * Basemap when the server has no charts configured (e.g.
+ * `/signalk/v1/api/resources/charts` 404s). Used as the *default*
+ * selection in that case — the map defaults to the first chart
+ * provider and never opens blank — and the watchkeeper can switch it
+ * off in the layers control when offline (tiles simply fail dark).
+ * Mirrors signalk-logbook's DEFAULT_LAYER.
  */
 export const DEFAULT_OSM_LAYER = {
   identifier: "osm",

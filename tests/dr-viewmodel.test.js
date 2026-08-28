@@ -315,6 +315,32 @@ test("chartLayersWithFallback: OSM fallback when nothing configured (404/empty)"
   }
 });
 
+test("chartLayersWithFallback: first layer is always a default-selectable provider (map never opens blank)", async () => {
+  const vm = await loadVm();
+  // Contract for dr-map-view's initMap: charts[0] is what gets
+  // auto-added to the map. Whatever the server says (or fails to say),
+  // the list is non-empty and its head is a usable tile layer.
+  const cases = [
+    null, // fetch 404 / not ok → null resource
+    {}, // resources provider enabled but no charts saved
+    {
+      b: { tilemapUrl: "http://x/b/{z}/{x}/{y}.png", name: "B Tiles" },
+      a: { tilemapUrl: "http://x/a/{z}/{x}/{y}.png", name: "A Tiles" },
+    },
+  ];
+  for (const resource of cases) {
+    const layers = vm.chartLayersWithFallback(resource);
+    assert.ok(layers.length >= 1, `non-empty for ${JSON.stringify(resource)}`);
+    const first = layers[0];
+    assert.ok(first.identifier, "identifier present");
+    assert.ok(first.name, "name present");
+    assert.match(first.url, /\{z\}\/\{x\}\/\{y\}/, "tile URL template");
+  }
+  // Sorted configured list: first = "A Tiles"; fallback list: first = osm.
+  assert.strictEqual(vm.chartLayersWithFallback(cases[2])[0].name, "A Tiles");
+  assert.strictEqual(vm.chartLayersWithFallback(null)[0].identifier, "osm");
+});
+
 test("bearingToTrue: east variation adds, west subtracts, wraps 360", async () => {
   const vm = await loadVm();
   closeTo(vm.bearingToTrue(350, 15), 5, 0.001, "east var wraps");

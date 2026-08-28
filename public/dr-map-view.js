@@ -3,12 +3,13 @@
  * inertial "Ghost Track" (SPEC §14.1), with uncertainty polygon, fixes,
  * LOP/CPL overlays, snap-to-fix vectors, and the live divergence readout.
  *
- * Tile-less by default (offline-first): geometry renders on a plain
- * dark background. Basemaps come from the server's *configured*
- * charts (`/signalk/v1/api/resources/charts` — offline MBTiles, tile
- * proxies, whatever the user set up), exposed via the layers control.
- * No hardcoded OSM (referer-403s on self-hosted setups, and the EW
- * operating mode is comms-denied).
+ * Defaults to the first chart provider so the plot never opens blank:
+ * the server's *configured* charts
+ * (`/signalk/v1/api/resources/charts` — offline MBTiles, tile proxies,
+ * whatever the user set up) when available, otherwise the OSM online
+ * fallback; the layers control switches between them. Only a failed
+ * charts request leaves the canvas tile-less (plain dark background).
+ * No hardcoded OSM-only default (referer-403s on self-hosted setups).
  *
  * Geometry/style decisions live in dr-viewmodel.js (pure); this file
  * is the Leaflet adapter. Leaflet is vendored at ./vendor/leaflet/
@@ -221,12 +222,9 @@ class DrMapView extends HTMLElement {
     );
 
     // Basemap: Signal K configured charts (offline MBTiles / tile proxies)
-    // when available. The first *configured* chart is added to the map so
-    // the plot has context immediately; the rest are registered in the
-    // layers control for switching. When the server has no charts the
-    // online OSM fallback is offered in the control but NEVER auto-added
-    // (offline-first: the DR plot stays tile-less until the watchkeeper
-    // opts in — vm.DEFAULT_OSM_LAYER's documented contract).
+    // when available, else the OSM online fallback. The first provider is
+    // auto-selected either way — a blank chart on open reads as broken
+    // (user feedback 2026-09); switching offline is one tap in the control.
     fetch("/signalk/v1/api/resources/charts")
       .then((r) => (r.ok ? r.json() : null))
       .then((resource) => {
@@ -241,12 +239,15 @@ class DrMapView extends HTMLElement {
             maxNativeZoom: c.maxZoom,
           });
           this.tileLayers[c.identifier] = layer;
-          bases[c.name] = layer;
+          // The control is keyed by display name — dedupe so two charts
+          // sharing a name don't clobber each other's radio entry.
+          let label = c.name;
+          for (let n = 2; bases[label]; n++) label = `${c.name} (${n})`;
+          bases[label] = layer;
         }
-        if (configured.length > 0) {
-          // Auto-select only a real configured chart, never the fallback.
-          Object.values(bases)[0].addTo(this.map);
-        }
+        // Default to the first chart provider (list is name-sorted):
+        // first configured chart, or the OSM fallback when none.
+        this.tileLayers[charts[0].identifier]?.addTo(this.map);
         if (Object.keys(bases).length > 1 || configured.length === 0) {
           L.control.layers(bases, {}, { collapsed: true }).addTo(this.map);
         }
