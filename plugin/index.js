@@ -80,6 +80,7 @@ const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
 const { reduceSight, reduceNoonSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
 const { registerPlotterExtension } = require("./plotterext.js");
+const { registerStatusTileExamples } = require("./statustilesexamples.js");
 const {
   createShadowVesselPublisher,
   resolveVelocity: resolveShadowVelocity,
@@ -418,6 +419,9 @@ module.exports = (app) => {
 
   /** @type {(() => void)|null} plotter-extension provider teardown (work doc #19) */
   let plotterExtTeardown = null;
+
+  /** @type {(() => void)|null} status-tiles examples provider teardown (work doc #22) */
+  let statusTileExamplesTeardown = null;
 
   /** @type {{publish: Function, stop: Function}|null} shadow vessel publisher (work doc #21) */
   let shadow = null;
@@ -804,6 +808,15 @@ module.exports = (app) => {
         id: PLUGIN_ID,
       });
 
+      // Status Tiles example-set provider (work doc #22): advertise
+      // the DR position tile set so the Status Tiles webapp offers it
+      // as a one-tap "Add" that merges into the user's panel. Read-only,
+      // running-gated — returns {} when stopped so a disabled plugin
+      // contributes no stale sets.
+      statusTileExamplesTeardown = registerStatusTileExamples(app, {
+        id: PLUGIN_ID,
+      });
+
       // Public config endpoint (CONFIG_PATH): mounted on the app so
       // anonymous / read-only clients can read the plugin config
       // (incl. positionFormat) without admin auth. Mirrors
@@ -861,6 +874,8 @@ module.exports = (app) => {
       training = null;
       plotterExtTeardown?.();
       plotterExtTeardown = null;
+      statusTileExamplesTeardown?.();
+      statusTileExamplesTeardown = null;
       shadow?.stop();
       shadow = null;
       // Hygiene: clear a live advisory so it doesn't linger after the

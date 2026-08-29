@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Example Status Tiles set (work doc #22)** — the plugin now ships a
+  ready-made Status Tiles set (`status-tiles-examples.json`) that a
+  boat owner copies into their panel with one tap — no JSON editing,
+  no hand-authoring predicates. The set exposes the underway DR
+  integrity tile: the sensor-health and divergence-advisory
+  notifications, the DR-override (`navigation.deadReckoning.active`)
+  state, and banded checks on the uncertainty radius (1 nm warn / 3 nm
+  crit) and time-since-fix (3 h / 6 h), with footer readouts for
+  uncertainty, DR–GPS divergence, and the DR method. It is advertised
+  through the standard resources API as a read-only
+  `statusTileExamples` provider (keyed by the plugin id, returning `{}`
+  when stopped so a disabled plugin contributes no stale sets),
+  which the signalk-status-tiles webapp discovers and offers as a
+  one-tap "Add" that merges into the user's config (skipping existing
+  ids — idempotent, never overwrites user edits). Mirrors the existing
+  plotter-extension provider pattern; no running server is required to
+  ship or consume it.
 - **Shadow vessel on chart plotters (work doc #21)** — the DR
   shadow-boat position is now published as a synthetic vessel on a
   stable `vessels.<uuid>` context, so chart plotters that source

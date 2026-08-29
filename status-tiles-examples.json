@@ -1,0 +1,120 @@
+{
+  "name": "Dead Reckoning examples",
+  "description": "Example Status Tiles set for signalk-dead-reckoning: DR position integrity while underway (GPS↔DR divergence, uncertainty radius, time-since-fix, and the sensor-health / divergence-advisory notifications). Requires navigation.state to be populated (e.g. by signalk-autostate) for the underway context.",
+  "sets": [
+    {
+      "id": "dr-position",
+      "name": "DR position",
+      "description": "DR integrity while underway: divergence advisory, uncertainty radius, time since last fix, and the DR override state.",
+      "contexts": [
+        {
+          "id": "drUnderway",
+          "label": "Underway",
+          "predicate": {
+            "path": "navigation.state",
+            "compare": "equals",
+            "value": "sailing",
+            "anyOf": [
+              {
+                "path": "navigation.state",
+                "compare": "equals",
+                "value": "motoring"
+              }
+            ]
+          }
+        }
+      ],
+      "tiles": [
+        {
+          "id": "drPosition",
+          "label": "DR",
+          "context": "drUnderway",
+          "size": "1x1",
+          "checks": [
+            {
+              "type": "notification",
+              "path": "notifications.navigation.deadReckoning.status",
+              "severityMap": {
+                "normal": "green",
+                "alert": "red",
+                "warn": "amber",
+                "alarm": "red",
+                "emergency": "red"
+              },
+              "staleState": "neutral",
+              "staleMs": 0
+            },
+            {
+              "type": "notification",
+              "path": "notifications.navigation.deadReckoning.divergenceAdvisory",
+              "severityMap": {
+                "normal": "green",
+                "alert": "amber",
+                "warn": "amber",
+                "alarm": "red",
+                "emergency": "red"
+              },
+              "staleState": "neutral",
+              "staleMs": 0
+            },
+            {
+              "type": "stateMatch",
+              "path": "navigation.deadReckoning.active",
+              "map": [
+                {
+                  "value": "true",
+                  "state": "amber"
+                }
+              ],
+              "default": "green",
+              "reason": "DR override engaged — GPS untrusted",
+              "staleState": "neutral",
+              "staleMs": 0
+            },
+            {
+              "type": "banded",
+              "path": "navigation.deadReckoning.uncertainty.radius",
+              "high": {
+                "warn": 1852,
+                "crit": 5556,
+                "warnState": "amber",
+                "critState": "red"
+              },
+              "reason": "DR uncertainty above band",
+              "staleState": "neutral",
+              "staleMs": 70000
+            },
+            {
+              "type": "banded",
+              "path": "navigation.deadReckoning.elapsedSinceFix",
+              "high": {
+                "warn": 10800,
+                "crit": 21600,
+                "warnState": "amber",
+                "critState": "red"
+              },
+              "reason": "fix overdue — confirm position",
+              "display": true,
+              "staleState": "amber",
+              "staleMs": 70000
+            }
+          ],
+          "footer": [
+            {
+              "label": "Unc",
+              "path": "navigation.deadReckoning.uncertainty.radius"
+            },
+            {
+              "label": "DR–GPS",
+              "path": "navigation.deadReckoning.divergence.distance"
+            },
+            {
+              "label": "Method",
+              "path": "navigation.deadReckoning.method"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
