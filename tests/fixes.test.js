@@ -20,6 +20,7 @@ const {
   distanceToLop,
   distanceToCircle,
   residualSpreadNm,
+  leastSquaresFit,
   resolveFix,
   advanceObservation,
 } = require("../plugin/fixes.js");
@@ -278,35 +279,105 @@ test("resolveFix: Circle × Circle → both candidates, nearest DR primary", () 
   assert.ok(dPrimary <= dAlt);
 });
 
-test("resolveFix: three LOPs forming a cocked hat → least-squares fit, residual > 0", () => {
-  // Three bearings through three different points, none concurrent: a
-  // classic cocked hat. The fit lands near the middle with a nonzero spread.
-  const obs = [
-    {
+test("resolveFix: three LOPs forming a cocked hat → exact least-squares point and residual", () => {
+  // Three bearings 120° apart through the same assumed position, all
+  // with the same intercept: the cocked hat is an equilateral triangle
+  // centered on the assumed position, so the least-squares point is the
+  // assumed position itself and the residual equals the intercept.
+  // Regression: the previous fixed-step solver could only travel a few
+  // hundred metres from its start, returning (nearly) the DR position
+  // with a residual that grew in lockstep with the intercept — the same
+  // fix for every intercept, which read as a plausible cocked hat.
+  for (const icptNm of [1, 10, 30]) {
+    const obs = [0, 120, 240].map((az) => ({
       kind: "lop",
       assumed_lat: 60,
       assumed_lon: 24,
-      azimuth_true: 0,
-      intercept_nm: 1,
-    },
-    {
-      kind: "lop",
-      assumed_lat: 60,
-      assumed_lon: 24,
-      azimuth_true: 120,
-      intercept_nm: 1,
-    },
-    {
-      kind: "lop",
-      assumed_lat: 60,
-      assumed_lon: 24,
-      azimuth_true: 240,
-      intercept_nm: 1,
-    },
+      azimuth_true: az,
+      intercept_nm: icptNm,
+    }));
+    const r = resolveFix(obs, CENTER, DR);
+    assert.ok(r);
+    assert.ok(
+      distanceNm(CENTER, { latitude: r.latitude, longitude: r.longitude }) <
+        0.01,
+      `intercept ${icptNm}nm: fit should sit on the assumed position, got (${r.latitude}, ${r.longitude})`,
+    );
+    assert.ok(
+      Math.abs(r.residual_nm - icptNm) < 0.05,
+      `intercept ${icptNm}nm: residual should be ${icptNm}, got ${r.residual_nm}`,
+    );
+  }
+});
+
+test("leastSquaresFit: over-determined lines, hand-computable answer", () => {
+  // Minimize x² + y² + (x − D)² over lines x=0, y=0, x=D → (D/2, 0),
+  // residual D/2. D = 10 nm puts the answer ~9 km from the start — well
+  // beyond what the old fixed-step descent could ever reach.
+  const nm = 1852;
+  const D = 10 * nm;
+  const lops = [
+    { n: { x: 1, y: 0 }, c: 0 },
+    { n: { x: 0, y: 1 }, c: 0 },
+    { n: { x: 1, y: 0 }, c: D },
   ];
-  const r = resolveFix(obs, CENTER, DR);
-  assert.ok(r);
-  assert.ok(r.residual_nm > 0.1); // not all concurrent → spread
+  const { point, residual } = leastSquaresFit(
+    lops,
+    { centers: [], radii: [] },
+    {
+      x: 0,
+      y: 0,
+    },
+  );
+  assert.ok(Math.abs(point.x - D / 2) < 1, `x ${point.x}`);
+  assert.ok(Math.abs(point.y) < 1, `y ${point.y}`);
+  assert.ok(Math.abs(residual.maxNm - 5) < 0.01, `maxNm ${residual.maxNm}`);
+});
+
+test("leastSquaresFit: mixed line + circles converges to the unique minimum", () => {
+  // Line x=5000 and two 3000 m circles at (0,0) and (10000,0): by
+  // symmetry the minimum is at (5000, 0) with max residual 2000 m.
+  const lops = [{ n: { x: 1, y: 0 }, c: 5000 }];
+  const circles = {
+    centers: [
+      { x: 0, y: 0 },
+      { x: 10000, y: 0 },
+    ],
+    radii: [3000, 3000],
+  };
+  const { point, residual } = leastSquaresFit(lops, circles, { x: 0, y: 0 });
+  assert.ok(Math.abs(point.x - 5000) < 1, `x ${point.x}`);
+  assert.ok(Math.abs(point.y) < 1, `y ${point.y}`);
+  assert.ok(
+    Math.abs(residual.maxNm - 2000 / 1852) < 0.01,
+    `maxNm ${residual.maxNm}`,
+  );
+});
+
+test("leastSquaresFit: parallel lines fall back to the midline nearest the start", () => {
+  // Two parallel E-W lines 2 nm apart (the lower one weighted ×2 by a
+  // duplicate) : the loss is flat along east-west, so the answer is
+  // pinned to the start's east-west coordinate at the weighted mean
+  // offset y = (0+0+2nm)/3, with the far line's distance as residual.
+  // The Tikhonov term makes the singular normal equations return that
+  // instead of blowing up.
+  const nm = 1852;
+  const lops = [
+    { n: { x: 0, y: 1 }, c: 0 },
+    { n: { x: 0, y: 1 }, c: 2 * nm },
+    { n: { x: 0, y: 1 }, c: 0 },
+  ];
+  const { point, residual } = leastSquaresFit(
+    lops,
+    { centers: [], radii: [] },
+    {
+      x: 4000,
+      y: -3000,
+    },
+  );
+  assert.ok(Math.abs(point.x - 4000) < 1, `x ${point.x}`);
+  assert.ok(Math.abs(point.y - (2 * nm) / 3) < 1, `y ${point.y}`);
+  assert.ok(Math.abs(residual.maxNm - 4 / 3) < 0.01, `maxNm ${residual.maxNm}`);
 });
 
 test("advanceObservation: LOP reference point moves by the displacement", () => {

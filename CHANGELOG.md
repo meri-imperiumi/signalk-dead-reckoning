@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The multi-fix resolver now actually converges on the least-squares
+  fix.** `leastSquaresFit()` — used for any fix combining three or more
+  lines/circles of position, and as the fallback when two don't
+  geometrically intersect — ran gradient descent with a fixed step size
+  that bounded its total travel to a few hundred metres from the DR
+  position, regardless of how far away the true answer was. With
+  realistic celestial intercepts (several to tens of nautical miles)
+  it stalled near the start point and reported it as the fix: a
+  symmetric three-star sight returned the same position for intercepts
+  from 0.1 to 50 nm, with only the residual growing in lockstep —
+  readable as a plausible cocked-hat spread. Lines-only problems are
+  now solved exactly via the normal equations (the same 2×2 solve the
+  two-LOP intersection uses, generalized to N lines), with a tiny
+  Tikhonov term so all-parallel lines return the midline point nearest
+  the DR instead of a degenerate solve; circles are refined by
+  damped Gauss-Newton (Levenberg-Marquardt) from the better of the
+  linear solution and the DR start, converging in a handful of
+  iterations and never returning a worse fit than it started with.
+- **DR track interpolation crosses the antimeridian the short way.**
+  `GroundTrack.positionAt()` interpolated longitude linearly, so a
+  dateline crossing (179.9°E → 179.9°W) interpolated through
+  Greenwich instead of over ±180° — a running-fix advance taken
+  mid-crossing measured ~half the globe instead of the actual 0.2°
+  run. Longitude now interpolates the wrapped ±180° delta and the
+  result is normalized to [-180, 180).
+- **Calibration matrix bins no longer blend the two tacks together in
+  light air.** The bin key folded AWA to |AWA| on the assumption that
+  the signed heel bin keeps the tacks apart — but at heel angles
+  below half the heel bin width both tacks quantize to `heel_bin 0`
+  (and a boat without a heel sensor lives there at every wind
+  strength), so opposite-tack observations with opposite-sign leeway
+  EMA-averaged toward zero in the same bin. `quantizeAwa()` now keeps
+  the sign: the AWA sign is the tack marker everywhere, and heel
+  remains the physics dimension. Bins written by earlier versions
+  under the folded key are simply retrained (fresh bins learn at full
+  rate); no migration is needed.
+
 ### Changed
 - **The webapp's "Ghost Track" heading above the map is gone.** It
   wasted vertical space the map could use — the map card now opens with

@@ -10,6 +10,8 @@
  * @file bins.js
  */
 
+const { normalizeDeg180 } = require("./geo.js");
+
 /** STW bin width in knots (SPEC §4.1 example: nearest 0.5kt). */
 const STW_BIN_WIDTH = 0.5;
 
@@ -46,18 +48,24 @@ function quantizeStw(stwKn) {
 }
 
 /**
- * Quantizes apparent wind angle (degrees, absolute) to the matrix bin.
+ * Quantizes apparent wind angle (degrees, signed) to the matrix bin.
  *
- * AWA is taken as an absolute angle (port/starboard symmetry holds for the
- * leeway/speed-loss physics the matrix learns), so we fold to [0, 180]
- * before quantizing.
+ * The sign is kept — it is the tack marker. The learned leeway angle
+ * is signed (leeward-positive), so port-tack and starboard-tack
+ * observations must never EMA-average into the same bin: their leeway
+ * signs are opposite and would blend toward zero. Heel sign separates
+ * the tacks while the boat heels, but at light-air heel (< half the
+ * heel bin width) both tacks quantize to heel_bin 0 — and a boat with
+ * no heel sensor lives there at every wind strength — so folding AWA
+ * to |AWA| would collapse the tacks exactly there. The input is
+ * normalized to [-180, 180) first so 0–360-style angles bin
+ * identically to their signed forms.
  *
  * @param {number} awaDeg - apparent wind angle in degrees (signed ok)
  * @returns {number}
  */
 function quantizeAwa(awaDeg) {
-  const folded = Math.min(Math.abs(awaDeg), 180);
-  return quantize(folded, AWA_BIN_WIDTH);
+  return quantize(normalizeDeg180(awaDeg), AWA_BIN_WIDTH);
 }
 
 /**

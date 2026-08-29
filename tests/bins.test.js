@@ -35,14 +35,29 @@ test("quantizeStw rounds to nearest 0.5kt", () => {
   assert.strictEqual(STW_BIN_WIDTH, 0.5);
 });
 
-test("quantizeAwa folds to [0,180] and rounds to 5deg", () => {
+test("quantizeAwa keeps sign for tack distinction, rounds to 5deg", () => {
   assert.strictEqual(quantizeAwa(42), 40);
   assert.strictEqual(quantizeAwa(43), 45);
-  // Negative AWA (port) folds to absolute
-  assert.strictEqual(quantizeAwa(-42), 40);
-  // Beyond 180 clamps
-  assert.strictEqual(quantizeAwa(190), 180);
+  // Negative AWA (port tack) keeps its sign — opposite tacks never
+  // share a bin, since their learned leeway signs are opposite.
+  assert.strictEqual(quantizeAwa(-42), -40);
+  assert.strictEqual(quantizeAwa(-43), -45);
+  // Inputs beyond ±180 wrap, not clamp: 190° apparent is 170° port.
+  assert.strictEqual(quantizeAwa(190), -170);
+  assert.strictEqual(quantizeAwa(-190), 170);
   assert.strictEqual(AWA_BIN_WIDTH, 5);
+});
+
+test("quantizeAwa separates tacks at light-air heel (regression)", () => {
+  // Both tacks at sub-bin heel share heel_bin 0 (=== : -0 and 0 are the
+  // same SQLite key); only the AWA sign keeps their bins — and their
+  // opposite-sign leeway — apart.
+  const stbd = quantizeAwa(32);
+  const port = quantizeAwa(-32);
+  assert.ok(quantizeHeel(0.4) === 0 && quantizeHeel(-0.4) === 0);
+  assert.notStrictEqual(stbd, port);
+  assert.strictEqual(stbd, 30);
+  assert.strictEqual(port, -30);
 });
 
 test("quantizeHeel preserves sign for tack distinction", () => {

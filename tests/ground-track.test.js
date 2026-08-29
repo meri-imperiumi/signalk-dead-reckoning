@@ -28,6 +28,36 @@ test("GroundTrack: positionAt null outside the buffered range", () => {
   assert.strictEqual(new GroundTrack().positionAt(0), null);
 });
 
+test("GroundTrack: positionAt interpolates across the antimeridian the short way", () => {
+  // Boat at the equator sailing east across the dateline: 179.9°E →
+  // 179.9°W is a 0.2° hop over ±180°, not 359.8° through Greenwich.
+  const gt = new GroundTrack();
+  gt.append({ timestamp: 0, latitude: 0, longitude: 179.9 });
+  gt.append({ timestamp: 1000, latitude: 0, longitude: -179.9 });
+  const q = gt.positionAt(250);
+  assert.ok(Math.abs(q.latitude) < 1e-9);
+  assert.ok(Math.abs(q.longitude - 179.95) < 1e-6, `lon ${q.longitude}`);
+  // Midpoint is the antimeridian itself (reported as -180). Both
+  // endpoints stay exact.
+  const mid = gt.positionAt(500);
+  assert.ok(Math.abs(Math.abs(mid.longitude) - 180) < 1e-6);
+  const end = gt.positionAt(1000);
+  assert.ok(Math.abs(end.longitude - -179.9) < 1e-9);
+});
+
+test("GroundTrack: displacementBetween across the antimeridian measures the short hop", () => {
+  // Interior interpolation crossing the dateline: half of the 0.2°
+  // eastbound run at the equator is ~6 nm at ~090°T. The unwrapped
+  // path would report ~half the globe.
+  const gt = new GroundTrack();
+  gt.append({ timestamp: 0, latitude: 0, longitude: 179.9 });
+  gt.append({ timestamp: 1000, latitude: 0, longitude: -179.9 });
+  const d = gt.displacementBetween(0, 500);
+  assert.ok(d, "displacement resolves");
+  assert.ok(d.distanceNm > 5.5 && d.distanceNm < 6.5, `dist ${d.distanceNm}`);
+  assert.ok(Math.abs(d.bearingTrue - 90) < 1, `brg ${d.bearingTrue}`);
+});
+
 test("GroundTrack: displacementBetween returns bearing + distance", () => {
   const gt = new GroundTrack();
   // Boat sails due east ~0.001° lon at 60N ≈ 0.05 nm.

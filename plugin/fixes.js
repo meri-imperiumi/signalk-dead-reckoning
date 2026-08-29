@@ -298,10 +298,27 @@ function residualSpreadNm(lops, circles, p) {
 
 /**
  * Least-squares best-fit point for ≥3 (or non-intersecting 2) inputs:
- * minimize the sum of squared constraint distances. Uses gradient
- * descent — the problem is small (≤ a handful of constraints) and a few
- * hundred iterations suffice. Returns the best-fit point and the residual
- * spread there.
+ * minimize the sum of squared constraint distances.
+ *
+ * Lines only, the problem is *linear* least squares: minimize
+ * Σ (nᵢ·p − cᵢ)² has the closed-form normal equations
+ * `(Σ nᵢnᵢᵀ) p = Σ cᵢnᵢ` — the same 2×2 solve `intersectLopLop`
+ * does, generalized to N lines — so the answer is exact, in one shot,
+ * however far the intercepts put it from the start point. (The previous
+ * fixed-step gradient descent could only travel a few hundred metres
+ * from its start regardless of the true answer — silently stalling on
+ * realistic multi-nautical-mile intercepts.) A Tikhonov term λI with
+ * λ ≪ the matrix scale makes the singular case (all lines parallel —
+ * the loss is flat along the common direction) return the minimizing
+ * line's point nearest `start` instead of dividing by ~0.
+ *
+ * With circles in the mix the residuals are nonlinear
+ * (|p − center| − radius), so after the linear solve the point is
+ * refined by Levenberg–Marquardt (damped Gauss–Newton). The constraint
+ * set is tiny (≤ a handful) and only mildly nonlinear in the local
+ * plane, so it converges in a handful of iterations; the damping keeps
+ * it robust when the Jacobian is near-singular (e.g. near-concentric
+ * circles).
  *
  * @param {LocalLop[]} lops
  * @param {{centers: {x:number,y:number}[], radii: number[]}} circles
@@ -309,39 +326,163 @@ function residualSpreadNm(lops, circles, p) {
  * @returns {{point: {x:number,y:number}, residual: {maxNm:number, meanNm:number}}}
  */
 function leastSquaresFit(lops, circles, start) {
+  let p = linearLopSolve(lops, start);
+  if (circles.centers.length > 0) {
+    // The linear solve minimizes only the line terms and can land in a
+    // worse basin than `start` once the circles count; start from the
+    // cheaper of the two. LM's accept-only-if-better step then
+    // guarantees the result is never worse than either.
+    if (fitLoss(lops, circles, start) < fitLoss(lops, circles, p)) {
+      p = { x: start.x, y: start.y };
+    }
+    p = gaussNewtonRefine(lops, circles, p);
+  }
+  return { point: p, residual: residualSpreadNm(lops, circles, p) };
+}
+
+/**
+ * Closed-form solution of the lines-only least squares: the normal
+ * equations `(Σ nᵢnᵢᵀ) p = Σ cᵢnᵢ`, damped toward `start` for the
+ * singular (all-parallel) case.
+ *
+ * @param {LocalLop[]} lops
+ * @param {{x: number, y: number}} start
+ * @returns {{x: number, y: number}}
+ */
+function linearLopSolve(lops, start) {
+  let a11 = 0;
+  let a12 = 0;
+  let a22 = 0;
+  let b1 = 0;
+  let b2 = 0;
+  for (const lop of lops) {
+    a11 += lop.n.x * lop.n.x;
+    a12 += lop.n.x * lop.n.y;
+    a22 += lop.n.y * lop.n.y;
+    b1 += lop.c * lop.n.x;
+    b2 += lop.c * lop.n.y;
+  }
+  // Tikhonov damping toward `start`: minimize ||Ap − b||² + λ||p − s||²
+  // solves (A + λI) p = b + λs. Well-conditioned systems are unaffected
+  // (the bias is λ/σ² ≪ 1); a flat loss valley returns the valley point
+  // nearest `start`.
+  const lambda = 1e-9 * Math.max(a11 + a22, 1);
+  const det = (a11 + lambda) * (a22 + lambda) - a12 * a12;
+  return {
+    x:
+      ((a22 + lambda) * (b1 + lambda * start.x) -
+        a12 * (b2 + lambda * start.y)) /
+      det,
+    y:
+      ((a11 + lambda) * (b2 + lambda * start.y) -
+        a12 * (b1 + lambda * start.x)) /
+      det,
+  };
+}
+
+/** Max Levenberg–Marquardt outer iterations and damping retry steps. */
+const GN_MAX_ITERS = 50;
+const GN_MAX_RETRIES = 12;
+
+/** Step size (m) below which the refinement is considered converged. */
+const GN_STEP_TOL_M = 1e-6;
+
+/**
+ * Sum of squared constraint distances at `p` — the objective the
+ * refinement minimizes.
+ *
+ * @param {LocalLop[]} lops
+ * @param {{centers: {x:number,y:number}[], radii: number[]}} circles
+ * @param {{x: number, y: number}} p
+ * @returns {number} m²
+ */
+function fitLoss(lops, circles, p) {
+  let s = 0;
+  for (const lop of lops) {
+    const d = signedDistanceToLop(lop, p);
+    s += d * d;
+  }
+  for (let i = 0; i < circles.centers.length; i++) {
+    const d = distanceToCircle(circles.centers[i], circles.radii[i], p);
+    s += d * d;
+  }
+  return s;
+}
+
+/**
+ * Levenberg–Marquardt refinement of the fit point over lines and
+ * circles. Each iteration solves the damped Gauss–Newton system
+ * `(JᵀJ + λI) δ = −Jᵀf`; the damping is raised until the step actually
+ * reduces the loss and lowered again afterwards, so the iteration
+ * behaves like gradient descent far from the minimum (where the
+ * quadratic model is optimistic) and like plain Gauss–Newton near it.
+ *
+ * @param {LocalLop[]} lops
+ * @param {{centers: {x:number,y:number}[], radii: number[]}} circles
+ * @param {{x: number, y: number}} start
+ * @returns {{x: number, y: number}}
+ */
+function gaussNewtonRefine(lops, circles, start) {
   let p = { x: start.x, y: start.y };
-  const lr = 1e-4; // step size in metres per (metres of residual) gradient
-  const iters = 2000;
-  for (let it = 0; it < iters; it++) {
-    let gx = 0;
-    let gy = 0;
-    // Each squared residual r^2 has gradient 2r * (dr/dp). For a line
-    // dr/dp = n (the signed distance gradient is the unit normal). For a
-    // circle dr/dp = (p-center)/|p-center| (the radial unit vector).
+  let loss = fitLoss(lops, circles, p);
+  let lambda = 1e-9; // relative to the JᵀJ scale (dimensionless)
+  for (let it = 0; it < GN_MAX_ITERS; it++) {
+    // Gauss–Newton normal terms at the current point: JᵀJ and −Jᵀf,
+    // with one Jacobian row per constraint (n for a line, the radial
+    // unit vector for a circle).
+    let a11 = 0;
+    let a12 = 0;
+    let a22 = 0;
+    let b1 = 0;
+    let b2 = 0;
     for (const lop of lops) {
-      const r = signedDistanceToLop(lop, p); // signed
-      gx += 2 * r * lop.n.x;
-      gy += 2 * r * lop.n.y;
+      const f = signedDistanceToLop(lop, p);
+      a11 += lop.n.x * lop.n.x;
+      a12 += lop.n.x * lop.n.y;
+      a22 += lop.n.y * lop.n.y;
+      b1 -= f * lop.n.x;
+      b2 -= f * lop.n.y;
     }
     for (let i = 0; i < circles.centers.length; i++) {
       const c = circles.centers[i];
-      const r = circles.radii[i];
-      const ddx = p.x - c.x;
-      const ddy = p.y - c.y;
-      const dist = Math.hypot(ddx, ddy) || 1e-9;
-      const residual = dist - r; // signed
-      gx += 2 * residual * (ddx / dist);
-      gy += 2 * residual * (ddy / dist);
+      const dx = p.x - c.x;
+      const dy = p.y - c.y;
+      const dist = Math.hypot(dx, dy);
+      // Radial unit vector; at the exact center the gradient direction
+      // is undefined — fall back to +x (the damping keeps it harmless).
+      const ux = dist > 1e-9 ? dx / dist : 1;
+      const uy = dist > 1e-9 ? dy / dist : 0;
+      const f = dist - circles.radii[i];
+      a11 += ux * ux;
+      a12 += ux * uy;
+      a22 += uy * uy;
+      b1 -= f * ux;
+      b2 -= f * uy;
     }
-    // Normalize gradient step: scale down as iterations proceed so it
-    // settles rather than oscillating.
-    const step = lr * (1 - it / iters);
-    const newX = p.x - step * gx;
-    const newY = p.y - step * gy;
-    if (Math.hypot(newX - p.x, newY - p.y) < 1e-6) break;
-    p = { x: newX, y: newY };
+    const scale = Math.max(a11 + a22, 1);
+
+    // Try the damped step; raise λ until the loss actually improves.
+    let stepped = false;
+    for (let retry = 0; retry < GN_MAX_RETRIES; retry++) {
+      const l = lambda * scale;
+      const det = (a11 + l) * (a22 + l) - a12 * a12;
+      const dx = ((a22 + l) * b1 - a12 * b2) / det;
+      const dy = ((a11 + l) * b2 - a12 * b1) / det;
+      const cand = { x: p.x + dx, y: p.y + dy };
+      const candLoss = fitLoss(lops, circles, cand);
+      if (candLoss <= loss) {
+        lambda = Math.max(lambda / 10, 1e-12);
+        p = cand;
+        loss = candLoss;
+        stepped = true;
+        if (Math.hypot(dx, dy) < GN_STEP_TOL_M) return p; // converged
+        break;
+      }
+      lambda *= 10;
+    }
+    if (!stepped) return p; // no damping level improves: at a minimum
   }
-  return { point: p, residual: residualSpreadNm(lops, circles, p) };
+  return p;
 }
 
 /**

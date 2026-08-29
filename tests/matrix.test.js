@@ -89,6 +89,51 @@ test("quantization means nearby conditions land in the same bin", () => {
   assert.ok(c.hit_count >= 6);
 });
 
+test("light-air opposite tacks do not blend into one bin (regression)", () => {
+  // Both tacks at sub-bin heel share heel_bin 0; with AWA folded to
+  // |AWA| they also shared awa_bin, and their opposite-sign leeway
+  // EMA-averaged toward zero. Signed AWA bins keep them apart.
+  const store = new MatrixStore(db);
+  const stw = 2.5; // distinct from other tests' bins
+  store.update(
+    {
+      sail_state: "sailing",
+      sea_state: "unknown",
+      stwKn: stw,
+      awaDeg: 30,
+      heelDeg: 0.4,
+    },
+    { leeway_angle: 2, speed_loss: 0.1, upwash_correction: 0 },
+  );
+  store.update(
+    {
+      sail_state: "sailing",
+      sea_state: "unknown",
+      stwKn: stw,
+      awaDeg: -30,
+      heelDeg: -0.4,
+    },
+    { leeway_angle: -2, speed_loss: 0.1, upwash_correction: 0 },
+  );
+  const stbd = store.lookup({
+    sail_state: "sailing",
+    sea_state: "unknown",
+    stwKn: stw,
+    awaDeg: 30,
+    heelDeg: 0.4,
+  });
+  const port = store.lookup({
+    sail_state: "sailing",
+    sea_state: "unknown",
+    stwKn: stw,
+    awaDeg: -30,
+    heelDeg: -0.4,
+  });
+  assert.strictEqual(stbd.leeway_angle, 2);
+  assert.strictEqual(port.leeway_angle, -2);
+  assert.strictEqual(stbd.hit_count, 5); // fresh bin — no cross-talk
+});
+
 test("live samples outweigh historical samples in effective hit count", () => {
   // 1 live hit * 5 = 5 effective; 1 historical climatology hit * 0.5 = 0.5.
   const live = { live_hit_count: 1, historical_hit_count: 0 };

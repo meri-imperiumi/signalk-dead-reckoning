@@ -24,7 +24,7 @@
  * @file ground-track.js
  */
 
-const { distanceNm, bearingDeg } = require("./geo.js");
+const { distanceNm, bearingDeg, normalizeDeg180 } = require("./geo.js");
 
 /**
  * @typedef {{timestamp: number, latitude: number, longitude: number}} Sample
@@ -66,7 +66,10 @@ class GroundTrack {
    * `t` is outside the buffered range. Linear interpolation in lat/lon
    * is adequate over the few-second gaps between 1 Hz samples; we do not
    * great-circle-interpolate because the error is sub-meter at that
-   * rate.
+   * rate. Longitude interpolates the short way around the sphere
+   * (samples straddling the antimeridian move over ±180°, not through
+   * Greenwich) and the result is normalized to [-180, 180).
+   *
    * @param {number} t
    * @returns {{latitude: number, longitude: number}|null}
    */
@@ -82,9 +85,13 @@ class GroundTrack {
       return { latitude: a.latitude, longitude: a.longitude };
     }
     const f = (t - a.timestamp) / (b.timestamp - a.timestamp);
+    // Wrap the longitude delta to ±180° so a dateline crossing
+    // (179.9° → -179.9°) interpolates 0.2° over the antimeridian
+    // instead of 359.8° the long way around.
+    const dLon = normalizeDeg180(b.longitude - a.longitude);
     return {
       latitude: a.latitude + (b.latitude - a.latitude) * f,
-      longitude: a.longitude + (b.longitude - a.longitude) * f,
+      longitude: normalizeDeg180(a.longitude + dLon * f),
     };
   }
 
