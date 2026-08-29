@@ -2557,11 +2557,13 @@ module.exports = (app) => {
           longitude: candidate.longitude,
           confirmed_by: confirmedBy,
           deviation_nm: result.deviation_nm,
+          deviation_bearing: result.deviation_bearing,
           dr_log_nm: engine.logNmSinceOrigin,
           residual_nm: candidate.residual_nm ?? null,
           observation_count:
             (candidate.observationIds?.lopIds?.length ?? 0) +
             (candidate.observationIds?.cplIds?.length ?? 0),
+          observations: hydrateObservationSources(db, candidate),
           stw_kn: conv(
             unwrapNumber(deltaState.get("navigation.speedThroughWater")),
             msToKnots,
@@ -2904,6 +2906,45 @@ function unwrapHeel(v) {
   if (deg == null) return null;
   // Signal K attitude roll is in radians.
   return (deg * 180) / Math.PI;
+}
+
+/**
+ * Hydrates the LOP/CPL rows that resolved into a candidate fix into the
+ * plain shapes `composeFixEntry` lists in the logbook `text` — the fix's
+ * sources (object, bearing/radius), which the structured `position`
+ * field can't carry. Reads via the db getters (pure read); a missing row
+ * is skipped rather than fatal.
+ *
+ * @param {import("node:sqlite").DatabaseSync|null} db
+ * @param {object} candidate - with `observationIds.{lopIds,cplIds}`
+ * @returns {Array<object>}
+ */
+function hydrateObservationSources(db, candidate) {
+  const out = [];
+  const lopIds = candidate?.observationIds?.lopIds ?? [];
+  const cplIds = candidate?.observationIds?.cplIds ?? [];
+  for (const id of lopIds) {
+    const row = db && deps.getLineOfPosition(db, id);
+    if (!row) continue;
+    out.push({
+      kind: "lop",
+      lop_type: row.lop_type,
+      body_or_object: row.body_or_object ?? null,
+      azimuth_true: row.azimuth_true ?? null,
+      intercept_nm: row.intercept_nm ?? null,
+    });
+  }
+  for (const id of cplIds) {
+    const row = db && deps.getCircularPositionLine(db, id);
+    if (!row) continue;
+    out.push({
+      kind: "cpl",
+      cpl_type: row.cpl_type,
+      source_object: row.source_object ?? null,
+      radius_nm: row.radius_nm ?? null,
+    });
+  }
+  return out;
 }
 
 module.exports.PLUGIN_ID = PLUGIN_ID;

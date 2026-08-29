@@ -1674,7 +1674,12 @@ test("logbook: confirmed fix writes entry and marks the fixes row", async () => 
     assert.strictEqual(entry.category, "navigation");
     assert.strictEqual(entry.author, "Alice");
     assert.strictEqual(entry.position.source, "GPS");
-    assert.ok(/GPS fix confirmed by Alice/.test(entry.text));
+    assert.ok(/GPS fix/.test(entry.text));
+    assert.ok(
+      !/by Alice/.test(entry.text),
+      "author stays in metadata, not text",
+    );
+    assert.ok(/0\.1 NM at \d{3}°T from DR/.test(entry.text));
     assert.ok(entry.datetime); // explicit, never `ago`
 
     // fixes row marked with the entry ref

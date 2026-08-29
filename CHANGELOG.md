@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Fix logbook entries now name the fix's sources instead of repeating
+  coordinates and the watchkeeper.** A confirmed fix was logged as
+  `Manual fix by bergie: 18°51'55.5" S 159°48'04.5" W, 0.1 nm from DR`
+  — but the coordinates are already in the structured `position` field
+  and the watchkeeper in `author`, so the text wasted both while
+  omitting the useful part: *what produced the fix*. A fix resolved
+  from compass bearings now reads `Manual fix from Aitutaki Atoll
+  bearing 123°T, Vessel Foo bearing 321°T, 0.1 NM at 045°T from DR`;
+  celestial fixes list the bodies sighted; CPL fixes list the object
+  and radius. Point fixes (GPS / manual / backfill) drop the
+  coordinates and the `by {user}` clause, keeping just the label and
+  the DR deviation. The deviation clause now carries the direction
+  (`0.5 NM at 090°T from DR`) and uses `NM` (Nautical Miles) rather
+  than `nm` (nanometers). `backfill` fixes get their own label and
+  `position.source` value instead of falling through to "Manual"/"DR".
+  Bearings are degrees-true (`°T`); magnetic (`°M`) would require a
+  magnetic-variation source, which isn't subscribed yet.
+
 ## [0.6.0] - 2026-08-28
 
 ### Fixed

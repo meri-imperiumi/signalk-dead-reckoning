@@ -8,6 +8,8 @@ const assert = require("node:assert/strict");
 
 const {
   formatPosition,
+  formatBearingTrue,
+  observationSources,
   composeFixEntry,
   composeTackEntry,
   composeObservationEntry,
@@ -58,8 +60,13 @@ test("composeFixEntry: GPS fix maps per SPEC §9.5", () => {
   assert.strictEqual(body.speed.stw, 5.1);
   assert.strictEqual(body.speed.sog, undefined);
   assert.deepStrictEqual(body.observations, { seaState: 3 });
-  assert.ok(/GPS fix confirmed by Alice/.test(body.text));
-  assert.ok(/0\.5 nm from DR/.test(body.text));
+  assert.ok(/GPS fix/.test(body.text));
+  assert.ok(/0\.5 NM from DR/.test(body.text));
+  assert.ok(!/by Alice/.test(body.text), "author stays in metadata, not text");
+  assert.ok(
+    !/60\.0000/.test(body.text),
+    "coordinates stay in the position field",
+  );
   // Closed-schema discipline: no stray fields.
   assert.ok(!("ago" in body));
   assert.ok(!("course" in body));
@@ -77,9 +84,14 @@ test("composeFixEntry: celestial fix composes sights + residual into text", () =
     observation_count: 3,
   });
   assert.strictEqual(body.position.source, "Celestial");
-  assert.ok(/Celestial fix by Bob/.test(body.text));
+  assert.ok(/Celestial fix/.test(body.text));
+  assert.ok(!/by Bob/.test(body.text), "author stays in metadata, not text");
   assert.ok(/from 3 sights/.test(body.text));
-  assert.ok(/residual 1\.2 nm/.test(body.text));
+  assert.ok(/residual 1\.2 NM/.test(body.text));
+  assert.ok(
+    !/60\.0000/.test(body.text),
+    "coordinates stay in the position field",
+  );
 });
 
 test("composeFixEntry: unattributed fix omits author and deviation clause when unknown", () => {
@@ -92,7 +104,7 @@ test("composeFixEntry: unattributed fix omits author and deviation clause when u
     deviation_nm: null,
   });
   assert.ok(!("author" in body));
-  assert.ok(/Manual fix: /.test(body.text));
+  assert.strictEqual(body.text, "Manual fix");
   assert.ok(!/from DR/.test(body.text));
 });
 
@@ -105,6 +117,104 @@ test("composeFixEntry: unknown sea_state emits no observations", () => {
     sea_state: null,
   });
   assert.ok(!("observations" in body));
+});
+
+test("formatBearingTrue: zero-padded, normalized to 0-359, true notation", () => {
+  assert.strictEqual(formatBearingTrue(0), "000°T");
+  assert.strictEqual(formatBearingTrue(9.4), "009°T");
+  assert.strictEqual(formatBearingTrue(47.2), "047°T");
+  assert.strictEqual(formatBearingTrue(360), "000°T");
+  assert.strictEqual(formatBearingTrue(370), "010°T");
+  assert.strictEqual(formatBearingTrue(-90), "270°T");
+});
+
+test("observationSources: shapes bearing LOPs, celestial sights, CPLs", () => {
+  const out = observationSources([
+    {
+      kind: "lop",
+      lop_type: "bearing",
+      body_or_object: "Aitutaki Atoll",
+      azimuth_true: 123,
+    },
+    { kind: "lop", lop_type: "celestial", body_or_object: "Sun" },
+    {
+      kind: "cpl",
+      cpl_type: "vertical-angle",
+      source_object: "lighthouse",
+      radius_nm: 0.42,
+    },
+  ]);
+  assert.deepStrictEqual(out, [
+    "Aitutaki Atoll bearing 123°T",
+    "Sun sight",
+    "lighthouse CPL 0.4 NM",
+  ]);
+  assert.deepStrictEqual(observationSources(null), []);
+  assert.deepStrictEqual(observationSources(undefined), []);
+});
+
+test("composeFixEntry: manual fix from bearing observations lists the sources", () => {
+  const body = composeFixEntry({
+    datetime: "2026-08-29T07:16:51.000Z",
+    source_type: "manual",
+    latitude: -18.8651,
+    longitude: -159.8008,
+    confirmed_by: "bergie",
+    deviation_nm: 0.12,
+    deviation_bearing: 45,
+    observations: [
+      {
+        kind: "lop",
+        lop_type: "bearing",
+        body_or_object: "Aitutaki Atoll",
+        azimuth_true: 123,
+      },
+      {
+        kind: "lop",
+        lop_type: "bearing",
+        body_or_object: "Vessel Foo",
+        azimuth_true: 321,
+      },
+    ],
+    positionFormat: "dms",
+  });
+  assert.strictEqual(body.author, "bergie");
+  // Sources named, coordinates & author kept out of the text.
+  assert.ok(
+    /Manual fix from Aitutaki Atoll bearing 123°T, Vessel Foo bearing 321°T/.test(
+      body.text,
+    ),
+  );
+  assert.ok(!/bergie/.test(body.text));
+  assert.ok(!/18°/.test(body.text));
+  // Deviation carries distance + direction, in NM (not nm).
+  assert.ok(/0\.1 NM at 045°T from DR/.test(body.text));
+});
+
+test("composeFixEntry: deviation clause carries bearing direction in NM", () => {
+  const body = composeFixEntry({
+    datetime: "2026-08-24T12:00:00.000Z",
+    source_type: "gps",
+    latitude: 60,
+    longitude: 24,
+    deviation_nm: 0.52,
+    deviation_bearing: 90,
+  });
+  assert.ok(/0\.5 NM at 090°T from DR/.test(body.text));
+  assert.ok(!/ nm /.test(body.text), "no lowercase nm (nanometers)");
+});
+
+test("composeFixEntry: backfill fix gets its own label, not Manual", () => {
+  const body = composeFixEntry({
+    datetime: "2026-08-24T12:00:00.000Z",
+    source_type: "backfill",
+    latitude: 60,
+    longitude: 24,
+    deviation_nm: 1.0,
+    deviation_bearing: 180,
+  });
+  assert.strictEqual(body.position.source, "Backfill");
+  assert.ok(/^Backfill fix, 1\.0 NM at 180°T from DR$/.test(body.text));
 });
 
 test("composeTackEntry: text, category, origin; heading zero-padded", () => {
@@ -299,7 +409,7 @@ test("composeObservationEntry: celestial sight with reduction", () => {
     "author stays in metadata, not text",
   );
   assert.match(body.text, /Zn 180\.0/);
-  assert.match(body.text, /intercept 2\.50 nm toward/);
+  assert.match(body.text, /intercept 2\.50 NM toward/);
   assert.strictEqual(body.position.source, "Celestial");
   assert.strictEqual(body.observations.seaState, 3);
 });
@@ -341,7 +451,7 @@ test("composeObservationEntry: vertical-angle CPL carries its radius", () => {
     body_or_object: "lighthouse",
     radius_nm: 0.42,
   });
-  assert.match(body.text, /lighthouse CPL 0.4 nm/);
+  assert.match(body.text, /lighthouse CPL 0.4 NM/);
   assert.strictEqual(body.position, undefined);
 });
 
@@ -352,5 +462,5 @@ test("composeObservationEntry: intercept away when negative", () => {
     body_or_object: "Polaris",
     reduction: { azimuth_true: 0, intercept_nm: -1.2 },
   });
-  assert.match(body.text, /intercept 1\.20 nm away/);
+  assert.match(body.text, /intercept 1\.20 NM away/);
 });

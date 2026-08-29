@@ -42,6 +42,7 @@ const POSITION_SOURCE = {
   celestial: "Celestial",
   bearing: "Bearing",
   manual: "DR",
+  backfill: "Backfill",
 };
 
 /**
@@ -103,18 +104,27 @@ function round(n, places) {
 /**
  * Composes the `NewEntry`-shaped body for a confirmed fix (SPEC §9.5
  * mapping). Only schema-defined fields are emitted (`additionalProperties:
- * false` on both NewEntry and Observations).
+ * false` on both NewEntry and Observations). The free-text `text` carries
+ * only what the structured fields lack — the fix's *sources* (the
+ * observations that resolved into it) and the DR-vs-fix deviation — since
+ * `position` already holds the coordinates and `author` the watchkeeper.
  *
  * @param {object} f
  * @param {string} f.datetime - ISO timestamp of the fix
- * @param {string} f.source_type - 'gps' | 'celestial' | 'bearing' | 'manual'
+ * @param {string} f.source_type - 'gps' | 'celestial' | 'bearing' | 'manual' | 'backfill'
  * @param {number} f.latitude
  * @param {number} f.longitude
  * @param {string|null} [f.confirmed_by] - crew name
  * @param {number|null} [f.deviation_nm] - DR-vs-fix deviation
+ * @param {number|null} [f.deviation_bearing] - true bearing from prior DR origin to the fix (deg)
  * @param {number|null} [f.dr_log_nm] - DR-integrated distance since last fix (§10.3)
  * @param {number|null} [f.residual_nm] - LOP/CPL residual (cocked-hat size)
  * @param {number|null} [f.observation_count] - number of LOPs/CPLs resolved
+ *   (fallback when `observations` rows aren't supplied)
+ * @param {Array<object>|null} [f.observations] - hydrated LOP/CPL rows that
+ *   resolved into the fix, shaped as {kind, lop_type|cpl_type,
+ *   body_or_object|source_object, azimuth_true?, radius_nm?}; named per-source
+ *   in `text` so the logbook records what produced the fix
  * @param {number|null} [f.stw_kn]
  * @param {number|null} [f.sog_kn]
  * @param {number|null} [f.heading_deg]
@@ -153,42 +163,118 @@ function composeFixEntry(f) {
 }
 
 /**
+ * Formats a true bearing as a zero-padded "090°T" string — the standard
+ * nautical abbreviation ("T" for true; "M" for magnetic). Bearings are
+ * stored degrees-true and no magnetic-variation source is subscribed, so
+ * only true bearings are emitted.
+ *
+ * @param {number} deg
+ * @returns {string}
+ */
+function formatBearingTrue(deg) {
+  const b = ((Math.round(deg) % 360) + 360) % 360;
+  return `${String(b).padStart(3, "0")}°T`;
+}
+
+/**
+ * Shapes the observations that resolved into a fix into short "source"
+ * fragments for the entry text — the navigable context the structured
+ * `position` field can't carry (it holds only the fix's own coordinates).
+ * One fragment per observation:
+ *   - bearing LOP:   "Aitutaki Atoll bearing 123°T"
+ *   - celestial LOP: "Sun sight"
+ *   - vertical CPL:  "lighthouse CPL 0.4 NM"
+ *
+ * @param {Array<object>|null|undefined} observations - hydrated LOP/CPL rows
+ * @returns {string[]} empty when no observation details were supplied
+ */
+function observationSources(observations) {
+  if (!Array.isArray(observations)) return [];
+  return observations.map(observationSourceLabel);
+}
+
+/**
+ * One observation's source label. Mirrors the per-entry text in
+ * {@link composeObservationEntry} but compact, for listing inside a fix.
+ */
+function observationSourceLabel(o) {
+  if (o.kind === "cpl") {
+    const obj = o.source_object ?? "object";
+    const r = Number.isFinite(o.radius_nm)
+      ? ` ${o.radius_nm.toFixed(1)} NM`
+      : "";
+    return `${obj} CPL${r}`;
+  }
+  if (o.lop_type === "celestial") {
+    return `${o.body_or_object ?? "Body"} sight`;
+  }
+  const obj = o.body_or_object ?? "object";
+  const b = Number.isFinite(o.azimuth_true)
+    ? ` bearing ${formatBearingTrue(o.azimuth_true)}`
+    : "";
+  return `${obj}${b}`;
+}
+
+/**
  * Composes the free-text summary for a fix entry, templated per
  * source_type (SPEC §9.5: celestial/bearing specifics go into `text` —
- * no structured fields exist for them).
+ * no structured fields exist for them). Coordinates stay in the
+ * structured `position` field and the watchkeeper in `author`, so `text`
+ * carries only what those lack: the fix's sources (for LOP/CPL fixes)
+ * and the DR-vs-fix deviation.
  */
 function composeFixText(f) {
-  const where = formatPosition(f.latitude, f.longitude, f.positionFormat);
-  const by = f.confirmed_by ? ` by ${f.confirmed_by}` : "";
+  const dev = deviationClause(f);
+  const res = Number.isFinite(f.residual_nm)
+    ? `, residual ${f.residual_nm.toFixed(1)} NM`
+    : "";
+  const sources = observationSources(f.observations);
+  const fromSources = sources.length
+    ? ` from ${sources.join(", ")}`
+    : countFrom(f);
+
   switch (f.source_type) {
-    case "celestial": {
-      const n = f.observation_count ?? 1;
-      const res = Number.isFinite(f.residual_nm)
-        ? `, residual ${f.residual_nm.toFixed(1)} nm`
-        : "";
-      return `Celestial fix${by}: ${where}, from ${n} sight${n > 1 ? "s" : ""}${res}`;
-    }
-    case "bearing": {
-      const n = f.observation_count ?? 1;
-      const res = Number.isFinite(f.residual_nm)
-        ? `, residual ${f.residual_nm.toFixed(1)} nm`
-        : "";
-      return `Bearing fix${by}: ${where}, from ${n} bearing${n > 1 ? "s" : ""}${res}`;
-    }
+    case "celestial":
+      return `Celestial fix${fromSources}${res}${dev}`;
+    case "bearing":
+      return `Bearing fix${fromSources}${res}${dev}`;
     case "gps":
-      return `GPS fix confirmed${by}: ${where}${deviationClause(f)}`;
+      return `GPS fix${dev}`;
+    case "backfill":
+      return `Backfill fix${dev}`;
     default:
-      return `Manual fix${by}: ${where}${deviationClause(f)}`;
+      return `Manual fix${fromSources}${res}${dev}`;
   }
 }
 
 /**
- * The "0.5 nm from DR" clause, when a deviation is known.
+ * Count-based "from N sights/bearings" fallback, used only when the
+ * caller supplied an `observation_count` but not the hydrated
+ * `observations` rows.
+ */
+function countFrom(f) {
+  const n = f.observation_count ?? 0;
+  if (!n) return "";
+  if (f.source_type === "celestial")
+    return ` from ${n} sight${n > 1 ? "s" : ""}`;
+  if (f.source_type === "bearing")
+    return ` from ${n} bearing${n > 1 ? "s" : ""}`;
+  return ` from ${n} observation${n > 1 ? "s" : ""}`;
+}
+
+/**
+ * The ", 0.5 NM at 090°T from DR" clause, when a deviation is known.
+ * Direction is the true bearing from the prior DR origin to the fix —
+ * "the fix is 0.5 NM away, bearing 090°T from where DR put us". "NM"
+ * (Nautical Miles), not "nm" (nanometers).
  */
 function deviationClause(f) {
-  return Number.isFinite(f.deviation_nm)
-    ? `, ${f.deviation_nm.toFixed(1)} nm from DR`
+  if (!Number.isFinite(f.deviation_nm)) return "";
+  const dist = f.deviation_nm.toFixed(1);
+  const at = Number.isFinite(f.deviation_bearing)
+    ? ` at ${formatBearingTrue(f.deviation_bearing)}`
     : "";
+  return `, ${dist} NM${at} from DR`;
 }
 
 /**
@@ -251,7 +337,7 @@ function composeObservationEntry(o) {
   if (o.kind === "celestial") {
     const r = o.reduction ?? {};
     const ic = Number.isFinite(r.intercept_nm)
-      ? `, intercept ${Math.abs(r.intercept_nm).toFixed(2)} nm ${
+      ? `, intercept ${Math.abs(r.intercept_nm).toFixed(2)} NM ${
           r.intercept_nm >= 0 ? "toward" : "away"
         }`
       : "";
@@ -261,7 +347,7 @@ function composeObservationEntry(o) {
     text = `${o.body_or_object ?? "Body"} sight${zn}${ic}`;
   } else if (o.kind === "vertical") {
     const r = Number.isFinite(o.radius_nm)
-      ? ` ${o.radius_nm.toFixed(1)} nm`
+      ? ` ${o.radius_nm.toFixed(1)} NM`
       : "";
     text = `${o.body_or_object ?? "object"} CPL${r}`;
   } else {
@@ -436,6 +522,8 @@ function newClientId() {
 module.exports = {
   POSITION_SOURCE,
   formatPosition,
+  formatBearingTrue,
+  observationSources,
   composeFixEntry,
   composeFixText,
   composeTackEntry,
