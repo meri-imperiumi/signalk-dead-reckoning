@@ -454,7 +454,11 @@ class DrApp extends HTMLElement {
     // AIS targets (work doc #23): same socket, `vessels.*` scope — the
     // protocol scopes each subscribe message to its context. Static
     // data (name/mmsi) seeds from the REST snapshot (bootstrapAis);
-    // these paths carry the live motion.
+    // these paths carry the live motion. The "" root path catches
+    // identification from providers that publish it only as root
+    // values (the common AIS-plugin pattern — Freeboard-SK subscribes
+    // "" for the same reason); the reducer picks name/mmsi/buddy out
+    // of root values and ignores the rest.
     stream.subscribeAis([
       "navigation.position",
       "navigation.courseOverGroundTrue",
@@ -462,6 +466,7 @@ class DrApp extends HTMLElement {
       "navigation.headingTrue",
       "name",
       "mmsi",
+      "",
     ]);
     stream.on((delta) => this.onDelta(delta));
     stream.onStatus((s) => this.renderLinkStatus(s));

@@ -1388,11 +1388,28 @@ export function distanceNm(from, to) {
 }
 
 /**
+ * Extracts an MMSI from a vessel context when it carries one — the
+ * common AIS keying (`vessels.urn:mrn:imo:mmsi:230123456`, or the bare
+ * `vessels.230123456` older providers use). Real AIS targets are almost
+ * always keyed this way, so even before any static data arrives the
+ * label can show the MMSI instead of the unwieldy full context string.
+ *
+ * @param {string|null|undefined} ctx
+ * @returns {string|null}
+ */
+export function aisMmsiFromContext(ctx) {
+  const m = /^(?:vessels\.)?(?:urn:mrn:imo:mmsi:)?(\d{6,9})$/.exec(ctx ?? "");
+  return m ? m[1] : null;
+}
+
+/**
  * Folds one `vessels.*` delta into the target store (work doc #23).
  * The store is a Map keyed by context, mutated in place (the TrackLog
  * pattern — the caller owns the Map, the reducer owns its shape).
  * Only position reports refresh `tMs`; name/mmsi/buddy ride along on
- * any update. Values keep their SI wire units.
+ * any update. Values keep their SI wire units. The MMSI pre-seeds from
+ * the context when it is mmsi-shaped, so a label exists before static
+ * data arrives.
  *
  * @param {Map<string, object>} store
  * @param {object} delta - Signal K delta with `context` + `updates`
@@ -1411,7 +1428,7 @@ export function applyAisDelta(store, delta, nowMs = Date.now()) {
       t = {
         context: ctx,
         name: null,
-        mmsi: null,
+        mmsi: aisMmsiFromContext(ctx),
         buddy: false,
         lat: null,
         lon: null,
@@ -1667,6 +1684,9 @@ export function aisMarkerSpec(target, nowMs, own) {
     (target.mmsi
       ? `MMSI ${target.mmsi}`
       : target.context.replace("vessels.", ""));
+  // Label chain (work doc #23): name → MMSI → context tail. Real AIS
+  // targets are mmsi-keyed so the tail is a last resort (uuid contexts
+  // without static data); the MMSI pre-seeds from the context.
   const rangeNm = own ? distanceNm(own, position) : null;
   const leader =
     !expiring && cogDeg != null && sogKn && sogKn > 0

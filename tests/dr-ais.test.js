@@ -106,6 +106,39 @@ test("applyAisDelta: ignores deltas without context or updates", async () => {
   assert.equal(store.size, 0);
 });
 
+test("aisMmsiFromContext: mmsi-shaped contexts yield an MMSI, others null", async () => {
+  const vm = await loadVm();
+  assert.equal(
+    vm.aisMmsiFromContext("vessels.urn:mrn:imo:mmsi:230123456"),
+    "230123456",
+  );
+  assert.equal(vm.aisMmsiFromContext("vessels.230123456"), "230123456");
+  assert.equal(vm.aisMmsiFromContext("vessels.urn:mrn:signalk:uuid:abc"), null);
+  assert.equal(vm.aisMmsiFromContext(null), null);
+});
+
+test("applyAisDelta: mmsi pre-seeds from the context before static data arrives", async () => {
+  const vm = await loadVm();
+  const store = new Map();
+  // Position-only delta on an mmsi-keyed context — no name, no mmsi value.
+  vm.applyAisDelta(
+    store,
+    delta("vessels.urn:mrn:imo:mmsi:230987654", [POSITION(60, 24)]),
+    T0,
+  );
+  const t = store.get("vessels.urn:mrn:imo:mmsi:230987654");
+  assert.equal(t.mmsi, "230987654", "mmsi derived from the context key");
+  // A later explicit mmsi value still wins.
+  vm.applyAisDelta(
+    store,
+    delta("vessels.urn:mrn:imo:mmsi:230987654", [
+      { path: "mmsi", value: "999999999" },
+    ]),
+    T0,
+  );
+  assert.equal(t.mmsi, "999999999");
+});
+
 test("applyAisDelta: position-only updates refresh tMs, not older fields", async () => {
   const vm = await loadVm();
   const store = new Map();
@@ -312,6 +345,39 @@ test("aisMarkerSpec: label fallbacks, rotation, range, leader, expiring", async 
   // Zero speed: no leader even while active.
   const moored = { ...fresh, sogMs: 0 };
   assert.equal(vm.aisMarkerSpec(moored, T0, null).leader, null);
+
+  // No static data at all on an mmsi-keyed context → MMSI label
+  // (derived from the context), never the unwieldy urn string.
+  const bare = {
+    context: "vessels.urn:mrn:imo:mmsi:230123456",
+    name: null,
+    mmsi: null,
+    buddy: false,
+    lat: 60,
+    lon: 24,
+    tMs: T0,
+    receivedMs: T0,
+    cogRad: null,
+    sogMs: null,
+    headingRad: null,
+  };
+  assert.equal(
+    vm.aisMarkerSpec(
+      { ...bare, mmsi: vm.aisMmsiFromContext(bare.context) },
+      T0,
+      null,
+    ).label,
+    "MMSI 230123456",
+  );
+  // uuid context without static data: context tail as the last resort.
+  assert.equal(
+    vm.aisMarkerSpec(
+      { ...bare, context: "vessels.urn:mrn:signalk:uuid:some-boat" },
+      T0,
+      null,
+    ).label,
+    "urn:mrn:signalk:uuid:some-boat",
+  );
 });
 
 test("aisTargetsForRender: drop, range filter, sort; without own renders all", async () => {
