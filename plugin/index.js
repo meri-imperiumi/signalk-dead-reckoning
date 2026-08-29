@@ -80,6 +80,10 @@ const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
 const { reduceSight, reduceNoonSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
 const { registerPlotterExtension } = require("./plotterext.js");
+const {
+  createShadowVesselPublisher,
+  resolveVelocity: resolveShadowVelocity,
+} = require("./shadow-vessel.js");
 const { computeRadius } = require("./uncertainty.js");
 const {
   DEFAULT_FACTOR,
@@ -298,6 +302,18 @@ const DEFAULT_CONFIG = {
     baseUrl: "", // empty → http://localhost:<server port>
     intervalMs: 1800000,
   },
+  /**
+   * Shadow vessel (work doc #21): publish the DR position as a synthetic
+   * `vessels.<id>` target so chart plotters (Freeboard-SK's AIS layer)
+   * render the shadow boat on the chart. Opt-in — off by default. The
+   * `buddy` flag is hardcoded on (it's the distinctness mechanism, not a
+   * preference): Freeboard-SK's only per-target data-driven visual lever
+   * is the buddy flag → the green ais_buddy glyph.
+   */
+  shadowVessel: {
+    enabled: false,
+    name: "DR Shadow",
+  },
 };
 
 /**
@@ -358,6 +374,8 @@ const deps = {
   createPolarSpeedState,
   polarSpeedSample,
   polarSpeedAverage,
+  createShadowVesselPublisher,
+  resolveShadowVelocity,
   distanceNm,
   bearingDeg,
 };
@@ -400,6 +418,9 @@ module.exports = (app) => {
 
   /** @type {(() => void)|null} plotter-extension provider teardown (work doc #19) */
   let plotterExtTeardown = null;
+
+  /** @type {{publish: Function, stop: Function}|null} shadow vessel publisher (work doc #21) */
+  let shadow = null;
 
   /**
    * Manual set-and-drift override (§6.2 tier 1): watchstander input,
@@ -589,6 +610,18 @@ module.exports = (app) => {
           title: "Polar speed staleness cutoff (s)",
           default: DEFAULT_CONFIG.polar.staleS,
         },
+        "shadowVessel.enabled": {
+          type: "boolean",
+          title: "Show the DR shadow boat on chart plotters",
+          description:
+            "Publishes the DR position as a synthetic vessel (a green 'buddy' target on Freeboard-SK) so chart plotters that source vessels from the Signal K stream render the shadow boat on the chart alongside your own vessel, with a projected COG line. The plugin stays the source of truth; this only adds a chart-visible target.",
+          default: DEFAULT_CONFIG.shadowVessel.enabled,
+        },
+        "shadowVessel.name": {
+          type: "string",
+          title: "Shadow vessel label",
+          default: DEFAULT_CONFIG.shadowVessel.name,
+        },
       },
     },
 
@@ -618,6 +651,10 @@ module.exports = (app) => {
       config.polar = {
         ...DEFAULT_CONFIG.polar,
         ...(options?.polar ?? {}),
+      };
+      config.shadowVessel = {
+        ...DEFAULT_CONFIG.shadowVessel,
+        ...(options?.shadowVessel ?? {}),
       };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
@@ -703,6 +740,24 @@ module.exports = (app) => {
       // continues the uncertainty polygon rather than resetting it.
       const logSinceOrigin = deps.getState(db, "dr_log_since_origin");
       if (logSinceOrigin) engine.logNmSinceOrigin = Number(logSinceOrigin) || 0;
+
+      // Shadow vessel (work doc #21): publish the DR position as a synthetic
+      // vessels.<id> target so chart plotters render it. The context is a
+      // stable UUID persisted across restarts so the plotter's target id
+      // is continuous (no flicker/age-out on restart). Generated once and
+      // reused — never collides with a real AIS target.
+      if (config.shadowVessel.enabled) {
+        let shadowCtx = deps.getState(db, "shadow_vessel_context");
+        if (!shadowCtx) {
+          shadowCtx = `vessels.urn:mrn:signalk:uuid:${crypto.randomUUID()}`;
+          deps.setState(db, "shadow_vessel_context", shadowCtx);
+        }
+        shadow = deps.createShadowVesselPublisher({
+          app,
+          context: shadowCtx,
+          name: config.shadowVessel.name,
+        });
+      }
 
       initLogbook();
 
@@ -806,6 +861,8 @@ module.exports = (app) => {
       training = null;
       plotterExtTeardown?.();
       plotterExtTeardown = null;
+      shadow?.stop();
+      shadow = null;
       // Hygiene: clear a live advisory so it doesn't linger after the
       // plugin stops monitoring.
       if (divergence?.active) {
@@ -1080,6 +1137,14 @@ module.exports = (app) => {
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
         [PATHS.divergenceDistance]: null,
       });
+      // Shadow vessel (work doc #21): keep the shadow on the chart at the
+      // last position so it doesn't vanish or go stale while DR is idle.
+      // SOG=0 clears any previously-drawn COG line so it doesn't linger
+      // stale; heading/COG are omitted (the plotter retains the last
+      // values, which is honest — the shadow isn't moving).
+      if (shadow && engine.origin) {
+        shadow.publish({ position: engine.origin, sogMs: 0 });
+      }
       return;
     }
 
@@ -1361,6 +1426,29 @@ module.exports = (app) => {
           ? dvg.distance_nm * METRES_PER_NM
           : null,
       });
+
+      // Shadow vessel (work doc #21): emit the DR position + a derived
+      // COG/SOG so the plotter draws the shadow with a projected COG
+      // line. The velocity vector mirrors the engine's motion model
+      // (water-track + current) so the line projects consistently. Units
+      // are Signal K SI (rad, m/s), matching how the plugin publishes
+      // the own-vessel current vector above.
+      if (shadow && pos) {
+        const vel = deps.resolveShadowVelocity({
+          stwKn: effectiveStwKn,
+          headingTrueDeg,
+          leewayDeg: corrections.leeway_angle,
+          speedLoss: corrections.speed_loss,
+          current,
+        });
+        shadow.publish({
+          position: pos,
+          headingTrueRad:
+            headingTrueDeg != null ? degToRad(headingTrueDeg) : null,
+          cogRad: vel ? degToRad(vel.cogDeg) : null,
+          sogMs: vel ? knotsToMs(vel.sogKn) : null,
+        });
+      }
     }
   }
 

@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Shadow vessel on chart plotters (work doc #21)** — the DR
+  shadow-boat position is now published as a synthetic vessel on a
+  stable `vessels.<uuid>` context, so chart plotters that source
+  vessels from the Signal K stream (Freeboard-SK's AIS layer) render
+  it on the chart alongside the own vessel and AIS traffic, with a
+  projected COG line. Freeboard-SK draws it as a green `ais_buddy`
+  target — the only per-target data-driven visual lever in its AIS
+  style decision tree is the `buddy` flag, which the plugin sets on the
+  root-value delta. The gap between the shadow's heading (bow) and its
+  COG line visualizes set + leeway, mirroring how the plotter treats
+  the own vessel. Opt-in via *Shadow Vessel* in the plugin settings
+  (off by default); the configurable label defaults to "DR Shadow".
+  The plugin stays the source of truth — the shadow is an additional
+  chart-visible target, not a navigational authority. The context UUID
+  is generated once and persisted so the plotter's target id is
+  continuous across restarts. While DR is idle (moored, no speed or
+  heading) the shadow keeps publishing the last position at SOG 0 so
+  it doesn't vanish or go stale, and the COG line clears. No
+  Freeboard-SK change is required.
 - **Vector chart tiles in the webapp map (work doc #20)** — charts
   with `format: 'pbf'` in the server's configured charts resource
   (NOAA ENC-derived S-57 MBTiles, an Open Waters passage cache, any
