@@ -206,7 +206,7 @@ class DrPendingList extends HTMLElement {
     const hint = this.shadowRoot.querySelector("#partner-hint");
     hint.hidden = !vm.needsPartner(this.rows);
     hint.textContent =
-      "One observation is a constraint, not a fix — it needs a partner LOP/CPL to resolve.";
+      "One observation is a constraint, not a fix — select a partner sight/bearing, or resolve it alone against the last confirmed fix as a running fix.";
 
     this.renderFooter();
   }
@@ -298,12 +298,19 @@ class DrPendingList extends HTMLElement {
     const n = this.selection.size;
     const previewBtn = this.shadowRoot.querySelector("#preview-btn");
     const confirmBtn = this.shadowRoot.querySelector("#confirm-btn");
-    previewBtn.disabled = n < 2;
+    // One selected observation resolves as a running fix against the
+    // last confirmed fix; two or more resolve as an ordinary fix.
+    previewBtn.disabled = n < 1;
     previewBtn.textContent =
-      n === 0 ? "Preview selected" : `Preview selected (${n})`;
+      n === 1
+        ? "Running fix (1)"
+        : n > 1
+          ? `Preview selected (${n})`
+          : "Preview selected";
     confirmBtn.disabled = !this.candidate;
+    const runTag = this.candidate?.derived_from_fix_id ? " · running fix" : "";
     this.statusEl.textContent = this.candidate
-      ? `candidate ready${this.candidate.residual_nm != null ? ` · residual ${this.candidate.residual_nm.toFixed(2)} nm` : ""}`
+      ? `candidate ready${runTag}${this.candidate.residual_nm != null ? ` · residual ${this.candidate.residual_nm.toFixed(2)} nm` : ""}`
       : n > 0
         ? `${n} selected`
         : "";
@@ -318,7 +325,7 @@ class DrPendingList extends HTMLElement {
   async preview() {
     this.hideError();
     const selection = this.selectedRows();
-    if (selection.length < 2) return;
+    if (selection.length < 1) return;
     try {
       const res = await fetch(`${API}/fix/resolve`, {
         method: "POST",

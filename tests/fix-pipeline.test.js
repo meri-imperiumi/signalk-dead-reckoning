@@ -23,7 +23,11 @@ const {
   getLineOfPosition,
   getCircularPositionLine,
 } = require("../plugin/db.js");
-const { distanceNm, bearingDeg } = require("../plugin/geo.js");
+const {
+  distanceNm,
+  bearingDeg,
+  destinationPoint,
+} = require("../plugin/geo.js");
 const {
   resolveCandidateFix,
   confirmFix,
@@ -652,5 +656,177 @@ test("full pipeline: two bearings → resolve → confirm → correction recorde
     .prepare("SELECT COUNT(*) AS n FROM dr_corrections WHERE fix_id = ?")
     .get(res.fix_id).n;
   assert.strictEqual(corrCount, 1);
+  db.close();
+});
+
+// --- Single-observation running fix against a previous confirmed fix ---
+
+const RUN_T0 = Date.UTC(2026, 0, 2, 10, 0, 0);
+const RUN_T1 = Date.UTC(2026, 0, 3, 10, 0, 0);
+
+/** The running-fix input shape shared by the tests below. */
+function runningFixInput(overrides = {}) {
+  return {
+    source_type: "celestial",
+    observations: [
+      {
+        kind: "lop",
+        assumed_lat: 60,
+        assumed_lon: 24,
+        azimuth_true: 0,
+        intercept_nm: 2,
+        timestamp_ms: RUN_T1,
+      },
+    ],
+    observationIds: { lopIds: [7], cplIds: [] },
+    previous_fix: {
+      fix_id: 42,
+      latitude: 60,
+      longitude: 24,
+      timestamp_ms: RUN_T0,
+    },
+    drPosition: { latitude: 60, longitude: 24 },
+    advance: () => ({ bearingTrue: 90, distanceNm: 1 }),
+    ...overrides,
+  };
+}
+
+test("resolveCandidateFix: single LOP + previous fix resolves as a running fix", () => {
+  const c = resolveCandidateFix(runningFixInput());
+  assert.ok(c);
+  assert.strictEqual(c.derived_from_fix_id, 42);
+  // The fix advanced 1nm east along the DR run, then projected 2nm
+  // north onto the sight's east-west line: residual = the correction.
+  const advancedFix = destinationPoint({ latitude: 60, longitude: 24 }, 90, 1);
+  assert.ok(
+    Math.abs(c.latitude - (advancedFix.latitude + 2 / 60)) < 0.001,
+    `latitude ${c.latitude}`,
+  );
+  assert.ok(Math.abs(c.longitude - advancedFix.longitude) < 0.001);
+  assert.ok(Math.abs(c.residual_nm - 2) < 0.02, `residual ${c.residual_nm}`);
+  // Advancements carry the fix transport (original → advanced + vector)
+  // and the un-transported sight.
+  const point = c.advancements.find((a) => a.kind === "point");
+  const sight = c.advancements.find((a) => a.kind === "lop");
+  assert.ok(point && sight);
+  assert.deepStrictEqual(point.original, { latitude: 60, longitude: 24 });
+  assert.deepStrictEqual(point.displacement, {
+    bearingTrue: 90,
+    distanceNm: 1,
+  });
+  assert.strictEqual(sight.displacement, null);
+});
+
+test("resolveCandidateFix: running fix needs DR-track coverage — null otherwise", () => {
+  // The track provider can't cover [fix, sight]: projecting the fix's
+  // stale position onto the sight would be silently wrong.
+  const c = resolveCandidateFix(runningFixInput({ advance: () => null }));
+  assert.strictEqual(c, null);
+});
+
+test("resolveCandidateFix: sight older than the fix does not engage running-fix mode", () => {
+  const c = resolveCandidateFix(
+    runningFixInput({
+      observations: [
+        {
+          kind: "lop",
+          assumed_lat: 60,
+          assumed_lon: 24,
+          azimuth_true: 0,
+          timestamp_ms: RUN_T0 - 1000,
+        },
+      ],
+    }),
+  );
+  // Falls through to ordinary single-LOP resolution: not resolvable.
+  assert.strictEqual(c, null);
+});
+
+test("resolveCandidateFix: zero-distance run still resolves (becalmed)", () => {
+  const c = resolveCandidateFix(
+    runningFixInput({ advance: () => ({ bearingTrue: 0, distanceNm: 0 }) }),
+  );
+  assert.ok(c);
+  assert.strictEqual(c.derived_from_fix_id, 42);
+  const point = c.advancements.find((a) => a.kind === "point");
+  assert.ok(point.displacement, "zero run is recorded as covered, not a gap");
+  assert.strictEqual(point.displacement.distanceNm, 0);
+  // Un-moved fix, still corrected onto the line 2nm north.
+  assert.ok(Math.abs(c.latitude - (60 + 2 / 60)) < 0.001);
+  assert.ok(Math.abs(c.residual_nm - 2) < 0.02);
+});
+
+test("resolveCandidateFix: two observations ignore previous_fix (ordinary fix)", () => {
+  const c = resolveCandidateFix(
+    runningFixInput({
+      observations: [
+        {
+          kind: "lop",
+          assumed_lat: 60,
+          assumed_lon: 24,
+          azimuth_true: 0,
+          timestamp_ms: RUN_T0,
+        },
+        {
+          kind: "lop",
+          assumed_lat: 60,
+          assumed_lon: 24,
+          azimuth_true: 90,
+          timestamp_ms: RUN_T1,
+        },
+      ],
+    }),
+  );
+  assert.ok(c);
+  assert.strictEqual(c.derived_from_fix_id, undefined);
+});
+
+test("confirmFix: running fix records derived_from_fix_id and attaches the sight", () => {
+  const db = openDatabase(join(tempDir, "running-fix-confirm.sqlite"));
+  const prevFixId = recordFix(db, {
+    timestamp: new Date(RUN_T0).toISOString(),
+    source_type: "gps",
+    latitude: 60,
+    longitude: 24,
+  });
+  const lopId = recordLineOfPosition(db, {
+    timestamp: new Date(RUN_T1).toISOString(),
+    lop_type: "celestial",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    intercept_nm: 2,
+    body_or_object: "Sun LL",
+  });
+  const engine = fakeEngine({ latitude: 60.05, longitude: 24.05 });
+  const candidate = resolveCandidateFix({
+    source_type: "celestial",
+    observationIds: { lopIds: [lopId], cplIds: [] },
+    previous_fix: {
+      fix_id: prevFixId,
+      latitude: 60,
+      longitude: 24,
+      timestamp_ms: RUN_T0,
+    },
+    drPosition: { latitude: 60, longitude: 24 },
+    db,
+    helpers: { getLineOfPosition, getCircularPositionLine },
+    advance: () => ({ bearingTrue: 90, distanceNm: 1 }),
+  });
+  assert.ok(candidate);
+  assert.strictEqual(candidate.derived_from_fix_id, prevFixId);
+
+  const res = confirmFix(db, candidate, engine, helpers, {
+    confirmedBy: "frank",
+    timestamp: new Date(RUN_T1).toISOString(),
+  });
+  const row = db
+    .prepare("SELECT derived_from_fix_id FROM fixes WHERE fix_id = ?")
+    .get(res.fix_id);
+  assert.strictEqual(row.derived_from_fix_id, prevFixId);
+  const attached = db
+    .prepare("SELECT used_in_fix_id FROM lines_of_position WHERE lop_id = ?")
+    .get(lopId);
+  assert.strictEqual(attached.used_in_fix_id, res.fix_id);
   db.close();
 });

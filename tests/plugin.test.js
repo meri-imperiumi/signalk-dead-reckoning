@@ -12,6 +12,11 @@ const { DatabaseSync } = require("node:sqlite");
 
 const makePlugin = require("../plugin/index.js");
 const celestial = require("../plugin/celestial.js");
+const {
+  openDatabase,
+  recordFix,
+  recordTrackSamples,
+} = require("../plugin/db.js");
 const { FakeSignalKApp, FakeRouter } = require("./fake-app.js");
 
 let tempDir;
@@ -608,6 +613,122 @@ test("POST /fix/resolve returns 400 for an unresolvable single LOP", async () =>
   });
   assert.strictEqual(status, 400);
   assert.ok(/not resolvable/.test(body.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("single sight resolves as a running fix against the last confirmed fix (end-to-end)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-runfix-"));
+  // Pre-seed the db exactly as a day of sailing would have left it:
+  // a confirmed fix at t0, and DR track samples covering [t0, t1] — the
+  // run the fix is advanced along (here ~3nm due east at 60N).
+  const t0 = Date.now() - 30 * 60 * 1000;
+  const t1 = Date.now() - 25 * 60 * 1000;
+  const seed = openDatabase(join(dir, "dead-reckoning.sqlite"));
+  const prevFixId = recordFix(seed, {
+    timestamp: new Date(t0).toISOString(),
+    source_type: "gps",
+    latitude: 60,
+    longitude: 24,
+  });
+  recordTrackSamples(seed, [
+    { timestamp: t0, latitude: 60, longitude: 24 },
+    { timestamp: t1, latitude: 60, longitude: 24.1 },
+  ]);
+  seed.close();
+
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  // No navigation.position delta here: emitting one records a GPS fix
+  // newer than the sight, which (correctly) blocks running backward
+  // from it. The E-W sight line keeps the projection origin-agnostic.
+
+  // A single sun sight 5h after the fix: east-west LOP 2nm north of
+  // the assumed position.
+  const lopId = router.invoke("post", "/fix/lop", {
+    lop_type: "celestial",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    intercept_nm: 2,
+    body_or_object: "Sun LL",
+    timestamp: new Date(t1).toISOString(),
+  }).body.lop_id;
+
+  const { status, body } = router.invoke("post", "/fix/resolve", {
+    source_type: "celestial",
+    lop_ids: [lopId],
+  });
+  assert.strictEqual(status, 200, JSON.stringify(body));
+  const c = body.candidate;
+  assert.strictEqual(c.derived_from_fix_id, prevFixId);
+  // The fix was advanced ~3nm east along the seeded DR run.
+  const point = c.advancements.find((a) => a.kind === "point");
+  assert.ok(point, "fix advancement present");
+  assert.ok(
+    point.displacement &&
+      Math.abs(point.displacement.distanceNm - 3) < 0.2 &&
+      Math.abs(point.displacement.bearingTrue - 90) < 2,
+    `displacement ${JSON.stringify(point.displacement)}`,
+  );
+  // Projected 2nm north onto the sight's line: residual = correction.
+  assert.ok(
+    Math.abs(c.latitude - (60 + 2 / 60)) < 0.01,
+    `latitude ${c.latitude}`,
+  );
+  assert.ok(Math.abs(c.longitude - 24.1) < 0.01, `longitude ${c.longitude}`);
+  assert.ok(Math.abs(c.residual_nm - 2) < 0.1, `residual ${c.residual_nm}`);
+
+  // Confirm: provenance recorded, sight attached, DR snapped.
+  const conf = router.invoke("post", "/fix", {
+    candidate: c,
+    confirmed_by: "crew",
+  });
+  assert.strictEqual(conf.status, 200, JSON.stringify(conf.body));
+  plugin.stop();
+  const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+    readOnly: true,
+  });
+  const fixRow = db
+    .prepare("SELECT * FROM fixes WHERE fix_id = ?")
+    .get(conf.body.fix_id);
+  assert.strictEqual(fixRow.derived_from_fix_id, prevFixId);
+  assert.strictEqual(fixRow.source_type, "celestial");
+  const lopRow = db
+    .prepare("SELECT used_in_fix_id FROM lines_of_position WHERE lop_id = ?")
+    .get(lopId);
+  assert.strictEqual(lopRow.used_in_fix_id, conf.body.fix_id);
+  db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("single sight with no previous fix gets the honest 400", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-runfix-none-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const lopId = router.invoke("post", "/fix/lop", {
+    lop_type: "celestial",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    intercept_nm: 2,
+    body_or_object: "Sun LL",
+    timestamp: new Date().toISOString(),
+  }).body.lop_id;
+  const { status, body } = router.invoke("post", "/fix/resolve", {
+    source_type: "celestial",
+    lop_ids: [lopId],
+  });
+  assert.strictEqual(status, 400);
+  assert.ok(/previous confirmed fix/.test(body.message), body.message);
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });

@@ -2385,6 +2385,25 @@ module.exports = (app) => {
     });
 
     /**
+     * The last confirmed fix, shaped as a running-fix anchor: the point a
+     * single selected observation resolves against (advanced along the
+     * DR track to the observation time by the pipeline). Null when no
+     * fix has been confirmed yet.
+     *
+     * @returns {{fix_id: number, latitude: number, longitude: number, timestamp_ms: number}|null}
+     */
+    function latestFixAsPreviousFix() {
+      const row = deps.listFixes(db, { limit: 1 })[0];
+      if (!row) return null;
+      return {
+        fix_id: row.fix_id,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        timestamp_ms: Date.parse(row.timestamp),
+      };
+    }
+
+    /**
      * POST /fix/resolve — preview a candidate fix from LOP/CPL inputs WITHOUT
      * confirming it (SPEC §9.1: candidate is presented to the watchkeeper with
      * context, then a human explicitly confirms). Returns the resolved
@@ -2403,6 +2422,25 @@ module.exports = (app) => {
         return;
       }
       const b = parseBody(req.body);
+      const lopIds = Array.isArray(b.lop_ids) ? b.lop_ids : [];
+      const cplIds = Array.isArray(b.cpl_ids) ? b.cpl_ids : [];
+      // Single selected observation: engage running-fix mode against the
+      // last confirmed fix when one exists (SPEC §9.1 sun-run-sun
+      // economy — one sight per day; equally a single bearing when
+      // making landfall). No previous fix → the honest 400 explaining
+      // what's missing.
+      const runningFixEligible =
+        typeof b.latitude !== "number" &&
+        !(Array.isArray(b.observations) && b.observations.length > 0) &&
+        lopIds.length + cplIds.length === 1;
+      const previousFix = runningFixEligible ? latestFixAsPreviousFix() : null;
+      if (runningFixEligible && !previousFix) {
+        res.status(400).json({
+          message:
+            "a single observation needs a previous confirmed fix (running fix) — select 2+ observations, or confirm a fix first",
+        });
+        return;
+      }
       const candidate = deps.resolveCandidateFix({
         source_type: b.source_type || "manual",
         point:
@@ -2410,10 +2448,8 @@ module.exports = (app) => {
             ? { latitude: b.latitude, longitude: b.longitude }
             : null,
         observations: Array.isArray(b.observations) ? b.observations : [],
-        observationIds: {
-          lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
-          cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
-        },
+        observationIds: { lopIds, cplIds },
+        previous_fix: previousFix ?? undefined,
         drPosition: engine.origin ?? undefined,
         engine,
         db,
@@ -2510,13 +2546,18 @@ module.exports = (app) => {
           advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
         });
       } else {
+        const lopIds = Array.isArray(b.lop_ids) ? b.lop_ids : [];
+        const cplIds = Array.isArray(b.cpl_ids) ? b.cpl_ids : [];
+        const runningFixEligible =
+          !(Array.isArray(b.observations) && b.observations.length > 0) &&
+          lopIds.length + cplIds.length === 1;
         candidate = deps.resolveCandidateFix({
           source_type: b.source_type || "manual",
           observations: Array.isArray(b.observations) ? b.observations : [],
-          observationIds: {
-            lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
-            cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
-          },
+          observationIds: { lopIds, cplIds },
+          previous_fix: runningFixEligible
+            ? (latestFixAsPreviousFix() ?? undefined)
+            : undefined,
           drPosition: engine.origin ?? undefined,
           engine,
           db,
@@ -2560,6 +2601,7 @@ module.exports = (app) => {
           deviation_bearing: result.deviation_bearing,
           dr_log_nm: engine.logNmSinceOrigin,
           residual_nm: candidate.residual_nm ?? null,
+          derived_from_fix_id: candidate.derived_from_fix_id ?? null,
           observation_count:
             (candidate.observationIds?.lopIds?.length ?? 0) +
             (candidate.observationIds?.cplIds?.length ?? 0),

@@ -94,6 +94,39 @@ test("composeFixEntry: celestial fix composes sights + residual into text", () =
   );
 });
 
+test("composeFixEntry: running fix names the fix it advanced from", () => {
+  const body = composeFixEntry({
+    datetime: "2026-08-24T12:00:00.000Z",
+    source_type: "celestial",
+    latitude: 60,
+    longitude: 24,
+    residual_nm: 2.4,
+    derived_from_fix_id: 7,
+    observations: [
+      { kind: "lop", lop_type: "celestial", body_or_object: "Sun LL" },
+    ],
+  });
+  assert.ok(
+    /Celestial fix from Sun LL sight \(running fix, advanced from fix #7\)/.test(
+      body.text,
+    ),
+    body.text,
+  );
+  assert.ok(/residual 2\.4 NM/.test(body.text));
+  // Without derived_from_fix_id there is no running-fix clause.
+  const plain = composeFixEntry({
+    datetime: "2026-08-24T12:00:00.000Z",
+    source_type: "celestial",
+    latitude: 60,
+    longitude: 24,
+    residual_nm: 2.4,
+    observations: [
+      { kind: "lop", lop_type: "celestial", body_or_object: "Sun LL" },
+    ],
+  });
+  assert.ok(!/running fix/.test(plain.text), plain.text);
+});
+
 test("composeFixEntry: unattributed fix omits author and deviation clause when unknown", () => {
   const body = composeFixEntry({
     datetime: "2026-08-24T12:00:00.000Z",

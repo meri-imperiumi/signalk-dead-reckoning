@@ -79,6 +79,9 @@ const { resolveFix, advanceObservation } = require("./fixes.js");
  *           original when not transported), and the displacement used —
  *           empty for GPS point fixes. Lets the preview UI draw the
  *           advancement instead of only the final fix.
+ * @property {number|null} [derived_from_fix_id] - the confirmed fix a
+ *           single-observation running fix was advanced from; null/absent
+ *           for ordinary multi-observation fixes.
  */
 
 /**
@@ -104,6 +107,7 @@ const { resolveFix, advanceObservation } = require("./fixes.js");
  * @param {import('node:sqlite').DatabaseSync|null} [input.db] - to hydrate observations from ids
  * @param {{getLineOfPosition?: Function, getCircularPositionLine?: Function}} [input.helpers] - db getters for id-hydration
  * @param {((t0: number, t1: number) => ({bearingTrue: number, distanceNm: number}|null))|null} [input.advance] - ground-track displacement provider for running fixes; advances earlier observations to the latest timestamp
+ * @param {{fix_id: number, latitude: number, longitude: number, timestamp_ms: number}|null} [input.previous_fix] - last confirmed fix, for the single-observation running fix: the fix is advanced along the DR track to the observation time and projected onto the observation's constraint
  * @returns {CandidateFix|null} null if observations can't be resolved (e.g. a single LOP with no point)
  */
 /**
@@ -159,6 +163,9 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
 function referencePoint(o) {
   if (o.kind === "cpl") {
     return { latitude: o.center_lat, longitude: o.center_lon };
+  }
+  if (o.kind === "point") {
+    return { latitude: o.latitude, longitude: o.longitude };
   }
   return { latitude: o.assumed_lat, longitude: o.assumed_lon };
 }
@@ -227,9 +234,19 @@ function advanceToLatest(observations, advance) {
       continue;
     }
     const disp = advance(o.timestamp_ms, tLate);
-    if (!disp || disp.distanceNm === 0) {
+    if (!disp) {
       out.push(o);
       advancements.push(advancementRecord(o, o, null));
+      continue;
+    }
+    if (disp.distanceNm === 0) {
+      // The track covers the interval but the vessel made no way over
+      // it (becalmed, anchored): the observation is already where the
+      // run puts it, and the displacement is recorded — covered, just
+      // zero — so downstream honesty checks don't mistake this for a
+      // coverage gap.
+      out.push(o);
+      advancements.push(advancementRecord(o, o, disp));
       continue;
     }
     const moved = advanceObservation(o, disp);
@@ -272,6 +289,41 @@ function resolveCandidateFix(input) {
   }
   if (observations.length === 0) return null;
 
+  // Single-observation running fix against a previous confirmed fix
+  // (SPEC §9.1 sun-run-sun economy — one sight per day; equally a
+  // single bearing when making landfall): the fix enters as a point
+  // observation, `advanceToLatest` transports it along the DR track to
+  // the observation time, and the resolver projects it onto the
+  // observation's constraint. Engaged only when exactly one geometric
+  // observation is in play and it is newer than the fix; anything else
+  // goes through the normal multi-observation resolution.
+  let derivedFromFixId = null;
+  if (
+    !input.point &&
+    input.previous_fix &&
+    observations.length === 1 &&
+    observations[0].kind !== "point"
+  ) {
+    const prev = input.previous_fix;
+    const sight = observations[0];
+    if (
+      Number.isFinite(sight.timestamp_ms) &&
+      Number.isFinite(prev.timestamp_ms) &&
+      sight.timestamp_ms > prev.timestamp_ms
+    ) {
+      observations = [
+        {
+          kind: "point",
+          latitude: prev.latitude,
+          longitude: prev.longitude,
+          timestamp_ms: prev.timestamp_ms,
+        },
+        sight,
+      ];
+      derivedFromFixId = prev.fix_id;
+    }
+  }
+
   // Running fix (SPEC §9.1, sun-run-sun): when observations carry
   // timestamps and span a time interval, advance the earlier ones to the
   // latest observation time along the vessel's ground track before
@@ -286,6 +338,17 @@ function resolveCandidateFix(input) {
   );
   observations = advancedObs;
 
+  // Running-fix honesty gate: the previous fix must actually have been
+  // transported to the observation time. Without DR-track coverage over
+  // the interval, projecting the fix's *stale* position onto the
+  // constraint would be silently wrong — return the honest null instead.
+  if (
+    derivedFromFixId != null &&
+    !advancements.some((a) => a.kind === "point" && a.displacement != null)
+  ) {
+    return null;
+  }
+
   const drPosition = input.drPosition ??
     input.engine?.origin ?? { latitude: 0, longitude: 0 };
   const resolved = resolveFix(observations, drPosition, drPosition);
@@ -299,6 +362,9 @@ function resolveCandidateFix(input) {
     alternate: resolved.alternate,
     observationIds: { lopIds: [...lopIds], cplIds: [...cplIds] },
     advancements,
+    ...(derivedFromFixId != null
+      ? { derived_from_fix_id: derivedFromFixId }
+      : {}),
   };
 }
 
@@ -350,6 +416,7 @@ function confirmFix(db, candidate, engine, helpers, opts = {}) {
       opts.estimatedErrorRadius ?? (candidate.residual_nm || null),
     confirmed_by: opts.confirmedBy ?? null,
     resets_dr_origin: resets,
+    derived_from_fix_id: candidate.derived_from_fix_id ?? null,
     notes: opts.notes ?? null,
   });
 

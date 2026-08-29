@@ -823,9 +823,11 @@ class DrMapView extends HTMLElement {
         weight: 1,
       })
         .bindTooltip(
-          spec.warning
-            ? "taken here — not advanced (no DR track)"
-            : "taken here",
+          spec.kind === "point"
+            ? "previous fix position"
+            : spec.warning
+              ? "taken here — not advanced (no DR track)"
+              : "taken here",
           { direction: "top" },
         )
         .addTo(layer);
@@ -849,7 +851,10 @@ class DrMapView extends HTMLElement {
         fillOpacity: 0.9,
         weight: 2,
       })
-        .bindTooltip("participates here", { direction: "top" })
+        .bindTooltip(
+          spec.kind === "point" ? "fix advanced here" : "participates here",
+          { direction: "top" },
+        )
         .addTo(layer);
       // The advanced constraint itself: LOP drawn at the advanced
       // position with the row's azimuth.

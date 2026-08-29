@@ -407,6 +407,15 @@ test("advanceObservation: CPL center moves, radius preserved", () => {
   assert.ok(Math.abs(moved.center_lon - expected.longitude) < 1e-9);
 });
 
+test("advanceObservation: point moves by the displacement", () => {
+  const obs = { kind: "point", latitude: 60, longitude: 24 };
+  const moved = advanceObservation(obs, { bearingTrue: 90, distanceNm: 1 });
+  assert.strictEqual(moved.kind, "point");
+  const expected = destinationPoint({ latitude: 60, longitude: 24 }, 90, 1);
+  assert.ok(Math.abs(moved.latitude - expected.latitude) < 1e-9);
+  assert.ok(Math.abs(moved.longitude - expected.longitude) < 1e-9);
+});
+
 test("running fix: advance one LOP then combine with a later LOP", () => {
   // First LOP: bearing 0 (object due north) → east-west line through CENTER.
   // DR moves 1nm NORTH over the interval; the advanced LOP is now an
@@ -431,4 +440,84 @@ test("running fix: advance one LOP then combine with a later LOP", () => {
   const dNorth = distanceNm(CENTER, { latitude: r.latitude, longitude: 24 });
   assert.ok(Math.abs(dNorth - 1) < 0.01, `expected ~1nm north, got ${dNorth}`);
   assert.ok(Math.abs(r.longitude - 24) < 0.01);
+});
+
+test("resolveFix: point alone returns the point with zero residual", () => {
+  const r = resolveFix(
+    [{ kind: "point", latitude: 60.01, longitude: 24.02 }],
+    CENTER,
+    DR,
+  );
+  assert.ok(r);
+  assert.ok(Math.abs(r.latitude - 60.01) < 1e-9);
+  assert.ok(Math.abs(r.longitude - 24.02) < 1e-9);
+  assert.strictEqual(r.residual_nm, 0);
+  assert.strictEqual(r.alternate, null);
+});
+
+test("resolveFix: point + LOP projects onto the line (running fix vs previous fix)", () => {
+  // Line: bearing 0 → east-west line 2nm north of CENTER (intercept 2).
+  // The previous fix sits 1nm north of CENTER. Its perpendicular foot
+  // on the line is 2nm north; the residual is the 1nm correction.
+  const lop = {
+    kind: "lop",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+    intercept_nm: 2,
+  };
+  const fixPoint = { kind: "point", latitude: 60 + 1 / 60, longitude: 24 };
+  const r = resolveFix([fixPoint, lop], CENTER, DR);
+  assert.ok(r);
+  const dNorth = distanceNm(CENTER, { latitude: r.latitude, longitude: 24 });
+  assert.ok(Math.abs(dNorth - 2) < 0.01, `foot ~2nm north, got ${dNorth}`);
+  assert.ok(Math.abs(r.longitude - 24) < 0.01);
+  assert.ok(Math.abs(r.residual_nm - 1) < 0.01, `residual ${r.residual_nm}`);
+  assert.strictEqual(r.alternate, null);
+});
+
+test("resolveFix: point + CPL projects radially onto the circle", () => {
+  // Circle of 3nm around CENTER; the previous fix is 5nm north →
+  // projected to the 3nm-north point on the circle, 2nm correction.
+  const cpl = { kind: "cpl", center_lat: 60, center_lon: 24, radius_nm: 3 };
+  const fixPoint = { kind: "point", latitude: 60 + 5 / 60, longitude: 24 };
+  const r = resolveFix([fixPoint, cpl], CENTER, DR);
+  assert.ok(r);
+  const dNorth = distanceNm(CENTER, { latitude: r.latitude, longitude: 24 });
+  assert.ok(Math.abs(dNorth - 3) < 0.01, `foot ~3nm north, got ${dNorth}`);
+  assert.ok(Math.abs(r.longitude - 24) < 0.01);
+  assert.ok(Math.abs(r.residual_nm - 2) < 0.01, `residual ${r.residual_nm}`);
+});
+
+test("resolveFix: point at the CPL center is undefined → null", () => {
+  const cpl = { kind: "cpl", center_lat: 60, center_lon: 24, radius_nm: 3 };
+  const r = resolveFix(
+    [{ kind: "point", latitude: 60, longitude: 24 }, cpl],
+    CENTER,
+    DR,
+  );
+  assert.strictEqual(r, null);
+});
+
+test("resolveFix: point with ≥2 lines/circles is not a defined combination → null", () => {
+  const fixPoint = { kind: "point", latitude: 60, longitude: 24 };
+  const a = {
+    kind: "lop",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+  };
+  const b = {
+    kind: "lop",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 90,
+  };
+  assert.strictEqual(resolveFix([fixPoint, a, b], CENTER, DR), null);
+  const cpl = { kind: "cpl", center_lat: 60, center_lon: 24, radius_nm: 3 };
+  assert.strictEqual(resolveFix([fixPoint, a, cpl], CENTER, DR), null);
+  assert.strictEqual(
+    resolveFix([fixPoint, { ...fixPoint, latitude: 61 }], CENTER, DR),
+    null,
+  );
 });

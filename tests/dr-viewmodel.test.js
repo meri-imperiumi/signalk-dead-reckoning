@@ -879,6 +879,41 @@ test("advancementLayerSpecs: original/advanced/displacement + warning rows", asy
   assert.strictEqual(orphan[0].azimuthDeg, null);
 });
 
+test("advancementLayerSpecs: running-fix point advancement (previous fix)", async () => {
+  const vm = await loadVm();
+  const specs = vm.advancementLayerSpecs(
+    [
+      {
+        id: null,
+        kind: "point",
+        timestamp_ms: 1000,
+        original: { latitude: 60, longitude: 24 },
+        advanced: { latitude: 60.02, longitude: 24.04 },
+        displacement: { bearingTrue: 60, distanceNm: 2.5 },
+      },
+      {
+        id: 5,
+        kind: "lop",
+        timestamp_ms: 2000,
+        original: { latitude: 60.02, longitude: 24.04 },
+        advanced: { latitude: 60.02, longitude: 24.04 },
+        displacement: null,
+      },
+    ],
+    { lop: new Map(), cpl: new Map() },
+  );
+  const point = specs[0];
+  assert.deepStrictEqual(point.original, [60, 24]);
+  assert.deepStrictEqual(point.advanced, [60.02, 24.04]);
+  assert.strictEqual(point.displacementNm, 2.5);
+  // No observation row backs the fix point: no azimuth/radius, but the
+  // original/advanced/vector render fine (and never a warning — the
+  // pipeline nulls un-advanced running fixes).
+  assert.strictEqual(point.azimuthDeg, null);
+  assert.strictEqual(point.radiusNm, null);
+  assert.strictEqual(point.warning, false);
+});
+
 test("relativeTimeText: watchkeeper-granularity ages", async () => {
   const vm = await loadVm();
   const now = Date.UTC(2026, 7, 26, 12, 0, 0);

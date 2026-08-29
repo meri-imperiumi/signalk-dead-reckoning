@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A single sight or bearing can now be resolved as a running fix
+  against the last confirmed fix.** The sun-run-sun economy — one sun
+  sight per day — previously stalled at every-other-day fixes: both
+  sights of a confirmed pair get attached to that fix and disappear
+  from the pending list, so the next day's lone sight had no partner to
+  resolve against. Selecting exactly one pending observation now
+  advances the last confirmed fix along the DR track (the shadow boat's
+  water-track integration, surviving restarts) to the observation time
+  and projects it onto the observation's constraint: cross-track comes
+  from the sight, along-track is trusted from the run. Works the same
+  for a celestial sight, a compass bearing when making landfall, or a
+  vertical-angle CPL (radial projection). In the pending list the
+  preview button reads "Running fix (1)" for a single selection;
+  selecting 2+ observations still resolves an ordinary fix. The
+  confirmed fix records its provenance in a new `derived_from_fix_id`
+  column (schema v2, migrated in place on open), the logbook entry
+  reads e.g. "Celestial fix from Sun LL sight (running fix, advanced
+  from fix #3)", and the map draws the previous-fix position, the DR
+  run vector, and the advanced point. Honest failures throughout: no
+  previous confirmed fix or a sight older than the latest fix → a 400
+  explaining what's missing; no DR-track coverage over the interval →
+  no fix, rather than silently projecting a stale fix position.
+
 ### Fixed
 - **The multi-fix resolver now actually converges on the least-squares
   fix.** `leastSquaresFit()` — used for any fix combining three or more

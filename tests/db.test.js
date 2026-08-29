@@ -8,12 +8,14 @@ const assert = require("node:assert/strict");
 const { mkdtemp, rm } = require("node:fs/promises");
 const { join } = require("node:path");
 const { tmpdir } = require("node:os");
+const { DatabaseSync } = require("node:sqlite");
 
 const {
   openDatabase,
   getState,
   setState,
   recordFix,
+  listFixes,
   recordCorrection,
   getDeviationRateStats,
   recordTrackSamples,
@@ -61,6 +63,76 @@ test("openDatabase creates all SPEC §4 tables idempotently", () => {
 test("openDatabase records the schema version in dr_state_store", () => {
   const db = openDatabase(join(tempDir, "b.sqlite"));
   assert.strictEqual(getState(db, "schema_version"), String(SCHEMA_VERSION));
+  db.close();
+});
+
+test("v1 → v2 migration adds fixes.derived_from_fix_id in place", () => {
+  const path = join(tempDir, "v1-migration.sqlite");
+  // Hand-build a v1 database: the pre-v2 `fixes` shape (no
+  // derived_from_fix_id) and a recorded schema_version of 1.
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE dr_state_store (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+  old.exec(`CREATE TABLE fixes (
+    fix_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    estimated_error_radius REAL,
+    confirmed_by TEXT,
+    logged_to_logbook BOOLEAN NOT NULL DEFAULT 0,
+    logbook_entry_ref TEXT,
+    resets_dr_origin BOOLEAN NOT NULL DEFAULT 0,
+    notes TEXT
+  )`);
+  old
+    .prepare(
+      "INSERT INTO dr_state_store (key, value, updated_at) VALUES ('schema_version', '1', ?)",
+    )
+    .run(new Date().toISOString());
+  old
+    .prepare(
+      "INSERT INTO fixes (timestamp, source_type, latitude, longitude) VALUES (?, 'gps', 60, 24)",
+    )
+    .run(new Date().toISOString());
+  old.close();
+
+  const db = openDatabase(path);
+  assert.strictEqual(getState(db, "schema_version"), "2");
+  const cols = db
+    .prepare("SELECT name FROM pragma_table_info('fixes')")
+    .all()
+    .map((r) => r.name);
+  assert.ok(cols.includes("derived_from_fix_id"));
+  // The pre-migration row survived and is readable through the API.
+  const rows = listFixes(db);
+  assert.strictEqual(rows.length, 1);
+  assert.strictEqual(rows[0].derived_from_fix_id, null);
+  assert.strictEqual(rows[0].latitude, 60);
+  db.close();
+});
+
+test("recordFix/listFixes round-trip derived_from_fix_id", () => {
+  const db = openDatabase(join(tempDir, "derived-roundtrip.sqlite"));
+  const anchorId = recordFix(db, {
+    timestamp: "2026-01-01T00:00:00Z",
+    source_type: "gps",
+    latitude: 60,
+    longitude: 24,
+  });
+  const runId = recordFix(db, {
+    timestamp: "2026-01-02T00:00:00Z",
+    source_type: "celestial",
+    latitude: 60.1,
+    longitude: 24.1,
+    derived_from_fix_id: anchorId,
+  });
+  assert.strictEqual(getFix(db, runId).derived_from_fix_id, anchorId);
+  assert.strictEqual(getFix(db, anchorId).derived_from_fix_id, null);
   db.close();
 });
 

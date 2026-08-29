@@ -17,8 +17,10 @@ const { DatabaseSync } = require("node:sqlite");
 const { dirname } = require("node:path");
 const { mkdirSync } = require("node:fs");
 
-/** Schema version, bumped when a migration is needed. Persisted in dr_state_store. */
-const SCHEMA_VERSION = 1;
+/** Schema version, bumped when a migration is needed. Persisted in dr_state_store.
+ * v2: `fixes.derived_from_fix_id` — provenance for single-observation
+ * running fixes advanced from a previous confirmed fix. */
+const SCHEMA_VERSION = 2;
 
 /**
  * DDL for every table in SPEC §4. Statements run in order; all are
@@ -71,6 +73,7 @@ const SCHEMA_DDL = [
     logged_to_logbook BOOLEAN NOT NULL DEFAULT 0,
     logbook_entry_ref TEXT,
     resets_dr_origin BOOLEAN NOT NULL DEFAULT 0,
+    derived_from_fix_id INTEGER,
     notes TEXT
   )`,
 
@@ -190,6 +193,15 @@ function openDatabase(dbPath) {
   for (const stmt of SCHEMA_DDL) {
     db.exec(stmt);
   }
+  // v1 → v2: running-fix provenance column on `fixes`. Fresh databases
+  // get the column from the DDL above; existing ones are altered in
+  // place. The stored version is read *after* the DDL (it creates
+  // dr_state_store on a fresh database, where there is nothing to
+  // migrate) and *before* the new version is recorded below.
+  const storedVersion = getState(db, "schema_version");
+  if (storedVersion != null && Number(storedVersion) < 2) {
+    db.exec("ALTER TABLE fixes ADD COLUMN derived_from_fix_id INTEGER");
+  }
   // Record schema version so future migrations can branch on it.
   setState(db, "schema_version", String(SCHEMA_VERSION));
   return db;
@@ -286,6 +298,8 @@ function recordCorrection(db, r) {
  * @param {number} [r.estimated_error_radius]
  * @param {string} [r.confirmed_by]
  * @param {boolean} [r.resets_dr_origin]
+ * @param {number} [r.derived_from_fix_id] - the fix this running fix was
+ *   advanced from (single-observation running fix)
  * @param {string} [r.notes]
  * @returns {number} inserted fix_id
  */
@@ -293,8 +307,9 @@ function recordFix(db, r) {
   const stmt = db.prepare(
     `INSERT INTO fixes (
        timestamp, source_type, latitude, longitude,
-       estimated_error_radius, confirmed_by, resets_dr_origin, notes
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       estimated_error_radius, confirmed_by, resets_dr_origin,
+       derived_from_fix_id, notes
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const info = stmt.run(
     r.timestamp,
@@ -304,6 +319,7 @@ function recordFix(db, r) {
     r.estimated_error_radius ?? null,
     r.confirmed_by ?? null,
     r.resets_dr_origin ? 1 : 0,
+    r.derived_from_fix_id ?? null,
     r.notes ?? null,
   );
   return Number(info.lastInsertRowid);
@@ -518,7 +534,8 @@ function listFixes(db, q = {}) {
   return db
     .prepare(
       `SELECT fix_id, timestamp, source_type, latitude, longitude,
-              estimated_error_radius, confirmed_by, resets_dr_origin
+              estimated_error_radius, confirmed_by, resets_dr_origin,
+              derived_from_fix_id
        FROM fixes ORDER BY fix_id DESC LIMIT ?`,
     )
     .all(q.limit ?? 100);
@@ -713,7 +730,7 @@ function getFix(db, id) {
     .prepare(
       `SELECT fix_id, timestamp, source_type, latitude, longitude,
               estimated_error_radius, confirmed_by, resets_dr_origin,
-              notes, logged_to_logbook, logbook_entry_ref
+              notes, logged_to_logbook, logbook_entry_ref, derived_from_fix_id
        FROM fixes WHERE fix_id = ?`,
     )
     .get(id);

@@ -254,8 +254,10 @@ function distanceToCircle(center, radiusM, p) {
 
 /**
  * A normalized observation in a form the resolver understands. Point
- * observations (GPS) are handled directly by the caller and don't enter
- * the geometric resolver. LOPs and CPLs are the inputs here.
+ * observations (GPS, a previously confirmed fix carried into a running
+ * fix) enter the resolver only in the point-combination branches below;
+ * the common path for a GPS point fix is the caller treating it as a
+ * fix directly. LOPs and CPLs are the geometric inputs here.
  *
  * @typedef {Object} LopInput
  * @property {'lop'} kind
@@ -270,7 +272,12 @@ function distanceToCircle(center, radiusM, p) {
  * @property {number} center_lon
  * @property {number} radius_nm
  *
- * @typedef {LopInput|CplInput} Observation
+ * @typedef {Object} PointInput
+ * @property {'point'} kind
+ * @property {number} latitude
+ * @property {number} longitude
+ *
+ * @typedef {LopInput|CplInput|PointInput} Observation
  */
 
 /**
@@ -506,10 +513,16 @@ function gaussNewtonRefine(lops, circles, start) {
  *   is surfaced as `alternate` when it's a meaningful second candidate.
  * - **Circle × Circle** → both candidates; the one nearest the DR position
  *   is the primary, the other is `alternate` (SPEC §4.4, Q4).
+ * - **Point alone** → the point itself (residual 0).
+ * - **Point × one LOP/CPL** → running fix: the point (e.g. the previous
+ *   confirmed fix, advanced along the DR track to the observation time)
+ *   projected onto the constraint; residual = the correction magnitude.
  * - **≥3 inputs** → least-squares best-fit + residual spread (cocked hat).
  * - **<2 inputs** → not resolvable; returns null (a single observation is
  *   a constraint, not a fix — it must be advanced to combine with a later
- *   one, see `advanceObservation`).
+ *   one, see `advanceObservation`, or resolved against a previous fix as
+ *   a running fix via the point combinations above).
+ * - Any other mix containing a point → null (not a defined combination).
  *
  * @param {Observation[]} observations
  * @param {{latitude: number, longitude: number}} projectionCenter - DR / assumed position
@@ -546,6 +559,68 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
   }
   const circles = { centers: cplCenters, radii: cplRadii };
   const nInputs = lops.length + cplCenters.length;
+
+  // Point combinations (SPEC §4.4): a point paired with exactly one
+  // line/circle is a running fix against that point — the point is
+  // typically the previous confirmed fix, advanced along the DR track
+  // to the observation time by the pipeline. The sight corrects
+  // cross-track (perpendicular to a LOP, radial to a CPL); along-track
+  // is trusted from the run. The residual reported is the correction
+  // magnitude — how far the advanced point had to move onto the
+  // constraint — since the resolved point sits exactly on it.
+  const pointObs = observations.filter((o) => o.kind === "point");
+  if (pointObs.length > 0) {
+    if (pointObs.length > 1) return null; // undefined combination
+    const q = projectToLocal(projectionCenter, {
+      latitude: pointObs[0].latitude,
+      longitude: pointObs[0].longitude,
+    });
+    if (nInputs === 0) {
+      // A point alone is a fix.
+      return {
+        latitude: pointObs[0].latitude,
+        longitude: pointObs[0].longitude,
+        residual_nm: 0,
+        alternate: null,
+      };
+    }
+    if (lops.length === 1 && cplCenters.length === 0) {
+      // Perpendicular projection onto the line: the foot of the
+      // perpendicular from the advanced point.
+      const lop = lops[0];
+      const d = signedDistanceToLop(lop, q);
+      const foot = { x: q.x - d * lop.n.x, y: q.y - d * lop.n.y };
+      const ll = unprojectFromLocal(projectionCenter, foot);
+      return {
+        latitude: ll.latitude,
+        longitude: ll.longitude,
+        residual_nm: Math.abs(d) / METRES_PER_NM,
+        alternate: null,
+      };
+    }
+    if (lops.length === 0 && cplCenters.length === 1) {
+      // Radial projection onto the circle: the nearest point on the
+      // circle to the advanced point. Undefined when the point sits at
+      // the center (every direction equally valid) — the honest null.
+      const c = cplCenters[0];
+      const r = cplRadii[0];
+      const dx = q.x - c.x;
+      const dy = q.y - c.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 1e-9) return null;
+      const foot = { x: c.x + (r * dx) / dist, y: c.y + (r * dy) / dist };
+      const ll = unprojectFromLocal(projectionCenter, foot);
+      return {
+        latitude: ll.latitude,
+        longitude: ll.longitude,
+        residual_nm: Math.abs(dist - r) / METRES_PER_NM,
+        alternate: null,
+      };
+    }
+    // A point with ≥2 lines/circles would need weighting decisions the
+    // watchkeeper should make explicitly — not a defined combination.
+    return null;
+  }
 
   if (nInputs < 2) return null;
 
@@ -698,7 +773,8 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
  * Advances an observation along the DR track for a running fix (SPEC §4.4).
  * Given an observation taken at `fromTime` and the DR displacement over the
  * elapsed interval, returns a new observation whose reference point
- * (assumed position for a LOP, center for a CPL) has been dead-reckoned
+ * (assumed position for a LOP, center for a CPL, the point itself for a
+ * point) has been dead-reckoned
  * forward by the displacement. The geometry of the constraint is preserved
  * (azimuth for a LOP, radius for a CPL), since the DR track transports the
  * whole observation, not just a point on it.
@@ -713,6 +789,20 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
  * @returns {Observation}
  */
 function advanceObservation(obs, displacement) {
+  if (obs.kind === "point") {
+    // A point observation transports wholesale — there is no geometry
+    // (azimuth/radius) to preserve, only the point itself.
+    const moved = destinationPoint(
+      { latitude: obs.latitude, longitude: obs.longitude },
+      displacement.bearingTrue,
+      displacement.distanceNm,
+    );
+    return {
+      kind: "point",
+      latitude: moved.latitude,
+      longitude: moved.longitude,
+    };
+  }
   if (obs.kind === "lop") {
     const moved = destinationPoint(
       { latitude: obs.assumed_lat, longitude: obs.assumed_lon },

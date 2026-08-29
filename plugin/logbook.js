@@ -232,18 +232,24 @@ function composeFixText(f) {
   const fromSources = sources.length
     ? ` from ${sources.join(", ")}`
     : countFrom(f);
+  // Single-observation running fix: name the fix it was advanced from,
+  // so the entry reads as a chain (fix #3 → this fix) rather than a
+  // free-standing one-sight "fix".
+  const run = Number.isFinite(f.derived_from_fix_id)
+    ? ` (running fix, advanced from fix #${f.derived_from_fix_id})`
+    : "";
 
   switch (f.source_type) {
     case "celestial":
-      return `Celestial fix${fromSources}${res}${dev}`;
+      return `Celestial fix${fromSources}${run}${res}${dev}`;
     case "bearing":
-      return `Bearing fix${fromSources}${res}${dev}`;
+      return `Bearing fix${fromSources}${run}${res}${dev}`;
     case "gps":
       return `GPS fix${dev}`;
     case "backfill":
       return `Backfill fix${dev}`;
     default:
-      return `Manual fix${fromSources}${res}${dev}`;
+      return `Manual fix${fromSources}${run}${res}${dev}`;
   }
 }
 
