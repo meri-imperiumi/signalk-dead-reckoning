@@ -348,6 +348,75 @@ test("bearingToTrue: east variation adds, west subtracts, wraps 360", async () =
   closeTo(vm.bearingToTrue(180, 0), 180, 0.001, "zero var");
 });
 
+test("variationFromForm: hemisphere sign, blank/invalid → NaN", async () => {
+  const vm = await loadVm();
+  assert.strictEqual(
+    vm.variationFromForm({ variation_deg: "4.5", variation_hem: "E" }),
+    4.5,
+  );
+  assert.strictEqual(
+    vm.variationFromForm({ variation_deg: "9", variation_hem: "W" }),
+    -9,
+  );
+  // Missing hemisphere defaults to east.
+  assert.strictEqual(vm.variationFromForm({ variation_deg: "3" }), 3);
+  // Blank / absent / non-numeric magnitude → NaN (not silent 0 —
+  // Number("") is 0, so an empty field must be rejected explicitly).
+  assert.ok(Number.isNaN(vm.variationFromForm({ variation_deg: "" })));
+  assert.ok(Number.isNaN(vm.variationFromForm({})));
+  assert.ok(Number.isNaN(vm.variationFromForm({ variation_deg: "abc" })));
+});
+
+test("bearingFromFormTrue: magnetic converts via variation, true passes through", async () => {
+  const vm = await loadVm();
+  // Magnetic + east variation: 350°M + 15°E → 5°T (wraps).
+  closeTo(
+    vm.bearingFromFormTrue({
+      bearing: "350",
+      bearing_ref: "mag",
+      variation_deg: "15",
+      variation_hem: "E",
+    }),
+    5,
+    0.001,
+    "east var wraps",
+  );
+  // Magnetic + west variation: 10°M − 20°W → 350°T.
+  closeTo(
+    vm.bearingFromFormTrue({
+      bearing: "10",
+      bearing_ref: "mag",
+      variation_deg: "20",
+      variation_hem: "W",
+    }),
+    350,
+    0.001,
+    "west var subtracts",
+  );
+  // True reference (and absent ref) passes through unchanged.
+  closeTo(
+    vm.bearingFromFormTrue({ bearing: "137", bearing_ref: "true" }),
+    137,
+    0.001,
+  );
+  closeTo(vm.bearingFromFormTrue({ bearing: "137" }), 137, 0.001);
+  // Magnetic without a usable variation → explicit error (never a
+  // silently unconverted or 0-variation bearing).
+  assert.throws(
+    () => vm.bearingFromFormTrue({ bearing: "90", bearing_ref: "mag" }),
+    /variation required/,
+  );
+  assert.throws(
+    () =>
+      vm.bearingFromFormTrue({
+        bearing: "90",
+        bearing_ref: "mag",
+        variation_deg: "",
+      }),
+    /variation required/,
+  );
+});
+
 test("verticalAngleDistanceNm: height/tan(angle) converted to nm", async () => {
   const vm = await loadVm();
   // 10m height, 1° angle → 10/tan(1°)/1852 = 0.3094 nm
@@ -393,7 +462,7 @@ test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing 
   const vm = await loadVm();
   const body = vm.bearingLopBody({
     object: "lighthouse",
-    bearing_true: 45,
+    bearing: 45,
     object_lat: 60,
     object_lon: 24,
     confirmed_by: "Alice",
@@ -410,7 +479,7 @@ test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing 
   // Sight time flows through as a timestamp (UTC ISO).
   const tsBody = vm.bearingLopBody({
     object: "lighthouse",
-    bearing_true: 45,
+    bearing: 45,
     object_lat: 60,
     object_lon: 24,
     sight_time: "2025-01-01T00:00:00",
@@ -419,6 +488,30 @@ test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing 
   assert.strictEqual(tsBody.timestamp, "2025-01-01T00:00:00.000Z");
   // No sight_time → no timestamp field (server defaults to now).
   assert.ok(!("timestamp" in body));
+  // Magnetic entry is converted to true before shaping: 45°M with
+  // 10°E variation → 55°T → azimuth 145.
+  const magBody = vm.bearingLopBody({
+    object: "lighthouse",
+    bearing: 45,
+    bearing_ref: "mag",
+    variation_deg: "10",
+    variation_hem: "E",
+    object_lat: 60,
+    object_lon: 24,
+  });
+  assert.strictEqual(magBody.azimuth_true, 145);
+  // …and magnetic without variation refuses rather than guessing.
+  assert.throws(
+    () =>
+      vm.bearingLopBody({
+        object: "lighthouse",
+        bearing: 45,
+        bearing_ref: "mag",
+        object_lat: 60,
+        object_lon: 24,
+      }),
+    /variation required/,
+  );
 });
 
 test("verticalAngleCplBody: center + radius from height/angle", async () => {

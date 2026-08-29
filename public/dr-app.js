@@ -447,6 +447,7 @@ class DrApp extends HTMLElement {
       "navigation.gnss.satellites",
       "navigation.gnss.satellitesVisible",
       "navigation.gnss.horizontalDilution",
+      "navigation.magneticVariation",
       "environment.mode",
       "environment.current.setTrue",
       "environment.current.drift",
@@ -741,6 +742,13 @@ class DrApp extends HTMLElement {
         // daylight legibility.
         if (value === "night" || value === "day") {
           document.documentElement.setAttribute("data-mode", value);
+        }
+        break;
+      case "navigation.magneticVariation":
+        // Bus value is radians (east positive); the sight panel wants
+        // east-positive degrees for magnetic bearing entry.
+        if (Number.isFinite(value)) {
+          this.sight?.setMagneticVariation(vm.radToDeg(value));
         }
         break;
       case "environment.current.setTrue":

@@ -54,6 +54,23 @@ template.innerHTML = /* html */ `
     }
     .row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
     .row > label { flex: 1; min-width: 8rem; }
+    /* Bearing reference (true/mag): variation + true-bearing readout
+       only exist in magnetic mode; the ref select stays a stable
+       width so the row doesn't jump when switching. */
+    .bearing-ref label.ref-toggle { flex: 0 0 auto; min-width: 0; }
+    .bearing-ref select[name="bearing_ref"] { min-width: 4.5rem; }
+    .bearing-ref .var-group {
+      display: flex;
+      gap: 0.3rem;
+      align-items: center;
+    }
+    .bearing-ref .var-group input { width: 4rem; }
+    .bearing-ref .var-group select { width: auto; }
+    output[name="bearing_true_out"] {
+      font-family: ui-monospace, "Fira Code", monospace;
+      font-size: 0.95rem;
+      color: var(--text-main);
+    }
     .sight-time { display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap; }
     .sight-time > label { flex: 1; }
     .sight-time .tz-toggle { flex: 0 0 auto; }
@@ -142,9 +159,29 @@ template.innerHTML = /* html */ `
       <label>Object
         <input name="object" placeholder="lighthouse, tower…" />
       </label>
-      <div class="row">
-        <label>Bearing (° true)
-          <input name="bearing_true" type="number" step="0.1" required />
+      <div class="row bearing-ref">
+        <label>Bearing (°)
+          <input name="bearing" type="number" step="0.1" required />
+        </label>
+        <label class="ref-toggle" title="Compass reference of the bearing entry">
+          <select name="bearing_ref">
+            <option value="mag">mag</option>
+            <option value="true">true</option>
+          </select>
+        </label>
+        <label class="ref-mag-only" title="Local magnetic variation — auto-filled from navigation.magneticVariation when the server provides it" hidden>
+          Variation (°)
+          <span class="var-group">
+            <input name="variation_deg" type="number" step="0.1" min="0" placeholder="4.5" inputmode="decimal" />
+            <select name="variation_hem">
+              <option value="E">E</option>
+              <option value="W">W</option>
+            </select>
+          </span>
+        </label>
+        <label class="ref-mag-only" title="The bearing converted to true — what gets submitted" hidden>
+          True
+          <output name="bearing_true_out">—</output>
         </label>
       </div>
       <div class="sight-time">
@@ -329,6 +366,20 @@ class DrSightPanel extends HTMLElement {
     const vForm = root.querySelector("#form-vertical");
     vForm.addEventListener("input", () => this.updateVerticalDistance());
 
+    // Bearing reference (true/mag): switching toggles the variation +
+    // true-bearing fields, and the choice persists to localStorage (a
+    // hand-bearing compass navigator wants it to stick, like the tz).
+    const bForm = root.querySelector("#form-bearing");
+    const refSel = bForm.querySelector('select[name="bearing_ref"]');
+    refSel.value = this.loadBearingRef();
+    refSel.addEventListener("change", () => {
+      this.saveBearingRef(refSel.value);
+      this.applyBearingRef();
+    });
+    this.applyBearingRef();
+    // Live true-bearing readout as the bearing/variation are typed.
+    bForm.addEventListener("input", () => this.updateBearingTrue());
+
     // Timezone toggle: re-express the current sight time in the newly
     // selected zone (local ↔ UTC) so the displayed digits match the
     // selected tz instead of silently reinterpreting them. Persists the
@@ -370,6 +421,19 @@ class DrSightPanel extends HTMLElement {
       )
       .forEach((el) => {
         el.addEventListener("input", () => {
+          el.dataset.dirty = "true";
+        });
+      });
+    // Mark the variation fields dirty on manual edit so a later
+    // navigation.magneticVariation delta doesn't overwrite the user's
+    // local value (e.g. the chart's variation for the sight's area).
+    bForm
+      .querySelectorAll('[name="variation_deg"], [name="variation_hem"]')
+      .forEach((el) => {
+        el.addEventListener("input", () => {
+          el.dataset.dirty = "true";
+        });
+        el.addEventListener("change", () => {
           el.dataset.dirty = "true";
         });
       });
@@ -536,9 +600,107 @@ class DrSightPanel extends HTMLElement {
     }
   }
 
-  /** localStorage key for the remembered sight-timezone choice. */
-  static get SIGHT_TZ_KEY() {
-    return "dr-sight-tz";
+  /** localStorage key for the remembered bearing-reference choice. */
+  static get BEARING_REF_KEY() {
+    return "dr-bearing-ref";
+  }
+
+  /**
+   * Reads the remembered bearing-reference preference from
+   * localStorage. Defaults to "mag" — the hand-bearing compass is the
+   * common instrument for LOP bearings.
+   * @returns {"true"|"mag"}
+   */
+  loadBearingRef() {
+    try {
+      const v = localStorage.getItem(DrSightPanel.BEARING_REF_KEY);
+      return v === "true" ? "true" : "mag";
+    } catch {
+      return "mag";
+    }
+  }
+
+  /**
+   * Persists the bearing-reference preference to localStorage.
+   * @param {"true"|"mag"} ref
+   * @returns {void}
+   */
+  saveBearingRef(ref) {
+    try {
+      localStorage.setItem(DrSightPanel.BEARING_REF_KEY, ref);
+    } catch {
+      /* storage unavailable — keep the session value */
+    }
+  }
+
+  /**
+   * Shows/hides the magnetic-only fields (variation, true-bearing
+   * readout) to match the bearing_ref select's current value.
+   * @returns {void}
+   */
+  applyBearingRef() {
+    const form = this.shadowRoot.querySelector("#form-bearing");
+    const mag =
+      form?.querySelector('select[name="bearing_ref"]')?.value === "mag";
+    form?.querySelectorAll(".ref-mag-only").forEach((el) => {
+      el.hidden = !mag;
+    });
+    this.updateBearingTrue();
+  }
+
+  /**
+   * Live true-bearing readout for magnetic entry — what will be
+   * submitted — updated as the bearing/variation are typed.
+   * @returns {void}
+   */
+  updateBearingTrue() {
+    const form = this.shadowRoot.querySelector("#form-bearing");
+    const out = form?.querySelector('[name="bearing_true_out"]');
+    if (!form || !out) return;
+    const ref = form.querySelector('select[name="bearing_ref"]');
+    if (ref?.value !== "mag") {
+      out.textContent = "—";
+      return;
+    }
+    const bearing = Number(form.querySelector('[name="bearing"]').value);
+    const variation = vm.variationFromForm({
+      variation_deg: form.querySelector('[name="variation_deg"]').value,
+      variation_hem: form.querySelector('[name="variation_hem"]').value,
+    });
+    out.textContent =
+      Number.isFinite(bearing) && Number.isFinite(variation)
+        ? `${String(Math.round(vm.bearingToTrue(bearing, variation))).padStart(3, "0")}° true`
+        : "—";
+  }
+
+  /**
+   * Called by dr-app when a `navigation.magneticVariation` delta
+   * arrives (radians on the bus; the app converts to east-positive
+   * degrees). Seeds the variation fields unless the user edited them.
+   *
+   * @param {number} degEast - variation, east positive / west negative
+   * @returns {void}
+   */
+  setMagneticVariation(degEast) {
+    if (!Number.isFinite(degEast) || Math.abs(degEast) > 180) return;
+    this.magneticVariation = degEast;
+    this.seedVariation();
+  }
+
+  /**
+   * Seeds the variation magnitude + hemisphere from the last stream
+   * value, skipping when the user manually edited the fields.
+   * @returns {void}
+   */
+  seedVariation() {
+    if (this.magneticVariation == null) return;
+    const form = this.shadowRoot?.querySelector("#form-bearing");
+    const input = form?.querySelector('[name="variation_deg"]');
+    if (!input || input.dataset.dirty === "true") return;
+    input.value = String(Math.abs(this.magneticVariation).toFixed(1));
+    const hem = form.querySelector('[name="variation_hem"]');
+    if (hem) hem.value = this.magneticVariation < 0 ? "W" : "E";
+    this.updateBearingTrue();
   }
 
   /**
@@ -693,6 +855,16 @@ class DrSightPanel extends HTMLElement {
       // restore the saved preference so the next sight uses it.
       const tzSel = form.querySelector('select[name="sight_tz"]');
       if (tzSel) tzSel.value = this.loadSightTz();
+      // Same for the bearing reference (reset lands on "mag" — the
+      // default — but the navigator's saved preference wins), plus
+      // re-seed the variation from the stream now that dirty flags
+      // are cleared.
+      const refSel = form.querySelector('select[name="bearing_ref"]');
+      if (refSel) {
+        refSel.value = this.loadBearingRef();
+        this.applyBearingRef();
+      }
+      this.seedVariation();
       this.updateVerticalDistance();
       // Re-seed assumed position now that dirty flags are cleared.
       if (this.lastKnownPosition)
@@ -729,7 +901,15 @@ class DrSightPanel extends HTMLElement {
         );
         return null;
       }
-      const bearing = Number(data.bearing_true);
+      let bearing;
+      try {
+        // Honors a magnetic entry (converted with the form's
+        // variation), same as a fresh bearingLopBody submit.
+        bearing = vm.bearingFromFormTrue(data);
+      } catch {
+        this.showError("variation required for a magnetic bearing");
+        return null;
+      }
       if (!Number.isFinite(bearing)) {
         this.showError("bearing required");
         return null;
@@ -792,9 +972,18 @@ class DrSightPanel extends HTMLElement {
     note.textContent = `Editing ${record.kind === "lop" ? "LOP" : "CPL"} #${this.editing.id} — submit writes the change`;
     if (record.kind === "lop") {
       form.querySelector('[name="object"]').value = record.body_or_object ?? "";
-      form.querySelector('[name="bearing_true"]').value = String(
+      // The stored azimuth is TRUE (magnetic entry was converted at
+      // submit time) — seed the form as a true reference so the value
+      // round-trips unchanged; the navigator can switch to mag for a
+      // corrected re-entry.
+      form.querySelector('[name="bearing"]').value = String(
         (((record.azimuth_true - 90) % 360) + 360) % 360,
       );
+      const refSel = form.querySelector('select[name="bearing_ref"]');
+      if (refSel) {
+        refSel.value = "true";
+        this.applyBearingRef();
+      }
       const fs = form.querySelector('fieldset.coord[data-prefix="object"]');
       seedCoord(fs, "lat", record.assumed_lat, true);
       seedCoord(fs, "lon", record.assumed_lon, true);

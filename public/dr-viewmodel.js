@@ -982,6 +982,46 @@ export function bearingToTrue(bearingMag, variationDeg) {
 }
 
 /**
+ * Signed variation (east positive, west negative) from the bearing
+ * form's magnitude + hemisphere select ("E"/"W"). Blank or non-numeric
+ * magnitude → NaN so callers can require it for magnetic entry.
+ *
+ * @param {object} form - { variation_deg?, variation_hem? }
+ * @returns {number} east-positive degrees, or NaN when absent/invalid
+ */
+export function variationFromForm(form) {
+  const raw = form?.variation_deg;
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return Number.NaN;
+  }
+  const mag = Number(raw);
+  if (!Number.isFinite(mag)) return Number.NaN;
+  return mag * (form.variation_hem === "W" ? -1 : 1);
+}
+
+/**
+ * Resolves a bearing-form entry to degrees true. When `bearing_ref` is
+ * "mag" (hand-bearing/compass), converts via `bearingToTrue` using the
+ * form's variation (east positive); any other value (or absence) means
+ * the entry is already true.
+ *
+ * @param {object} form - { bearing, bearing_ref?, variation_deg?, variation_hem? }
+ * @returns {number} 0..360
+ * @throws {Error} magnetic reference without a usable variation
+ */
+export function bearingFromFormTrue(form) {
+  const bearing = Number(form?.bearing);
+  if (form?.bearing_ref === "mag") {
+    const variation = variationFromForm(form);
+    if (!Number.isFinite(bearing) || !Number.isFinite(variation)) {
+      throw new Error("variation required for a magnetic bearing");
+    }
+    return bearingToTrue(bearing, variation);
+  }
+  return bearing;
+}
+
+/**
  * Distance to an object of known height from a vertical angle, in
  * nautical miles. Standard formula: distance = height / tan(angle),
  * with height in meters converted to nm (1 nm = 1852 m).
@@ -1000,17 +1040,21 @@ export function verticalAngleDistanceNm(heightM, angleDeg) {
  * Shape a compass-bearing form into a `POST /fix/lop` body. The
  * navigator takes a bearing to a charted object whose position is
  * known; the LOP is the line from the object at the reciprocal bearing
- * (you are somewhere on it). The engine's LOP convention is "a line
- * through `assumed` perpendicular to `azimuth`", so to make the line
- * run *along* the bearing we feed the object position as the assumed
- * point and rotate the azimuth +90° (the line's normal points
- * across-track). Intercept is 0 — the line passes through the object.
+ * (you are somewhere on it). The bearing may be entered true, or
+ * magnetic (`bearing_ref: "mag"`) — converted to true with the form's
+ * variation (east positive), per `bearingFromFormTrue`. The engine's
+ * LOP convention is "a line through `assumed` perpendicular to
+ * `azimuth`", so to make the line run *along* the bearing we feed the
+ * object position as the assumed point and rotate the azimuth +90°
+ * (the line's normal points across-track). Intercept is 0 — the line
+ * passes through the object.
  *
- * @param {object} form - { object, bearing_true, object_lat, object_lon, sight_time, confirmed_by? }
+ * @param {object} form - { object, bearing, bearing_ref?, variation_deg?,
+ *   variation_hem?, object_lat, object_lon, sight_time?, sight_tz?, confirmed_by? }
  * @returns {object}
  */
 export function bearingLopBody(form) {
-  const bearing = Number(form.bearing_true);
+  const bearing = bearingFromFormTrue(form);
   const body = {
     lop_type: "bearing",
     assumed_lat: Number(form.object_lat),

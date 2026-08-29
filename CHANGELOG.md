@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Magnetic bearing entry** (work doc #9's deferred magnetic input) —
+  the sight panel's bearing form now takes a compass reference
+  (`mag`/`true`, defaulting to `mag`, the hand-bearing-compass case,
+  remembered per browser). In magnetic mode the form shows a variation
+  field (magnitude + E/W hemisphere) auto-filled from the server's
+  `navigation.magneticVariation` (radians on the bus, converted to
+  east-positive degrees; a manual entry is never overwritten by the
+  stream) and a live true-bearing readout of what will be submitted.
+  Conversion (True = Magnetic + Variation, east positive) happens at
+  entry — the stored LOP stays degrees true. A magnetic bearing
+  without a usable variation is refused with a clear error instead of
+  silently guessing. Editing a persisted LOP seeds the form as true
+  (that's what's stored); the reference can be flipped for corrected
+  re-entry.
+
 ## [0.5.0] - 2026-08-28
 
 ### Added

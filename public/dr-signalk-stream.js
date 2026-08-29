@@ -27,6 +27,7 @@ class DrSignalkStream {
       "navigation.deadReckoning.active",
       "navigation.deadReckoning.log",
       "navigation.position",
+      "navigation.magneticVariation",
     ];
     /**
      * AIS target path set (work doc #23), subscribed on the SAME socket
