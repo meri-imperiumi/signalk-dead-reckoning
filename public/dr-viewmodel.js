@@ -600,6 +600,91 @@ export function chartAssetsFromManifest(value) {
 }
 
 /**
+ * First POINT feature among a `queryRenderedFeatures` result — the
+ * actual object under the cursor (light, beacon, buoy, named peak,
+ * cape, landmark, place point). Only symbol layers render labels, so
+ * non-symbol layers are skipped; and only Point/MultiPoint geometry
+ * counts, because the mirrored Open Waters style renders area names
+ * like "Marae Moana" (a 100 NM nature reserve) as a `symbol` layer over
+ * a Polygon — a symbol hit is not enough on its own. Area/line labels
+ * are not things you take a bearing to.
+ *
+ * @param {Array<object>|null|undefined} hits
+ * @returns {object|null} the first point symbol feature, or null
+ */
+export function firstPointSymbolHit(hits) {
+  if (!Array.isArray(hits)) return null;
+  for (const f of hits) {
+    if (f?.layer?.type !== "symbol") continue;
+    const geom = f.geometry?.type ?? "";
+    if (geom === "Point" || geom === "MultiPoint") return f;
+  }
+  return null;
+}
+
+/**
+ * A point symbol feature's charted identifier — its `name` (a named
+ * peak, cape, landmark) or, falling back, its `light` characteristic
+ * (e.g. `Fl.G.3s`), which is how the Open Waters `lights-label` layer
+ * renders lights that carry no `name`. Returns null for an unnamed
+ * point so the sight form leaves the object field for the user to type.
+ *
+ * @param {object|null|undefined} feature - a `queryRenderedFeatures` point hit
+ * @returns {string|null}
+ */
+export function pointSymbolName(feature) {
+  if (!feature) return null;
+  const props = feature.properties ?? {};
+  const name = typeof props.name === "string" ? props.name.trim() : "";
+  if (name) return name;
+  const light = typeof props.light === "string" ? props.light.trim() : "";
+  return light || null;
+}
+
+/**
+ * Picks the charted name to attribute a pick/bearing to, from the
+ * features a MapLibre `queryRenderedFeatures` box returned. Only symbol
+ * layers render names, so non-symbol layers are skipped.
+ *
+ * Bearings and vertical-sextant distances are taken to POINT objects —
+ * a light, beacon, named peak, landmark, place point — never to an area
+ * or line label (see `firstPointSymbolHit` for why geometry, not render
+ * order, decides). Getting the name right is a convenience, so it is
+ * only filled for objects we recognize — a point feature that carries a
+ * charted `name` (a named peak, cape, landmark) or a `light`
+ * characteristic. An unnamed point (a light with neither) stays null and
+ * the sight form leaves the object field for the user to type — better
+ * an honest blank than a guessed name.
+ *
+ * A light's charted identifier is its `light` characteristic (e.g.
+ * `Fl.G.3s`), not its `name`: most lights carry an empty `name`, and the
+ * Open Waters `lights-label` layer renders `light` (adding `name` only
+ * at close zoom when present). So for point features `name` is tried
+ * first and `light` falls back, matching what the chart actually shows.
+ *
+ * @param {Array<object>|null|undefined} hits - `map.queryRenderedFeatures` result
+ * @returns {string|null} resolved name/characteristic, or null when no named point is hit
+ */
+export function pickSymbolNameFromHits(hits) {
+  return pointSymbolName(firstPointSymbolHit(hits));
+}
+
+/**
+ * Whether the cursor is over a bearing-able chart object — any point
+ * symbol hit (light, beacon, buoy, named peak, cape, landmark, place
+ * point), named or not. Drives the crosshair hover cursor: an unnamed
+ * buoy is still something you can see and take a bearing to, so the
+ * cursor signals it even though `pickSymbolNameFromHits` leaves the
+ * sight form's object field blank for the user to type.
+ *
+ * @param {Array<object>|null|undefined} hits - `map.queryRenderedFeatures` result
+ * @returns {boolean}
+ */
+export function isBearingablePointHit(hits) {
+  return firstPointSymbolHit(hits) != null;
+}
+
+/**
  * Marine-tactical palette for the generated vector style: dark sea
  * background to match the app theme, land/depth families keyed by the
  * source-layer names chart producers actually use (S-57 ENC layer ids

@@ -218,6 +218,32 @@ class DrMapView extends HTMLElement {
     this.map.on("contextmenu", (e) =>
       this.showPickMenu(e.latlng, e.containerPoint),
     );
+    // Hover cursor: over a charted point object you can take a bearing
+    // to (light, beacon, buoy, named peak, cape, landmark), the cursor
+    // becomes a crosshair signalling "right-click to take a bearing
+    // here". Only the mirrored vector chart exposes queryable features;
+    // raster/OSM fallbacks keep Leaflet's grab cursor. Throttled to one
+    // query per animation frame — `queryRenderedFeatures` is synchronous
+    // and mousemove fires many times per second.
+    this.map.on("mousemove", (e) => {
+      this._hoverPoint = e.containerPoint;
+      if (this._hoverRaf) return;
+      this._hoverRaf = requestAnimationFrame(() => {
+        this._hoverRaf = null;
+        const pt = this._hoverPoint;
+        this._hoverPoint = null;
+        this.mapEl.style.cursor =
+          pt && this.isBearingableAt(pt) ? "crosshair" : "";
+      });
+    });
+    this.map.on("mouseout", () => {
+      if (this._hoverRaf) {
+        cancelAnimationFrame(this._hoverRaf);
+        this._hoverRaf = null;
+      }
+      this._hoverPoint = null;
+      this.mapEl.style.cursor = "";
+    });
     // Shadow DOM layout settles asynchronously after connectedCallback;
     // force Leaflet to recompute the container size on every resize or
     // tiles render jumbled and markers land off-screen.
@@ -354,43 +380,93 @@ class DrMapView extends HTMLElement {
   }
 
   /**
-   * Resolves the charted name of the symbol nearest a Leaflet container
-   * point — lights, seamarks, peaks, place labels rendered by the
-   * mirrored chart style (the composed fallback has no symbols).
-   * Bearings are taken to identified objects, so the pick menu and the
-   * sight form carry the name whenever one is hit. Small catchment box:
-   * an exact point query misses thin icons at high DPI.
+   * Queries the mirrored vector chart for rendered features near a
+   * Leaflet container point. `radius` 0 is an exact pixel query
+   * (`[x, y]`); larger is a `[[x1,y1],[x2,y2]]` box of ±radius px so a
+   * click "on" a thin light icon that isn't pixel-perfect still hits it.
+   * Returns null when the mirror/MapLibre isn't mounted.
+   *
+   * The geometry MUST be an array: MapLibre's `queryRenderedFeatures`
+   * treats any argument that is neither a Point instance nor an Array
+   * (e.g. a plain `{left, top, right, bottom}`) as "no geometry" and
+   * silently falls back to the WHOLE viewport — which is how a pick used
+   * to resolve to the first point feature anywhere on screen, 1 NM (or,
+   * before the Point-geometry filter, 100 NM via a sea-area label) from
+   * the click. The bridge pads the GL canvas around the Leaflet viewport
+   * by `options.padding` (default 0.1) on each side, so Leaflet container
+   * coords are translated into GL canvas coords first.
    *
    * @param {L.Point|null|undefined} containerPoint
-   * @returns {string|null} symbol name, or null when nothing named is hit
+   * @param {number} [radius=10]
+   * @returns {Array<object>|null} `map.queryRenderedFeatures` result, or null
    */
-  pickSymbolName(containerPoint) {
+  _queryChartHits(containerPoint, radius = 10) {
     const mirror = this.tileLayers.__chart_mirror__;
     const gl = mirror?.getMaplibreMap?.();
     if (!gl || !containerPoint) return null;
     try {
-      // The bridge pads the GL canvas around the Leaflet viewport by
-      // `options.padding` (default 0.1) of the map size on each side —
-      // translate Leaflet container coords into GL canvas coords.
       const size = this.map.getSize();
       const pad = mirror.options?.padding ?? 0.1;
       const x = containerPoint.x + size.x * pad;
       const y = containerPoint.y + size.y * pad;
-      const hits = gl.queryRenderedFeatures({
-        left: x - 5,
-        top: y - 5,
-        right: x + 5,
-        bottom: y + 5,
-      });
-      for (const f of hits) {
-        if (f.layer?.type !== "symbol") continue;
-        const name = f.properties?.name;
-        if (typeof name === "string" && name.length > 0) return name;
-      }
-      return null;
+      if (radius <= 0) return gl.queryRenderedFeatures([x, y]);
+      const r = radius;
+      return gl.queryRenderedFeatures([
+        [x - r, y - r],
+        [x + r, y + r],
+      ]);
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Finds the point chart object nearest the cursor — light, beacon,
+   * buoy, named peak, cape, landmark. Grows the catchment from the exact
+   * pixel outward (0 → 5 → 10 px) so the first hit is the closest charted
+   * object, not a neighbour inside the box that merely renders earlier.
+   * Returns the feature (for `vm.pointSymbolName`) or null.
+   *
+   * @param {L.Point|null|undefined} containerPoint
+   * @returns {object|null}
+   */
+  _pickClosestPointSymbol(containerPoint) {
+    for (const r of [0, 5, 10]) {
+      const f = vm.firstPointSymbolHit(this._queryChartHits(containerPoint, r));
+      if (f) return f;
+    }
+    return null;
+  }
+
+  /**
+   * Resolves the charted name of the symbol nearest a Leaflet container
+   * point — lights, seamarks, named peaks, capes, landmarks, place
+   * points rendered by the mirrored chart style (the composed fallback
+   * has no symbols). Bearings are taken to identified objects, so the
+   * pick menu and sight form carry the name whenever one is hit; an
+   * unnamed point leaves the field for the user to type. Selection goes
+   * through `_pickClosestPointSymbol` so a point symbol under the cursor
+   * wins over an area label (e.g. a light inside a 100 NM nature reserve
+   * resolves to the light, not the reserve).
+   *
+   * @param {L.Point|null|undefined} containerPoint
+   * @returns {string|null} symbol name/characteristic, or null when nothing named is hit
+   */
+  pickSymbolName(containerPoint) {
+    return vm.pointSymbolName(this._pickClosestPointSymbol(containerPoint));
+  }
+
+  /**
+   * Whether a Leaflet container point is over a bearing-able chart
+   * object (any point symbol — light, beacon, buoy, named peak, cape,
+   * landmark — named or not). Drives the crosshair hover cursor; uses a
+   * single ±10 px box query (one per animation frame on mousemove).
+   *
+   * @param {L.Point|null|undefined} containerPoint
+   * @returns {boolean}
+   */
+  isBearingableAt(containerPoint) {
+    return vm.isBearingablePointHit(this._queryChartHits(containerPoint, 10));
   }
 
   /**
