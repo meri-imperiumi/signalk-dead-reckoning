@@ -572,17 +572,23 @@ class DrSightPanel extends HTMLElement {
    * → "Add bearing to here" / "Distance CPL at here"). Switches to the
    * matching tab and fills the object/center coordinates (overwriting any
    * prior value — a fresh pick is intentional), plus the object *name*
-   * when the pick resolved a charted symbol (light, seamark, peak…):
-   * bearings are taken to identified objects, not bare coordinates.
+   * when the pick resolved a charted symbol (light, seamark, peak…) or an
+   * AIS target (work doc #23): bearings are taken to identified objects,
+   * not bare coordinates. `tMs` (the pick instant) pre-fills the sight
+   * time — for an AIS target the seeded position is its *predicted*
+   * position valid at exactly that instant, so position and timestamp
+   * stay consistent. Marked dirty so the tz toggle converts it in place
+   * instead of re-seeding to "now".
    * Used by dr-app when the map dispatches `dr-pick-position`.
    *
    * @param {number} lat
    * @param {number} lon
    * @param {"bearing"|"vertical"} mode
-   * @param {string} [label] - charted name of the picked object, if any
+   * @param {string} [label] - charted name / AIS target name, if any
+   * @param {number} [tMs] - pick instant the position is valid for
    * @returns {void}
    */
-  seedObjectPosition(lat, lon, mode, label) {
+  seedObjectPosition(lat, lon, mode, label, tMs = null) {
     const prefix = mode === "vertical" ? "center" : "object";
     const tab = mode === "vertical" ? "vertical" : "bearing";
     this.switchTab(tab);
@@ -593,6 +599,16 @@ class DrSightPanel extends HTMLElement {
     if (typeof label === "string" && label.length > 0) {
       const nameInput = form?.querySelector('input[name="object"]');
       if (nameInput) nameInput.value = label;
+    }
+    if (Number.isFinite(tMs)) {
+      const input = form?.querySelector('input[name="sight_time"]');
+      if (input) {
+        input.value = vm.isoToSightTimeInput(
+          new Date(tMs).toISOString(),
+          this.loadSightTz(),
+        );
+        input.dataset.dirty = "true";
+      }
     }
     if (!fs) return;
     // Force-fill (a chart pick overwrites, no dirty check).

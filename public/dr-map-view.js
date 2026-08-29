@@ -17,6 +17,12 @@
  * through MapLibre GL, vendored at ./vendor/maplibre-gl/ and mounted
  * as one Leaflet layer via the official bridge (work doc #20).
  *
+ * AIS targets (work doc #23) render in their own layer group from
+ * specs pushed by dr-app (`renderAis`, outside the snapshot path —
+ * targets tick independently of DR ticks). Right-clicking a target
+ * seeds the sight form from its predicted position, with the sight
+ * time anchored to the prediction instant.
+ *
  * @file dr-map-view.js
  */
 
@@ -114,6 +120,17 @@ class DrMapView extends HTMLElement {
         box-shadow: none !important;
         font: 11px ui-monospace, "Fira Code", monospace !important;
       }
+      /* AIS target glyphs (work doc #23): a rotated arrow on a bare
+         divIcon (Leaflet's default .leaflet-div-icon white box is
+         replaced by className); the inner glyph's rotation eases
+         between renders — the mark turns with the target. */
+      .dr-ais-marker {
+        background: transparent;
+        border: none;
+      }
+      .dr-ais-glyph {
+        transition: transform 0.5s linear;
+      }
     `;
     root.appendChild(style);
     // Leaflet's CSS must live INSIDE the shadow root — a document-level
@@ -172,9 +189,20 @@ class DrMapView extends HTMLElement {
       drMarker: null,
       candidate: null,
       advancements: null,
+      ais: null,
     };
     this.tileLayers = {};
     this.follow = true;
+    /**
+     * Rendered AIS entries by target context (work doc #23) — markers
+     * are reused across renderAis calls (position/style updates in
+     * place) so ~1 Hz re-renders don't churn DOM and flicker tooltips.
+     * @type {Map<string, {spec: object, marker: object, leader: object|null}>}
+     */
+    this._aisRendered = new Map();
+    /** Instant the rendered AIS predictions are valid for — a pick
+     * from a target dispatches it as the sight-time anchor. */
+    this._aisRenderNowMs = null;
   }
 
   connectedCallback() {
@@ -215,9 +243,20 @@ class DrMapView extends HTMLElement {
     // Chart pick: right-click / long-press opens a small context menu
     // to pre-seed a sight form with the picked object position (and the
     // object's charted name, when a symbol was hit — see pickSymbolName).
-    this.map.on("contextmenu", (e) =>
-      this.showPickMenu(e.latlng, e.containerPoint),
-    );
+    // An AIS target under the cursor (work doc #23) wins over the chart:
+    // its *predicted* position seeds the bearing, with the sight time
+    // anchored to the prediction instant.
+    this.map.on("contextmenu", (e) => {
+      const target = this._aisTargetAt(e.containerPoint);
+      if (target) {
+        this.showPickMenu(target.position, e.containerPoint, {
+          label: target.label,
+          tMs: this._aisRenderNowMs ?? Date.now(),
+        });
+        return;
+      }
+      this.showPickMenu(e.latlng, e.containerPoint);
+    });
     // Hover cursor: over a charted point object you can take a bearing
     // to (light, beacon, buoy, named peak, cape, landmark), the cursor
     // becomes a crosshair signalling "right-click to take a bearing
@@ -233,7 +272,9 @@ class DrMapView extends HTMLElement {
         const pt = this._hoverPoint;
         this._hoverPoint = null;
         this.mapEl.style.cursor =
-          pt && this.isBearingableAt(pt) ? "crosshair" : "";
+          pt && (this.isBearingableAt(pt) || this._aisTargetAt(pt) != null)
+            ? "crosshair"
+            : "";
       });
     });
     this.map.on("mouseout", () => {
@@ -331,9 +372,16 @@ class DrMapView extends HTMLElement {
           this.tileLayers[charts[0].identifier] ??
           ordered[0];
         first?.addTo(this.map);
-        if (Object.keys(bases).length > 1 || configured.length === 0) {
-          L.control.layers(bases, {}, { collapsed: true }).addTo(this.map);
-        }
+        // Always mounted (even single-chart installs): the AIS traffic
+        // overlay (work doc #23) needs its checkbox so the chart can be
+        // de-cluttered.
+        L.control
+          .layers(
+            bases,
+            { "AIS traffic": this.layers.ais },
+            { collapsed: true },
+          )
+          .addTo(this.map);
       })
       .catch((e) => {
         // Offline stays tile-less by design, but a chart that fails to
@@ -470,19 +518,53 @@ class DrMapView extends HTMLElement {
   }
 
   /**
+   * Finds the rendered AIS target nearest a Leaflet container point
+   * (work doc #23), within a finger-friendly catchment — targets are
+   * picked by proximity to the rendered glyph, not by DOM hit-testing,
+   * so it works identically for touch long-presses. Returns the target's
+   * render spec (whose `position` is the predicted position the pick
+   * will seed) or null.
+   *
+   * @param {L.Point|null|undefined} containerPoint
+   * @returns {object|null}
+   */
+  _aisTargetAt(containerPoint) {
+    if (!this.map || !containerPoint || this._aisRendered.size === 0) {
+      return null;
+    }
+    let best = null;
+    let bestD = 16;
+    for (const entry of this._aisRendered.values()) {
+      const p = this.map.latLngToContainerPoint(entry.spec.position);
+      const d = p.distanceTo(containerPoint);
+      if (d < bestD) {
+        bestD = d;
+        best = entry.spec;
+      }
+    }
+    return best;
+  }
+
+  /**
    * Shows a small context menu at a chart point offering to pre-seed a
    * sight form with that position as the object. Dispatches
-   * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode, label }`
-   * — `label` carries the picked symbol's charted name, when one was hit.
+   * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode,
+   * label, tMs }` — `label` carries the picked symbol's charted name
+   * (or an AIS target's name, work doc #23), `tMs` the pick instant the
+   * position is valid for (an AIS target's predicted position is
+   * anchored to it).
    *
-   * @param {L.LatLng} latlng
+   * @param {L.LatLng|[number, number]} latlng
    * @param {L.Point|null|undefined} [containerPoint]
+   * @param {{label?: string|null, tMs?: number}|null} [preset] - AIS
+   *   picks resolve label/time here instead of the chart query
    * @returns {void}
    */
-  showPickMenu(latlng, containerPoint) {
+  showPickMenu(latlng, containerPoint, preset = null) {
     // Remove any prior menu.
     this.hidePickMenu();
-    const label = this.pickSymbolName(containerPoint);
+    const label = preset?.label ?? this.pickSymbolName(containerPoint);
+    const tMs = Number.isFinite(preset?.tMs) ? preset.tMs : Date.now();
     const menu = document.createElement("div");
     menu.className = "dr-pick-menu";
     const what = label ?? "this point";
@@ -501,9 +583,10 @@ class DrMapView extends HTMLElement {
             bubbles: true,
             composed: true,
             detail: {
-              lat: latlng.lat,
-              lng: latlng.lng,
+              lat: Array.isArray(latlng) ? latlng[0] : latlng.lat,
+              lng: Array.isArray(latlng) ? latlng[1] : latlng.lng,
               mode: it.mode,
+              tMs,
               ...(label ? { label } : {}),
             },
           }),
@@ -859,6 +942,114 @@ class DrMapView extends HTMLElement {
           { direction: "top" },
         )
         .addTo(this.layers.snaps);
+    }
+  }
+
+  /**
+   * Builds the divIcon for an AIS target glyph (work doc #23): a bare
+   * rotated arrow (className drops Leaflet's default white box), sized
+   * for a finger-ish target without covering the chart. Expiring marks
+   * drop opacity — the plotter's "data decaying" cue.
+   *
+   * @param {object} spec - aisMarkerSpec result
+   * @returns {object} Leaflet divIcon
+   */
+  _aisIcon(spec) {
+    const rot =
+      spec.rotationDeg != null
+        ? `transform:rotate(${Math.round(spec.rotationDeg)}deg);`
+        : "";
+    const opacity = spec.expiring ? "opacity:0.55;" : "";
+    return L.divIcon({
+      className: "dr-ais-marker",
+      iconSize: [16, 16],
+      iconAnchor: [8, 8],
+      html: `<div class="dr-ais-glyph" style="${rot}${opacity}"><svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M8 1.5 L13.5 13.5 L8 10.8 L2.5 13.5 Z" fill="${spec.color}" stroke="${spec.color}" stroke-width="0.6"/></svg></div>`,
+    });
+  }
+
+  /**
+   * Renders the AIS target set (work doc #23). Dr-app pushes specs built
+   * by `aisTargetsForRender` — outside `render(snap)`, since targets tick
+   * independently of the DR snapshot. Markers are REUSED across calls
+   * (position/rotation/leader update in place) so ~1 Hz refreshes don't
+   * churn DOM or flicker tooltips. Targets absent from `specs` (aged
+   * out, range-filtered) are removed.
+   *
+   * @param {Array<object>} specs - aisMarkerSpec results
+   * @param {number} nowMs - instant the predicted positions are valid
+   *   for; a right-click pick dispatches it as the sight-time anchor
+   * @returns {void}
+   */
+  renderAis(specs, nowMs) {
+    if (!this.map) return;
+    this._aisRenderNowMs = nowMs;
+    const incoming = new Map(specs.map((s) => [s.context, s]));
+    for (const [ctx, entry] of this._aisRendered) {
+      if (incoming.has(ctx)) continue;
+      this.layers.ais?.removeLayer(entry.marker);
+      if (entry.leader) this.layers.ais?.removeLayer(entry.leader);
+      this._aisRendered.delete(ctx);
+    }
+    for (const spec of incoming.values()) {
+      let entry = this._aisRendered.get(spec.context);
+      if (!entry) {
+        const icon = this._aisIcon(spec);
+        icon._drAis = {
+          rotationDeg: spec.rotationDeg,
+          color: spec.color,
+          expiring: spec.expiring,
+        };
+        const marker = L.marker(spec.position, { icon })
+          .bindTooltip(spec.tooltip, { direction: "top" })
+          .addTo(this.layers.ais);
+        entry = { spec, marker, leader: null };
+        this._aisRendered.set(spec.context, entry);
+      } else {
+        entry.spec = spec;
+        entry.marker.setLatLng(spec.position);
+        // Icon rebuild only when something visible changed — setIcon
+        // recreates the DOM node, so skip it when only position moved.
+        const prev = entry.marker.options?.icon ?? null;
+        const changed =
+          !prev ||
+          prev._drAis?.rotationDeg !== spec.rotationDeg ||
+          prev._drAis?.color !== spec.color ||
+          prev._drAis?.expiring !== spec.expiring;
+        if (changed) {
+          const icon = this._aisIcon(spec);
+          icon._drAis = {
+            rotationDeg: spec.rotationDeg,
+            color: spec.color,
+            expiring: spec.expiring,
+          };
+          entry.marker.setIcon(icon);
+        }
+        entry.marker.setTooltipContent?.(spec.tooltip);
+      }
+      // Velocity leader: 6-minute run from the predicted position;
+      // drops when the target expires (nothing trustworthy to project).
+      if (spec.leader) {
+        const pts = [spec.leader.from, spec.leader.to];
+        if (entry.leader) {
+          entry.leader.setLatLngs(pts);
+          entry.leader.setStyle({
+            color: spec.color,
+            opacity: spec.expiring ? 0.4 : 0.8,
+          });
+        } else {
+          entry.leader = L.polyline(pts, {
+            color: spec.color,
+            weight: 1,
+            opacity: spec.expiring ? 0.4 : 0.8,
+            dashArray: "2 4",
+            interactive: false,
+          }).addTo(this.layers.ais);
+        }
+      } else if (entry.leader) {
+        this.layers.ais?.removeLayer(entry.leader);
+        entry.leader = null;
+      }
     }
   }
 

@@ -199,3 +199,35 @@ test("shadow context UUID persists across restarts", async () => {
 
   assert.equal(ctx1, ctx2, "shadow context UUID reused across restart");
 });
+
+test("GET /status reports the shadow context so the webapp can filter its AIS layer (doc #23)", async () => {
+  const { app, plugin } = makeStartedWithShadow();
+  feed(app, [
+    { path: "navigation.position", value: { latitude: 1, longitude: 1 } },
+    { path: "navigation.speedThroughWater", value: 1 },
+    { path: "navigation.headingTrue", value: 0 },
+  ]);
+  await new Promise((r) => setTimeout(r, 1100));
+  const ctx = shadowDeltas(app)[0].message.context;
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { status, body } = router.invoke("get", "/status");
+  assert.equal(status, 200);
+  assert.equal(
+    body.shadowVesselContext,
+    ctx,
+    "status context must equal the emitted shadow context",
+  );
+  plugin.stop();
+
+  // Shadow disabled → null: nothing for the webapp to filter.
+  const plain = new FakeSignalKApp();
+  plain.dataPath = tempDir;
+  const plainPlugin = makePlugin(plain);
+  plainPlugin.start({});
+  const plainRouter = new FakeRouter();
+  plainPlugin.registerWithRouter(plainRouter);
+  const { body: plainBody } = plainRouter.invoke("get", "/status");
+  assert.equal(plainBody.shadowVesselContext, null);
+  plainPlugin.stop();
+});

@@ -427,6 +427,15 @@ module.exports = (app) => {
   let shadow = null;
 
   /**
+   * The shadow vessel's stable `vessels.<uuid>` context (work doc #21),
+   * when the shadow is enabled — mirrored into GET /status so the DR
+   * webapp's AIS layer can filter it out (it already draws the DR marker
+   * itself; rendering the shadow again as "traffic" would double-draw).
+   * @type {string|null}
+   */
+  let shadowContext = null;
+
+  /**
    * Manual set-and-drift override (§6.2 tier 1): watchstander input,
    * honored while its TTL lasts. Set/cleared via
    * PUT/DELETE /current/manual.
@@ -756,6 +765,7 @@ module.exports = (app) => {
           shadowCtx = `vessels.urn:mrn:signalk:uuid:${crypto.randomUUID()}`;
           deps.setState(db, "shadow_vessel_context", shadowCtx);
         }
+        shadowContext = shadowCtx;
         shadow = deps.createShadowVesselPublisher({
           app,
           context: shadowCtx,
@@ -878,6 +888,7 @@ module.exports = (app) => {
       statusTileExamplesTeardown = null;
       shadow?.stop();
       shadow = null;
+      shadowContext = null;
       // Hygiene: clear a live advisory so it doesn't linger after the
       // plugin stops monitoring.
       if (divergence?.active) {
@@ -2016,6 +2027,10 @@ module.exports = (app) => {
         // the UI's header readout can bootstrap without a delta.
         current: lastCurrent,
         manualCurrent,
+        // Work doc #23: the shadow vessel's context, when enabled, so
+        // the DR webapp can filter it from its AIS target layer (the
+        // webapp already renders the DR position as its own marker).
+        shadowVesselContext: shadowContext,
       });
     });
 

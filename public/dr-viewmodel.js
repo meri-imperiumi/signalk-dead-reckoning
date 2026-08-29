@@ -27,6 +27,15 @@ export const STYLE = {
   gpsTrack: "#6b9e78",
   drMarker: "#ffffff",
   snapVector: "#888899",
+  // AIS targets (work doc #23): violet for ordinary traffic (distinct
+  // from every family above — plotters draw AIS in its own hue too),
+  // green for buddies (Freeboard-SK's ais_buddy convention). Targets
+  // past the expiring threshold keep ONE shared grey (the inactive
+  // family) — the plotter convention: active target color → expiring
+  // color → gone.
+  ais: "#c77bd9",
+  aisBuddy: "#6b9e78",
+  aisExpiring: "#888899",
   fix: {
     gps: "#6b9e78",
     celestial: "#c77b28",
@@ -1317,4 +1326,432 @@ export function pointFixBody(form) {
     body.estimated_error_nm = err;
   }
   return body;
+}
+
+// ---------------------------------------------------------------------------
+// AIS targets on the chart (work doc #23)
+// Pure delta→store reducer, staleness/range shaping, and marker specs so
+// the map adapter stays thin and everything here is unit-testable.
+// Targets keep Signal K SI units (rad, m/s) as received; conversions
+// happen at spec time. Coordinate convention: [lat, lon] like the rest
+// of the module.
+// ---------------------------------------------------------------------------
+
+/**
+ * Position report older than this starts the target EXPIRING: the mark
+ * greys out, the velocity leader drops, the tooltip says how old the
+ * report is — the plotter-standard warning that the data is decaying
+ * (Freeboard-SK's 3-minute `ais_inactive` convention; one missed Class A
+ * report at anchor).
+ */
+export const AIS_EXPIRING_MS = 3 * 60_000;
+
+/**
+ * Position report older than this drops the target from the map AND
+ * evicts it from the store ("aged out", work doc #23): a target silent
+ * for 20 minutes — several Class B report intervals — is no longer
+ * navigational data, only a guess, and a long-running chart in busy
+ * waters would otherwise keep every context it ever heard forever.
+ */
+export const AIS_DROP_MS = 20 * 60_000;
+
+/**
+ * Default range filter around own position (nm): markers beyond it are
+ * clutter, not situational awareness, and the bearing you'd take to a
+ * hull-down target 40 nm away isn't one you can hold against your compass.
+ */
+export const AIS_RANGE_NM = 24;
+
+/** Velocity-leader length (minutes) — the plotter-standard 6-minute run. */
+export const AIS_LEADER_MIN = 6;
+
+/** Extrapolation horizon: predictions freeze at the expiring threshold. */
+export const AIS_PREDICT_HORIZON_MS = AIS_EXPIRING_MS;
+
+/**
+ * Great-circle distance between two [lat, lon] points, in nautical miles
+ * (haversine; the ranges here are tens of nm so a spherical earth is far
+ * beyond the precision of an AIS report).
+ *
+ * @param {[number, number]} from
+ * @param {[number, number]} to
+ * @returns {number}
+ */
+export function distanceNm(from, to) {
+  const φ1 = from[0] * RAD;
+  const φ2 = to[0] * RAD;
+  const dφ = φ2 - φ1;
+  const dλ = (to[1] - from[1]) * RAD;
+  const a =
+    Math.sin(dφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(dλ / 2) ** 2;
+  return 2 * EARTH_RADIUS_NM * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+/**
+ * Folds one `vessels.*` delta into the target store (work doc #23).
+ * The store is a Map keyed by context, mutated in place (the TrackLog
+ * pattern — the caller owns the Map, the reducer owns its shape).
+ * Only position reports refresh `tMs`; name/mmsi/buddy ride along on
+ * any update. Values keep their SI wire units.
+ *
+ * @param {Map<string, object>} store
+ * @param {object} delta - Signal K delta with `context` + `updates`
+ * @param {number} [nowMs=Date.now()] receipt time
+ * @returns {Map<string, object>} the same store (deltas without a
+ *   usable context or updates are ignored)
+ */
+export function applyAisDelta(store, delta, nowMs = Date.now()) {
+  const ctx = delta?.context;
+  if (typeof ctx !== "string" || ctx.length === 0) return store;
+  const updates = delta?.updates;
+  if (!Array.isArray(updates)) return store;
+  let t = store.get(ctx);
+  const touch = () => {
+    if (!t) {
+      t = {
+        context: ctx,
+        name: null,
+        mmsi: null,
+        buddy: false,
+        lat: null,
+        lon: null,
+        tMs: null,
+        cogRad: null,
+        sogMs: null,
+        headingRad: null,
+        receivedMs: nowMs,
+      };
+      store.set(ctx, t);
+    }
+    t.receivedMs = nowMs;
+    return t;
+  };
+  for (const update of updates) {
+    if (!Array.isArray(update?.values)) continue;
+    const updateMs = Number.isFinite(Date.parse(update.timestamp ?? ""))
+      ? Date.parse(update.timestamp)
+      : nowMs;
+    for (const v of update.values) {
+      const value = v?.value;
+      switch (v?.path) {
+        case "navigation.position":
+          if (value?.latitude != null && value?.longitude != null) {
+            const target = touch();
+            target.lat = value.latitude;
+            target.lon = value.longitude;
+            target.tMs = updateMs;
+          }
+          break;
+        case "navigation.courseOverGroundTrue":
+          if (Number.isFinite(value)) touch().cogRad = value;
+          break;
+        case "navigation.speedOverGround":
+          if (Number.isFinite(value)) touch().sogMs = value;
+          break;
+        case "navigation.headingTrue":
+          if (Number.isFinite(value)) touch().headingRad = value;
+          break;
+        case "name":
+          if (typeof value === "string" && value) touch().name = value;
+          break;
+        case "mmsi":
+          if (value != null && `${value}` !== "") {
+            touch().mmsi = typeof value === "string" ? value : `${value}`;
+          }
+          break;
+        case "": {
+          // Root value: AIS providers commonly identify the target here
+          // (Freeboard's buddy flag arrives the same way).
+          if (value && typeof value === "object") {
+            const target = touch();
+            if (typeof value.name === "string" && value.name) {
+              target.name = value.name;
+            }
+            if (value.mmsi != null && `${value.mmsi}` !== "") {
+              target.mmsi =
+                typeof value.mmsi === "string" ? value.mmsi : `${value.mmsi}`;
+            }
+            if (typeof value.buddy === "boolean") target.buddy = value.buddy;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+  return store;
+}
+
+/**
+ * Seeds the target store from a REST `GET /signalk/v1/api/vessels`
+ * snapshot (work doc #23): static data (name/mmsi) arrives here once,
+ * live positions keep arriving as deltas. Entries without a position are
+ * still seeded — the name/mmsi are what make later position deltas
+ * render with a label. `self` (and the real self context, and the DR
+ * shadow vessel's context, when known) are excluded: the webapp already
+ * draws own vessel and the DR marker.
+ *
+ * @param {Map<string, object>} store
+ * @param {object|null|undefined} snapshot - parsed REST response
+ * @param {{selfContext?: string|null, shadowContext?: string|null, nowMs?: number}} [opts]
+ * @returns {Map<string, object>} the same store
+ */
+export function seedAisFromSnapshot(store, snapshot, opts = {}) {
+  const vessels = snapshot?.vessels ?? snapshot;
+  if (!vessels || typeof vessels !== "object") return store;
+  const skip = new Set(["self", opts.selfContext, opts.shadowContext]);
+  for (const ctx of Object.keys(vessels)) {
+    if (skip.has(ctx) || !ctx.startsWith("vessels.")) continue;
+    const v = vessels[ctx];
+    if (!v || typeof v !== "object") continue;
+    // REST leaves are {value, timestamp} objects in full snapshots;
+    // accept plain values too (partial APIs, tests).
+    const leaf = (node, key) => node?.[key]?.value ?? node?.[key];
+    const position = leaf(v.navigation, "position");
+    const ts = v.navigation?.position?.timestamp;
+    const tMs = Number.isFinite(Date.parse(ts ?? "")) ? Date.parse(ts) : null;
+    const store2 = applyAisDelta(
+      store,
+      {
+        context: ctx,
+        updates: [
+          {
+            timestamp: null, // parsed ts below wins; null → receipt time
+            values: [
+              ...(position?.latitude != null
+                ? [
+                    {
+                      path: "navigation.position",
+                      value: {
+                        latitude: position.latitude,
+                        longitude: position.longitude,
+                      },
+                    },
+                  ]
+                : []),
+              { path: "name", value: leaf(v, "name") ?? null },
+              { path: "mmsi", value: leaf(v, "mmsi") ?? null },
+              ...(leaf(v, "buddy") === true
+                ? [{ path: "", value: { buddy: true } }]
+                : []),
+              {
+                path: "navigation.courseOverGroundTrue",
+                value: leaf(v.navigation, "courseOverGroundTrue") ?? null,
+              },
+              {
+                path: "navigation.speedOverGround",
+                value: leaf(v.navigation, "speedOverGround") ?? null,
+              },
+              {
+                path: "navigation.headingTrue",
+                value: leaf(v.navigation, "headingTrue") ?? null,
+              },
+            ],
+          },
+        ],
+      },
+      tMs ?? opts.nowMs ?? Date.now(),
+    );
+    // applyAisDelta stamps receipt time when timestamp is null; carry
+    // the report timestamp for position so staleness reflects the AIS
+    // report age, not the snapshot fetch.
+    const t = store2.get(ctx);
+    if (t && tMs != null && position?.latitude != null) t.tMs = tMs;
+  }
+  return store;
+}
+
+/**
+ * Age of the last position report, in ms.
+ *
+ * @param {object} target - store entry
+ * @param {number} nowMs
+ * @returns {number|null}
+ */
+export function aisTargetAgeMs(target, nowMs) {
+  const base = target?.tMs ?? target?.receivedMs;
+  return base == null ? null : Math.max(0, nowMs - base);
+}
+
+/**
+ * Staleness classification (plotter tri-state, work doc #23):
+ * "active" while the position report is fresh, "expiring" past
+ * `expiringMs` (greyed, leader dropped — the data is decaying),
+ * "dropped" past `dropMs` (removed from the map and the store).
+ *
+ * @param {object} target - store entry
+ * @param {number} nowMs
+ * @param {{expiringMs?: number, dropMs?: number}} [opts]
+ * @returns {active|expiring|dropped}
+ */
+export function aisStaleness(target, nowMs, opts = {}) {
+  const expiringMs = opts.expiringMs ?? AIS_EXPIRING_MS;
+  const dropMs = opts.dropMs ?? AIS_DROP_MS;
+  const age = aisTargetAgeMs(target, nowMs);
+  if (age == null) return "dropped";
+  if (age >= dropMs) return "dropped";
+  if (age >= expiringMs) return "expiring";
+  return "active";
+}
+
+/**
+ * Predicts a target's position at `nowMs` by dead reckoning its last
+ * report forward along COG/SOG — the honest default when a pick seeds a
+ * bearing (AIS reports lag reality, up to 3 min for Class B). The
+ * extrapolation horizon caps at `maxHorizonMs` (default: the stale
+ * threshold): past it the mark freezes rather than speculating further,
+ * and the stale styling says so. Returns the report position when there
+ * is nothing to extrapolate from (no COG/SOG, or zero speed).
+ *
+ * @param {object} target - store entry
+ * @param {number} nowMs
+ * @param {{maxHorizonMs?: number}} [opts]
+ * @returns {[number, number]|null} predicted [lat, lon], null when the
+ *   target has never reported a position
+ */
+export function predictAisPosition(target, nowMs, opts = {}) {
+  if (target?.lat == null || target?.lon == null) return null;
+  const horizon = opts.maxHorizonMs ?? AIS_PREDICT_HORIZON_MS;
+  const dt = Math.min(
+    Math.max(0, nowMs - (target.tMs ?? target.receivedMs ?? nowMs)),
+    horizon,
+  );
+  const sogKn = target.sogMs != null ? msToKn(target.sogMs) : null;
+  if (target.cogRad == null || !sogKn || dt <= 0) {
+    return [target.lat, target.lon];
+  }
+  const distNm = sogKn * (dt / 3_600_000);
+  return destinationPoint(
+    [target.lat, target.lon],
+    radToDeg(target.cogRad),
+    distNm,
+  );
+}
+
+/**
+ * Full render spec for one target (work doc #23): the marker position is
+ * the *predicted* position (the mark rides its dead-reckoned track
+ * between reports — the DR plugin's home turf), so a right-click pick
+ * seeds the bearing from where the target actually is at pick time. The
+ * velocity leader projects `AIS_LEADER_MIN` ahead from that position.
+ * Expiring targets keep their predicted position but grey out and lose
+ * the leader — the plotter's "data decaying" state before age-out.
+ *
+ * @param {object} target - store entry
+ * @param {number} nowMs
+ * @param {[number, number]|null} [own] - own DR/GPS position for the
+ *   range figure (null → no range in tooltip)
+ * @returns {{context: string, label: string, position: [number, number],
+ *   rotationDeg: number|null, color: string, expiring: boolean, buddy: boolean,
+ *   sogKn: number|null, cogDeg: number|null, rangeNm: number|null, ageMin: number|null,
+ *   leader: {from: [number, number], to: [number, number]}|null,
+ *   tooltip: string}|null} null when the target has no position yet
+ */
+export function aisMarkerSpec(target, nowMs, own) {
+  const position = predictAisPosition(target, nowMs);
+  if (!position) return null;
+  const expiring = aisStaleness(target, nowMs) !== "active";
+  const age = aisTargetAgeMs(target, nowMs);
+  const sogKn = target.sogMs != null ? msToKn(target.sogMs) : null;
+  const cogDeg = target.cogRad != null ? radToDeg(target.cogRad) : null;
+  // Glyph orientation: true heading when broadcast (Class A), else COG.
+  const rotationDeg =
+    target.headingRad != null
+      ? radToDeg(target.headingRad)
+      : target.cogRad != null
+        ? radToDeg(target.cogRad)
+        : null;
+  const label =
+    target.name ??
+    (target.mmsi
+      ? `MMSI ${target.mmsi}`
+      : target.context.replace("vessels.", ""));
+  const rangeNm = own ? distanceNm(own, position) : null;
+  const leader =
+    !expiring && cogDeg != null && sogKn && sogKn > 0
+      ? {
+          from: position,
+          to: destinationPoint(position, cogDeg, sogKn * (AIS_LEADER_MIN / 60)),
+        }
+      : null;
+  const parts = [label];
+  if (rangeNm != null) parts.push(`${rangeNm.toFixed(1)} nm`);
+  if (sogKn != null && cogDeg != null) {
+    parts.push(
+      `${sogKn.toFixed(1)} kn / ${String(Math.round(cogDeg)).padStart(3, "0")}°`,
+    );
+  }
+  if (expiring && age != null) {
+    parts.push(`expiring · last report ${Math.round(age / 60_000)}m ago`);
+  }
+  return {
+    context: target.context,
+    label,
+    position,
+    rotationDeg,
+    color: expiring
+      ? STYLE.aisExpiring
+      : target.buddy
+        ? STYLE.aisBuddy
+        : STYLE.ais,
+    expiring,
+    buddy: Boolean(target.buddy),
+    sogKn,
+    cogDeg,
+    rangeNm,
+    ageMin: age != null ? age / 60_000 : null,
+    leader,
+    tooltip: parts.join(" · "),
+  };
+}
+
+/**
+ * Evicts aged-out targets from the store entirely (work doc #23): past
+ * `dropMs` without a report a target is useless for navigating, so it
+ * leaves the map and frees its slot — otherwise every context ever
+ * heard lingers in memory for the life of the page (busy waters =
+ * hundreds of entries). Callers run this on their regular render tick;
+ * a target that starts reporting again simply re-seeds on its next
+ * delta (the store is a cache, not a log).
+ *
+ * @param {Map<string, object>} store
+ * @param {number} nowMs
+ * @param {{dropMs?: number}} [opts]
+ * @returns {Map<string, object>} the same store, pruned
+ */
+export function pruneAisStore(store, nowMs, opts = {}) {
+  const dropMs = opts.dropMs ?? AIS_DROP_MS;
+  for (const [ctx, target] of store) {
+    const age = aisTargetAgeMs(target, nowMs);
+    if (age == null || age >= dropMs) store.delete(ctx);
+  }
+  return store;
+}
+
+/**
+ * Builds the map's AIS render set from the target store: dropped targets
+ * removed, range-filtered around `own` when known (without own there is
+ * no basis to filter — render everything), nearest first so closer
+ * markers win click/hit-testing ties.
+ *
+ * @param {Map<string, object>} store
+ * @param {number} nowMs
+ * @param {[number, number]|null} [own]
+ * @param {{rangeNm?: number}} [opts]
+ * @returns {Array<object>} aisMarkerSpec results
+ */
+export function aisTargetsForRender(store, nowMs, own, opts = {}) {
+  const rangeNm = opts.rangeNm ?? AIS_RANGE_NM;
+  const specs = [];
+  for (const target of store.values()) {
+    if (target.lat == null) continue;
+    if (aisStaleness(target, nowMs) === "dropped") continue;
+    const spec = aisMarkerSpec(target, nowMs, own);
+    if (!spec) continue;
+    if (own && spec.rangeNm != null && spec.rangeNm > rangeNm) continue;
+    specs.push(spec);
+  }
+  if (own) specs.sort((a, b) => (a.rangeNm ?? 0) - (b.rangeNm ?? 0));
+  return specs;
 }

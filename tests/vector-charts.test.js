@@ -507,10 +507,21 @@ test("vendor wiring: renderer, bridge and licenses vendored and referenced", () 
   assert.match(mapView, /crosshair/);
   assert.match(mapView, /requestAnimationFrame/);
   assert.match(mapView, /cancelAnimationFrame/);
+  // AIS targets (work doc #23): their own layer group fed outside the
+  // snapshot path, proximity-based picks (touch-friendly), and the
+  // layers-control toggle for de-cluttering.
+  assert.match(mapView, /renderAis\(specs, nowMs\)/);
+  assert.match(mapView, /_aisTargetAt/);
+  assert.match(mapView, /"AIS traffic"/);
   const sightPanel = fs.readFileSync(
     path.join(__dirname, "..", "public", "dr-sight-panel.js"),
     "utf8",
   );
-  assert.match(sightPanel, /seedObjectPosition\(lat, lon, mode, label\)/);
+  assert.match(sightPanel, /seedObjectPosition\(lat, lon, mode, label, tMs/);
+  // The pick instant anchors the sight time (an AIS target's seeded
+  // position is its predicted position valid at exactly tMs), marked
+  // dirty so the tz toggle converts it instead of re-seeding to now.
+  assert.match(sightPanel, /isoToSightTimeInput/);
+  assert.match(sightPanel, /dataset\.dirty = "true"/);
   assert.match(sightPanel, /input\[name="object"\]/);
 });

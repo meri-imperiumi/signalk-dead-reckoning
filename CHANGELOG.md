@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **AIS targets on the DR chart (work doc #23)** — the DR webapp now
+  renders AIS traffic on the map and lets you take a bearing to a
+  vessel you can see, even in open water with no charted objects in
+  range. Targets arrive on the same stream under a second `vessels.*`
+  subscription (throttled to 2 s per path; static name/MMSI seeded from
+  a REST snapshot and re-seeded on reconnect), and render as a
+  plotter-style tri-state: active (violet arrow, green for AIS buddies,
+  rotated to heading/COG, with a 6-minute velocity leader), expiring
+  after 3 minutes without a report (grey, leader dropped, tooltip says
+  how old the report is), then aged out and evicted entirely after 20
+  minutes. Marks ride their dead-reckoned track between reports —
+  position is predicted forward from the last report along SOG/COG
+  (capped at the expiring threshold) — so right-click → "Bearing to
+  <name>" seeds the sight form from where the vessel actually is at
+  pick time, with the sight time defaulting to that same instant.
+  Targets are range-filtered around the own boat (default 24 nm),
+  own vessel and the DR shadow vessel are excluded, and an "AIS
+  traffic" checkbox in the layers control de-clutters the chart.
+  `GET /status` now reports the shadow vessel's context
+  (`shadowVesselContext`) so the webapp can filter it.
+
 ## [0.4.0] - 2026-08-28
 
 ### Added

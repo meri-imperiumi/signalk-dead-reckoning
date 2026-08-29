@@ -6,7 +6,10 @@
  * explicit subscribe message with `policy: "instant"` + `minPeriod: 1000`
  * (1 Hz throttle), auto-reconnects on link loss, and forwards only delta
  * frames (skipping hello/ack). Link-state transitions are reported so the
- * UI can show "link lost" immediately.
+ * UI can show "link lost" immediately. A second subscribe message scoped
+ * to `vessels.*` (work doc #23) feeds the AIS target layer; the Hello
+ * frame's self context is captured so consumers can route own-vessel vs.
+ * target deltas.
  *
  * @file dr-signalk-stream.js
  */
@@ -25,6 +28,23 @@ class DrSignalkStream {
       "navigation.deadReckoning.log",
       "navigation.position",
     ];
+    /**
+     * AIS target path set (work doc #23), subscribed on the SAME socket
+     * under `vessels.*` — the Signal K stream protocol scopes each
+     * subscribe message to its context, so the self and AIS
+     * subscriptions coexist (this is how Freeboard-SK feeds its AIS
+     * layer). Empty until subscribeAis() is called.
+     * @type {Array<string>}
+     */
+    this.aisPaths = [];
+    /**
+     * The server's self context from the stream Hello frame (e.g.
+     * `vessels.urn:mrn:signalk:uuid:…`) — deltas arrive with their REAL
+     * contexts, so consumers need this to tell own-vessel deltas from
+     * AIS targets (Freeboard's isSelf does the same).
+     * @type {string|null}
+     */
+    this.selfContext = null;
     /** @type {Set<(data: object) => void>} */
     this.listeners = new Set();
     /** @type {Set<(status: {state: string}) => void>} */
@@ -75,6 +95,11 @@ class DrSignalkStream {
       if (data.errorMessage) {
         console.error("[dr] stream error:", data.errorMessage);
       }
+      // Hello carries the server's self context — needed to route
+      // deltas once a vessels.* (AIS) subscription is active.
+      if (typeof data.self === "string") {
+        this.selfContext = data.self;
+      }
       // Forward only delta frames (hello/ack have no updates).
       if (data.updates) {
         for (const fn of this.listeners) fn(data);
@@ -95,23 +120,41 @@ class DrSignalkStream {
 
   /**
    * Sends the subscription for the current path set (no-op when the
-   * socket isn't open).
+   * socket isn't open). The AIS path set (work doc #23) rides the same
+   * socket as a second subscribe message scoped to `vessels.*`; its
+   * minPeriod is looser than the self subscription — AIS position
+   * reports are 2–30 s apart (Class A) and up to 3 min (Class B), so a
+   * 2 s throttle per path loses nothing while keeping busy-water
+   * traffic from flooding the link.
    *
    * @returns {void}
    */
   sendSubscription() {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    if (this.paths.length === 0) return;
-    this.ws.send(
-      JSON.stringify({
-        context: "vessels.self",
-        subscribe: this.paths.map((path) => ({
-          path,
-          policy: "instant",
-          minPeriod: 1000,
-        })),
-      }),
-    );
+    if (this.paths.length > 0) {
+      this.ws.send(
+        JSON.stringify({
+          context: "vessels.self",
+          subscribe: this.paths.map((path) => ({
+            path,
+            policy: "instant",
+            minPeriod: 1000,
+          })),
+        }),
+      );
+    }
+    if (this.aisPaths.length > 0) {
+      this.ws.send(
+        JSON.stringify({
+          context: "vessels.*",
+          subscribe: this.aisPaths.map((path) => ({
+            path,
+            policy: "instant",
+            minPeriod: 2000,
+          })),
+        }),
+      );
+    }
   }
 
   /**
@@ -125,6 +168,19 @@ class DrSignalkStream {
     this.paths = paths;
     this.retryMs = 0;
     this.ws?.close();
+  }
+
+  /**
+   * Sets the AIS target path set (work doc #23) and re-sends the
+   * subscriptions on the open socket (no reconnect needed — a second
+   * subscribe message is additive on the same connection).
+   *
+   * @param {Array<string>} paths
+   * @returns {void}
+   */
+  subscribeAis(paths) {
+    this.aisPaths = paths;
+    this.sendSubscription();
   }
 
   /**

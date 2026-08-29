@@ -6,6 +6,10 @@
  * the Signal K WebSocket stream through the view-model (tracks,
  * sparkline) into `<dr-map-view>`; REST overlays (fixes, LOPs, CPLs,
  * snap vectors) refresh on a slow poll and after any confirm POST.
+ * AIS targets (work doc #23) ride the same stream under `vessels.*`,
+ * accumulate in a pure store (dr-viewmodel), and render through the
+ * map's AIS layer — right-clicking a target seeds a bearing from its
+ * predicted position.
  *
  * @file dr-app.js
  */
@@ -229,11 +233,14 @@ class DrApp extends HTMLElement {
       ?.addEventListener("click", () => this.map?.recenter());
     // Chart pick: right-click an object on the map → open the sight
     // dialog with the object position pre-seeded (and its charted name,
-    // when the picked symbol carries one — light, seamark, peak…).
+    // when the picked symbol carries one — light, seamark, peak…). AIS
+    // picks (work doc #23) also carry tMs — the instant the seeded
+    // (predicted) position is valid for — so the sight time defaults to
+    // the moment the target was clicked.
     this.map?.addEventListener("dr-pick-position", (e) => {
-      const { lat, lng, mode, label } = e.detail;
+      const { lat, lng, mode, label, tMs } = e.detail;
       openSight();
-      this.sight?.seedObjectPosition(lat, lng, mode, label);
+      this.sight?.seedObjectPosition(lat, lng, mode, label, tMs);
     });
 
     /** @type {HTMLDialogElement|null} */
@@ -365,6 +372,19 @@ class DrApp extends HTMLElement {
     /** History-API backfill tracks (null until a provider answers). */
     this.gpsHistory = [];
     this.ghostHistory = [];
+    /**
+     * AIS target store (work doc #23): context → target state, fed by
+     * `vessels.*` deltas + the REST snapshot seed, rendered through
+     * `aisTargetsForRender`. Owned by dr-viewmodel's pure helpers.
+     * @type {Map<string, object>}
+     */
+    this.aisStore = new Map();
+    /**
+     * DR shadow vessel context (work doc #21), filtered from the AIS
+     * layer — the webapp already draws the DR position as its own marker.
+     * @type {string|null}
+     */
+    this.shadowContext = null;
     this.snap = {
       drPosition: null,
       gpsPosition: null,
@@ -387,7 +407,7 @@ class DrApp extends HTMLElement {
     this.connectStream();
     this.loadPluginConfig();
     this.bootstrapSelf();
-    this.fetchStatus();
+    this.fetchStatus().then(() => this.bootstrapAis());
     this.refreshOverlays();
     this.refreshTrackHistory();
     // Slow REST refresh for persisted overlays; stream drives the live parts.
@@ -397,6 +417,10 @@ class DrApp extends HTMLElement {
       this.refreshOverlays();
       this.fetchStatus();
     }, 30000);
+    // AIS tick (work doc #23): predictions, expiring styling, and
+    // age-out must advance even when nothing else flows (moored, DR
+    // idle, quiet targets) — a slow dedicated pulse.
+    setInterval(() => this.renderAis(), 5000);
   }
 
   /**
@@ -426,6 +450,18 @@ class DrApp extends HTMLElement {
       "environment.mode",
       "environment.current.setTrue",
       "environment.current.drift",
+    ]);
+    // AIS targets (work doc #23): same socket, `vessels.*` scope — the
+    // protocol scopes each subscribe message to its context. Static
+    // data (name/mmsi) seeds from the REST snapshot (bootstrapAis);
+    // these paths carry the live motion.
+    stream.subscribeAis([
+      "navigation.position",
+      "navigation.courseOverGroundTrue",
+      "navigation.speedOverGround",
+      "navigation.headingTrue",
+      "name",
+      "mmsi",
     ]);
     stream.on((delta) => this.onDelta(delta));
     stream.onStatus((s) => this.renderLinkStatus(s));
@@ -529,12 +565,69 @@ class DrApp extends HTMLElement {
   }
 
   /**
-   * Streams a delta into the view-model and re-renders.
+   * Seeds the AIS target store from the REST vessel snapshot (work doc
+   * #23): static data (name/mmsi) arrives here; live motion rides the
+   * `vessels.*` deltas. Also re-run on stream reconnect — targets that
+   * aged out while offline come straight back with names intact.
+   *
+   * @returns {Promise<void>}
+   */
+  async bootstrapAis() {
+    try {
+      const res = await fetch("/signalk/v1/api/vessels");
+      if (!res.ok) return;
+      const body = await res.json();
+      vm.seedAisFromSnapshot(this.aisStore, body, {
+        selfContext: window.drSignalkStream?.selfContext,
+        shadowContext: this.shadowContext,
+      });
+      this.renderAis();
+    } catch {
+      /* REST unavailable — deltas will drive when they can */
+    }
+  }
+
+  /**
+   * Renders the AIS layer (work doc #23): prunes aged-out targets, then
+   * pushes range-filtered marker specs to the map with the prediction
+   * instant. Own position prefers DR (the chart's own-boat reference);
+   * GPS when DR hasn't started.
+   *
+   * @returns {void}
+   */
+  renderAis() {
+    const nowMs = Date.now();
+    vm.pruneAisStore(this.aisStore, nowMs);
+    const own = this.snap.drPosition ?? this.snap.gpsPosition;
+    this.map?.renderAis(
+      vm.aisTargetsForRender(this.aisStore, nowMs, own),
+      nowMs,
+    );
+  }
+
+  /**
+   * Streams a delta into the view-model and re-renders. Deltas from
+   * other vessels (the `vessels.*` AIS subscription, work doc #23) feed
+   * the target store instead — own vessel (by real context or the
+   * literal `vessels.self`) and the DR shadow vessel are excluded.
    *
    * @param {object} delta
    * @returns {void}
    */
   onDelta(delta) {
+    const ctx = delta?.context;
+    const selfCtx = window.drSignalkStream?.selfContext;
+    if (
+      typeof ctx === "string" &&
+      ctx.startsWith("vessels.") &&
+      ctx !== "vessels.self" &&
+      ctx !== selfCtx &&
+      ctx !== this.shadowContext
+    ) {
+      vm.applyAisDelta(this.aisStore, delta);
+      this.renderAis();
+      return;
+    }
     for (const update of delta?.updates ?? []) {
       for (const v of update.values ?? []) {
         this.applyValue(v.path, v.value);
@@ -790,6 +883,9 @@ class DrApp extends HTMLElement {
     this.shadowRoot.querySelector("#dr-divergence").textContent =
       vm.divergenceText(this.snap.divergence);
     this.map?.render(this.snap);
+    // AIS ranges/leaders move with the own boat — cheap to re-shape
+    // alongside the snapshot (markers are reused in the map).
+    this.renderAis();
   }
 
   /**
@@ -806,7 +902,11 @@ class DrApp extends HTMLElement {
       const body = await res.json();
       this.snap.current = body.current ?? this.snap.current;
       this.snap.manualCurrent = body.manualCurrent ?? null;
+      // Shadow vessel context (work doc #21/#23): once known, the AIS
+      // layer filters it (the DR marker already covers that position).
+      this.shadowContext = body.shadowVesselContext ?? this.shadowContext;
       this.renderCurrent();
+      this.renderAis();
     } catch {
       /* REST unavailable — stream will drive when it can */
     }
@@ -928,6 +1028,10 @@ class DrApp extends HTMLElement {
     } else if (status.state === "retrying") {
       panel.classList.add("retrying");
       text.textContent = "Signal K link lost — reconnecting…";
+    } else if (status.state === "open") {
+      // Re-seed AIS static data on (re)connect (work doc #23) — names
+      // and MMSIs don't ride position deltas.
+      this.bootstrapAis();
     }
     // "open" — let the DR state panel take over once data flows.
   }
