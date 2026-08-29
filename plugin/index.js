@@ -639,35 +639,42 @@ module.exports = (app) => {
     },
 
     start: (options) => {
-      config = { ...DEFAULT_CONFIG, ...(options || {}) };
+      // The server's plugin-config UI persists this plugin's schema
+      // keys flat (e.g. "logbook.enabled": true) — dotted schema names
+      // are saved verbatim by the admin UI, with no nesting. Normalize
+      // to the nested-object shape every reader below uses, so a flat
+      // save doesn't silently fall back to the defaults (and disable
+      // logbook write-through).
+      const opts = deflattenConfig(options);
+      config = { ...DEFAULT_CONFIG, ...opts };
       // Allow partial divergence overrides without losing the defaults.
       config.divergence = {
         ...DEFAULT_CONFIG.divergence,
-        ...(options?.divergence ?? {}),
+        ...(opts.divergence ?? {}),
       };
       config.sensorHealth = {
         ...DEFAULT_CONFIG.sensorHealth,
-        ...(options?.sensorHealth ?? {}),
+        ...(opts.sensorHealth ?? {}),
       };
       config.logbook = {
         ...DEFAULT_CONFIG.logbook,
-        ...(options?.logbook ?? {}),
+        ...(opts.logbook ?? {}),
       };
       config.training = {
         ...DEFAULT_CONFIG.training,
-        ...(options?.training ?? {}),
+        ...(opts.training ?? {}),
       };
       config.weatherCurrent = {
         ...DEFAULT_CONFIG.weatherCurrent,
-        ...(options?.weatherCurrent ?? {}),
+        ...(opts.weatherCurrent ?? {}),
       };
       config.polar = {
         ...DEFAULT_CONFIG.polar,
-        ...(options?.polar ?? {}),
+        ...(opts.polar ?? {}),
       };
       config.shadowVessel = {
         ...DEFAULT_CONFIG.shadowVessel,
-        ...(options?.shadowVessel ?? {}),
+        ...(opts.shadowVessel ?? {}),
       };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
@@ -2200,8 +2207,12 @@ module.exports = (app) => {
           datetime: b.timestamp ?? new Date().toISOString(),
           body_or_object: b.body_or_object ?? null,
           confirmed_by: obsBy,
-          latitude: b.assumed_lat,
-          longitude: b.assumed_lon,
+          // The entry records where *we* were when the sight was taken
+          // (the vessel's DR position), not the charted object — the
+          // object's position is a chart feature; the logbook is ours.
+          latitude: engine.origin?.latitude,
+          longitude: engine.origin?.longitude,
+          azimuth_true: b.azimuth_true,
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
@@ -2251,8 +2262,10 @@ module.exports = (app) => {
           datetime: b.timestamp ?? new Date().toISOString(),
           body_or_object: b.source_object ?? null,
           confirmed_by: obsBy,
-          latitude: b.center_lat,
-          longitude: b.center_lon,
+          // Vessel DR position, not the CPL's charted center (see /fix/lop).
+          latitude: engine.origin?.latitude,
+          longitude: engine.origin?.longitude,
+          radius_nm: b.radius_nm,
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
@@ -2341,8 +2354,10 @@ module.exports = (app) => {
           datetime: new Date(b.epoch_ms).toISOString(),
           body_or_object: result.body,
           confirmed_by: obsBy,
-          latitude: result.assumed_lat,
-          longitude: result.assumed_lon,
+          // Vessel DR position, not the sight-reduction assumed position
+          // (see /fix/lop).
+          latitude: engine.origin?.latitude,
+          longitude: engine.origin?.longitude,
           reduction: {
             azimuth_true: result.azimuth_true,
             intercept_nm: result.intercept_nm,
@@ -2564,6 +2579,7 @@ module.exports = (app) => {
             radToDeg,
           ),
           sea_state: seaState !== "unknown" ? Number(seaState) : null,
+          positionFormat: config.positionFormat,
         }),
         "fix",
         result.fix_id,
@@ -2806,6 +2822,38 @@ function parseBody(body) {
 }
 
 /**
+ * Normalizes plugin configuration from the shape the server delivers.
+ * The admin UI saves dotted schema keys flat ("logbook.enabled": true
+ * for the schema key of that name) while the plugin reads nested
+ * objects (`config.logbook.enabled`) — this folds flat dotted keys into
+ * nested objects. Nested keys pass through untouched (and win if both
+ * shapes somehow carry the same leaf). Never throws.
+ *
+ * @param {object|null} options - raw configuration from the server
+ * @returns {object} nested configuration
+ */
+function deflattenConfig(options) {
+  const out = {};
+  for (const [key, value] of Object.entries(options ?? {})) {
+    if (!key.includes(".")) {
+      out[key] =
+        typeof value === "object" && value != null && !Array.isArray(value)
+          ? { ...out[key], ...value }
+          : value;
+      continue;
+    }
+    const parts = key.split(".");
+    let node = out;
+    for (const part of parts.slice(0, -1)) {
+      if (typeof node[part] !== "object" || node[part] == null) node[part] = {};
+      node = node[part];
+    }
+    node[parts[parts.length - 1]] = value;
+  }
+  return out;
+}
+
+/**
  * Unwraps a Signal K position value to {latitude, longitude}.
  *
  * @param {unknown} v
@@ -2866,3 +2914,4 @@ module.exports.unwrapPosition = unwrapPosition;
 module.exports.unwrapNumber = unwrapNumber;
 module.exports.unwrapHeel = unwrapHeel;
 module.exports.parseBody = parseBody;
+module.exports.deflattenConfig = deflattenConfig;

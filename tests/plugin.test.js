@@ -1670,7 +1670,7 @@ test("logbook: confirmed fix writes entry and marks the fixes row", async () => 
     assert.strictEqual(posts.length, 1, "one logbook entry POSTed");
     assert.ok(posts[0].url.includes("/plugins/signalk-logbook/logs"));
     const entry = posts[0].body;
-    assert.strictEqual(entry.origin, "agent");
+    assert.strictEqual(entry.origin, "auto");
     assert.strictEqual(entry.category, "navigation");
     assert.strictEqual(entry.author, "Alice");
     assert.strictEqual(entry.position.source, "GPS");
@@ -1689,6 +1689,89 @@ test("logbook: confirmed fix writes entry and marks the fixes row", async () => 
       .get(body.fix_id);
     assert.strictEqual(row.logged_to_logbook, 1);
     assert.strictEqual(row.logbook_entry_ref, entry.datetime);
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("deflattenConfig folds flat dotted keys into nested objects", () => {
+  const deflattenConfig = require("../plugin/index.js").deflattenConfig;
+  // Flat shape — what the server's admin UI saves for dotted schema keys.
+  assert.deepEqual(
+    deflattenConfig({
+      tickIntervalMs: 500,
+      "logbook.enabled": true,
+      "logbook.token": "tok",
+      "polar.windowS": 90,
+    }),
+    {
+      tickIntervalMs: 500,
+      logbook: { enabled: true, token: "tok" },
+      polar: { windowS: 90 },
+    },
+  );
+  // Nested shape passes through untouched.
+  const nested = {
+    logbook: { enabled: true, url: "http://x" },
+    array: [1, 2],
+  };
+  assert.deepEqual(deflattenConfig(nested), nested);
+  // Mixed shapes merge without losing either side.
+  assert.deepEqual(
+    deflattenConfig({
+      "logbook.enabled": true,
+      logbook: { token: "tok" },
+    }),
+    { logbook: { enabled: true, token: "tok" } },
+  );
+  // Null-safe.
+  assert.deepEqual(deflattenConfig(null), {});
+});
+
+test("logbook: flat dotted config keys enable write-through (server admin UI save shape)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-flat-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    posts.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 201 };
+  };
+  try {
+    // Exactly the shape saved by the admin UI for the dotted schema
+    // keys (regression: this used to fall back to enabled=false and
+    // silently queue every entry forever).
+    plugin.start({
+      "logbook.enabled": true,
+      "logbook.token": "tok",
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const { status } = router.invoke("post", "/fix/lop", {
+      assumed_lat: -18.865,
+      assumed_lon: -159.8,
+      azimuth_true: 45,
+      lop_type: "bearing",
+      body_or_object: "LIGHTHOUSE",
+      confirmed_by: "bergie",
+    });
+    assert.strictEqual(status, 200);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(posts.length, 1, "observation entry POSTed immediately");
+    assert.ok(/LIGHTHOUSE bearing/.test(posts[0].body.text));
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    const queued = db
+      .prepare("SELECT COUNT(*) AS n FROM logbook_pending")
+      .get();
+    assert.strictEqual(queued.n, 0, "nothing left in the pending queue");
     db.close();
     plugin.stop();
   } finally {
@@ -2164,7 +2247,7 @@ test("logbook: completed tack writes one entry, debounced for a second maneuver"
       1,
       `expected exactly one tack entry, got ${posts.map((p) => p.body.text)}`,
     );
-    assert.strictEqual(tacks[0].body.origin, "agent");
+    assert.strictEqual(tacks[0].body.origin, "auto");
     assert.ok(tacks[0].body.datetime);
 
     // An immediate second maneuver inside the debounce window logs nothing.
@@ -2423,6 +2506,23 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
     plugin.start({ logbook: { enabled: true, token: "tok" } });
     const router = new FakeRouter();
     plugin.registerWithRouter(router);
+    // Seed the vessel's DR position from the first GPS fix — distinct
+    // from the charted object, so the test can prove the entry records
+    // *our* position, not the lighthouse's.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 61, longitude: 25 },
+            },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
     const { status } = router.invoke("post", "/fix/lop", {
       lop_type: "bearing",
       assumed_lat: 60,
@@ -2435,8 +2535,12 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
     assert.strictEqual(posts.length, 1, "observation logbook entry POSTed");
     const entry = posts[0].body;
     assert.strictEqual(entry.category, "navigation");
-    assert.match(entry.text, /lighthouse bearing/);
+    assert.match(entry.text, /lighthouse bearing 135°T/);
     assert.strictEqual(entry.position.source, "DR");
+    // The entry's position is the vessel's DR, not the object's charted
+    // position (assumed_lat/lon 60,24 is the lighthouse).
+    assert.strictEqual(entry.position.latitude, 61);
+    assert.strictEqual(entry.position.longitude, 25);
     plugin.stop();
   } finally {
     globalThis.fetch = realFetch;
@@ -2459,6 +2563,22 @@ test("logbook: posting a celestial sight writes a sight entry with reduction", a
     plugin.start({ logbook: { enabled: true, token: "tok" } });
     const router = new FakeRouter();
     plugin.registerWithRouter(router);
+    // Seed the vessel's DR position so the entry records where we were
+    // (the sight-reduction assumed position is a different artifact).
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 40, longitude: -70 },
+            },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
     const { status } = router.invoke("post", "/celestial/sight", {
       body: "Sun",
       hs_deg: 45,
@@ -2472,6 +2592,9 @@ test("logbook: posting a celestial sight writes a sight entry with reduction", a
     const entry = sightEntries[0].body;
     assert.strictEqual(entry.category, "navigation");
     assert.strictEqual(entry.position.source, "Celestial");
+    // The entry's position is the vessel's DR, not the reduction's AP.
+    assert.strictEqual(entry.position.latitude, 40);
+    assert.strictEqual(entry.position.longitude, -70);
     assert.match(entry.text, /Sun sight/);
     assert.match(entry.text, /intercept/);
     plugin.stop();

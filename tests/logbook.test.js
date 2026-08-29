@@ -16,9 +16,22 @@ const {
   newClientId,
 } = require("../plugin/logbook.js");
 
-test("formatPosition renders N/S E/W with 4 decimals", () => {
-  assert.strictEqual(formatPosition(60, 24), "60.0000°N 24.0000°E");
-  assert.strictEqual(formatPosition(-33.5, -71.25), "33.5000°S 71.2500°W");
+test("formatPosition renders decimal/dm/dms like the webapp", () => {
+  assert.strictEqual(formatPosition(60, 24, "decimal"), "60.0000 N 24.0000 E");
+  assert.strictEqual(
+    formatPosition(-33.5, -71.25, "decimal"),
+    "33.5000 S 71.2500 W",
+  );
+  assert.strictEqual(
+    formatPosition(60.0, 24.5, "dm"),
+    "60°00.000' N 24°30.000' E",
+  );
+  assert.strictEqual(
+    formatPosition(-18.8651, -159.8008, "dms"),
+    "18°51'54.4\" S 159°48'02.9\" W",
+  );
+  // Default stays decimal for callers that don't pass a preference.
+  assert.strictEqual(formatPosition(60, 24), "60.0000 N 24.0000 E");
 });
 
 test("composeFixEntry: GPS fix maps per SPEC §9.5", () => {
@@ -36,7 +49,7 @@ test("composeFixEntry: GPS fix maps per SPEC §9.5", () => {
   });
   assert.strictEqual(body.datetime, "2026-08-24T12:00:00.000Z");
   assert.strictEqual(body.category, "navigation");
-  assert.strictEqual(body.origin, "agent");
+  assert.strictEqual(body.origin, "auto");
   assert.strictEqual(body.author, "Alice");
   assert.strictEqual(body.position.source, "GPS");
   assert.strictEqual(body.position.latitude, 60);
@@ -102,7 +115,7 @@ test("composeTackEntry: text, category, origin; heading zero-padded", () => {
   });
   assert.strictEqual(tack.text, "Tack to 045°");
   assert.strictEqual(tack.category, "navigation");
-  assert.strictEqual(tack.origin, "agent");
+  assert.strictEqual(tack.origin, "auto");
 
   const gybe = composeTackEntry({
     direction: "gybe",
@@ -277,7 +290,7 @@ test("composeObservationEntry: celestial sight with reduction", () => {
     sea_state: 3,
   });
   assert.strictEqual(body.category, "navigation");
-  assert.strictEqual(body.origin, "agent");
+  assert.strictEqual(body.origin, "auto");
   assert.strictEqual(body.author, "Alice");
   assert.match(body.text, /Sun sight/);
   assert.doesNotMatch(
@@ -291,27 +304,44 @@ test("composeObservationEntry: celestial sight with reduction", () => {
   assert.strictEqual(body.observations.seaState, 3);
 });
 
-test("composeObservationEntry: bearing LOP names the object", () => {
+test("composeObservationEntry: bearing LOP names the object and the bearing", () => {
   const body = composeObservationEntry({
     kind: "bearing",
     datetime: "2026-01-01T12:00:00Z",
     body_or_object: "lighthouse",
+    azimuth_true: 47.2,
     confirmed_by: null,
     latitude: 60,
     longitude: 24,
   });
-  assert.match(body.text, /lighthouse bearing/);
+  assert.match(body.text, /lighthouse bearing 047°T/);
   assert.strictEqual(body.author, undefined);
   assert.strictEqual(body.position.source, "DR");
 });
 
-test("composeObservationEntry: vertical-angle CPL", () => {
+test("composeObservationEntry: coordinates stay in the position field, not text", () => {
+  const body = composeObservationEntry({
+    kind: "bearing",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "Vessel COULD BE WORSE",
+    azimuth_true: 90,
+    latitude: -18.8651,
+    longitude: -159.8008,
+  });
+  assert.strictEqual(body.text, "Vessel COULD BE WORSE bearing 090°T");
+  assert.strictEqual(body.position.latitude, -18.8651);
+  assert.strictEqual(body.position.longitude, -159.8008);
+  assert.strictEqual(body.position.source, "DR");
+});
+
+test("composeObservationEntry: vertical-angle CPL carries its radius", () => {
   const body = composeObservationEntry({
     kind: "vertical",
     datetime: "2026-01-01T12:00:00Z",
     body_or_object: "lighthouse",
+    radius_nm: 0.42,
   });
-  assert.match(body.text, /lighthouse CPL/);
+  assert.match(body.text, /lighthouse CPL 0.4 nm/);
   assert.strictEqual(body.position, undefined);
 });
 

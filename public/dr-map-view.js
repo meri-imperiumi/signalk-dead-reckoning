@@ -249,8 +249,13 @@ class DrMapView extends HTMLElement {
     this.map.on("contextmenu", (e) => {
       const target = this._aisTargetAt(e.containerPoint);
       if (target) {
+        // An AIS target is a vessel, not a chart feature — pre-seed the
+        // bearing object as "Vessel {name}" so logbook entries and the
+        // pending-LOP label read unambiguously (a bare name could be a
+        // buoy, a cape, another boat…). The map glyph itself keeps the
+        // bare label (aisMarkerSpec.label).
         this.showPickMenu(target.position, e.containerPoint, {
-          label: target.label,
+          label: target.label ? `Vessel ${target.label}` : null,
           tMs: this._aisRenderNowMs ?? Date.now(),
         });
         return;

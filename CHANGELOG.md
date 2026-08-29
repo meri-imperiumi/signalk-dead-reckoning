@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Logbook write-through silently disabled by the config shape the
+  server's admin UI saves.** This plugin's schema declares grouped
+  fields with dotted keys (`"logbook.enabled"`, `"polar.windowS"`, …),
+  and the Signal K admin UI persists those dotted keys flat. But
+  `start()` read them as nested objects (`config.logbook.enabled`), so
+  the merge fell back to the defaults — `logbook.enabled` to `false` —
+  and every fix and observation was queued in `logbook_pending` forever,
+  never written, with no access request ever submitted. The incoming
+  configuration is now deflattened once before the defaults merge, so a
+  flat dotted save reaches the nested readers. Existing installs that
+  had enabled logbook writes start working on next restart (approve the
+  pending access request once in the server UI).
+- **Observation logbook entries recorded no bearing, used the
+  object's charted position, and duplicated coordinates in text.** A
+  bearing line of position was logged as `«object» bearing
+  (18.8651°S 159.8008°W)` — the observed angle was missing, the
+  coordinates were the *object's* charted position (not the vessel's),
+  and they were redundant with the structured `position` field the
+  logbook UI renders separately. The entry text now carries only what
+  was observed — the true bearing (`«object» bearing 047°T`) or a CPL's
+  radius (`«object» CPL 0.4 nm`) — with no coordinate parenthetical.
+  The `position` field records *our* DR position at the time of the
+  sight (where we were, not where the charted object is). Celestial
+  sight and CPL entries likewise record the vessel's DR position
+  instead of the reduction's assumed position / the CPL's charted
+  center. Fix entries (§9.5) honor the configured `positionFormat`
+  preference for their in-text coordinates.
+
+### Changed
+- **Logbook `origin` switched from `agent` to `auto`** for all
+  entries this plugin writes (fixes, observations, auto-detected
+  tacks/gybes). `manual` is reserved for free text a watchkeeper types
+  into the logbook UI; these entries are posted through the API (the
+  watchkeeper's name travels in `author`). The dead-reckoning plugin is
+  routine automation, not an autonomous agent, so `auto` is the honest
+  provenance. (SPEC §9.5's earlier `agent` convention is superseded.)
+- Bearings taken to AIS targets are pre-seeded as `Vessel {name}`
+  rather than the bare name, so the logbook entry and pending-LOP label
+  read unambiguously (a bare name could be a buoy, a cape, another
+  boat). The AIS map glyph itself keeps the bare label.
+
 ## [0.5.1] - 2026-08-28
 
 ### Added

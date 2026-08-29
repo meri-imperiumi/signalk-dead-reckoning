@@ -12,10 +12,13 @@
  *    entry contains exactly the fields POSTed, which is what SPEC §9.5's
  *    mapping assigns this plugin anyway (position, log, speed, heading,
  *    observations all composed here).
- *  - `origin` accepts 'manual' | 'auto' | 'agent'; this plugin uses
- *    'agent' for entries generated from human-confirmed fixes and for
- *    auto-detected maneuvers (§9.4: no human judgment in "a tack
- *    happened").
+ *  - `origin` accepts 'manual' | 'auto' | 'agent'. This plugin writes
+ *    'auto' for every entry: 'manual' is reserved for free text a
+ *    watchkeeper types into the logbook UI, whereas these entries are
+ *    posted through the API (the watchkeeper's name travels in
+ *    `author`); 'agent' is left for autonomous agents, and the DR
+ *    plugin is routine automation — §9.4 tack detection and §9.5
+ *    fix/observation write-through.
  *  - `body.author` overrides the JWT-derived author (delegation), so
  *    `confirmed_by` flows through as the entry author.
  *  - Auth: the server's auth gate reads the Authorization Bearer header;
@@ -42,16 +45,48 @@ const POSITION_SOURCE = {
 };
 
 /**
- * Formats a latitude/longitude as "60.0000°N 24.0000°E" for entry text.
+ * Formats a single coordinate (lat or lon) in one of the three
+ * notations the webapp supports (`public/dr-position-format.js`, SPEC
+ * §14.1), so logbook entry text matches what the watchkeeper sees on
+ * screen — decimal "60.0000 N", DM "60°00.000' N", DMS "60°00'00.0\" N"
+ * (the last being the traditional nautical chart format). Mirrored
+ * server-side because the webapp module is ESM and this is CJS.
+ *
+ * @param {number} deg - signed degrees
+ * @param {"lat"|"lon"} kind
+ * @param {"decimal"|"dm"|"dms"} format
+ * @returns {string}
+ */
+function formatCoord(deg, kind, format) {
+  const abs = Math.abs(deg);
+  const hem =
+    deg < 0 ? (kind === "lat" ? "S" : "W") : kind === "lat" ? "N" : "E";
+  if (format === "dms") {
+    const d = Math.floor(abs);
+    const minFull = (abs - d) * 60;
+    const m = Math.floor(minFull);
+    const s = ((minFull - m) * 60).toFixed(1);
+    return `${d}°${String(m).padStart(2, "0")}'${s.padStart(4, "0")}" ${hem}`;
+  }
+  if (format === "dm") {
+    const d = Math.floor(abs);
+    const m = ((abs - d) * 60).toFixed(3);
+    return `${d}°${String(m).padStart(6, "0")}' ${hem}`;
+  }
+  return `${abs.toFixed(4)} ${hem}`;
+}
+
+/**
+ * Formats a latitude/longitude pair for entry text, in the same
+ * notation as the webapp (see {@link formatCoord}).
  *
  * @param {number} latitude
  * @param {number} longitude
+ * @param {"decimal"|"dm"|"dms"} [format="decimal"]
  * @returns {string}
  */
-function formatPosition(latitude, longitude) {
-  const lat = `${Math.abs(latitude).toFixed(4)}°${latitude >= 0 ? "N" : "S"}`;
-  const lon = `${Math.abs(longitude).toFixed(4)}°${longitude >= 0 ? "E" : "W"}`;
-  return `${lat} ${lon}`;
+function formatPosition(latitude, longitude, format = "decimal") {
+  return `${formatCoord(latitude, "lat", format)} ${formatCoord(longitude, "lon", format)}`;
 }
 
 /**
@@ -85,6 +120,8 @@ function round(n, places) {
  * @param {number|null} [f.heading_deg]
  * @param {number|null} [f.course_deg]
  * @param {number|null} [f.sea_state] - WMO sea state code 0-9
+ * @param {"decimal"|"dm"|"dms"} [f.positionFormat="decimal"] - notation
+ *   for the position in entry text (mirrors the webapp preference)
  * @returns {object} POST /logs body
  */
 function composeFixEntry(f) {
@@ -92,7 +129,7 @@ function composeFixEntry(f) {
     datetime: f.datetime,
     text: composeFixText(f),
     category: "navigation",
-    origin: "agent",
+    origin: "auto",
     position: {
       latitude: f.latitude,
       longitude: f.longitude,
@@ -121,7 +158,7 @@ function composeFixEntry(f) {
  * no structured fields exist for them).
  */
 function composeFixText(f) {
-  const where = formatPosition(f.latitude, f.longitude);
+  const where = formatPosition(f.latitude, f.longitude, f.positionFormat);
   const by = f.confirmed_by ? ` by ${f.confirmed_by}` : "";
   switch (f.source_type) {
     case "celestial": {
@@ -175,7 +212,7 @@ function composeTackEntry(t) {
     datetime: t.datetime,
     text,
     category: "navigation",
-    origin: "agent",
+    origin: "auto",
   };
   if (Number.isFinite(t.sea_state)) {
     body.observations = { seaState: Math.round(t.sea_state) };
@@ -188,25 +225,28 @@ function composeTackEntry(t) {
  * (SPEC §9.5): a bearing LOP, a vertical-angle CPL, or a celestial
  * sight. Logged when the observation is recorded — independent of
  * whether it ever resolves into a fix — because taking the sight is
- * itself a navigational event. The `position` is the relevant charted/
- * assumed/object position; `text` describes what was observed.
+ * itself a navigational event. The vessel's position (DR at the time
+ * of the sight) goes in the structured `position` field — the logbook
+ * UI renders it separately, so it stays out of `text`; `text` carries
+ * only what was observed (object, bearing/radius/reduction).
  *
  * @param {object} o
  * @param {"bearing"|"vertical"|"celestial"} o.kind
  * @param {string} [o.body_or_object] - body name (celestial) or object label
  * @param {string} o.datetime - ISO timestamp
  * @param {string|null} [o.confirmed_by] - watchkeeper (author)
- * @param {number} [o.latitude] - position to anchor the entry
+ * @param {number} [o.latitude] - vessel position to anchor the entry
  * @param {number} [o.longitude]
  * @param {object} [o.reduction] - celestial reduction (Hc/Ho/Zn/intercept)
+ * @param {number|null} [o.azimuth_true] - true bearing to the object, deg
+ *   (bearing LOPs — the observed angle is the event, it belongs in text)
+ * @param {number|null} [o.radius_nm] - CPL radius, nm (vertical-angle CPLs)
  * @param {number|null} [o.sea_state] - WMO sea state code 0-9
  * @returns {object} POST /logs body
  */
 function composeObservationEntry(o) {
-  const where =
-    Number.isFinite(o.latitude) && Number.isFinite(o.longitude)
-      ? formatPosition(o.latitude, o.longitude)
-      : null;
+  const hasPosition =
+    Number.isFinite(o.latitude) && Number.isFinite(o.longitude);
   let text;
   if (o.kind === "celestial") {
     const r = o.reduction ?? {};
@@ -220,19 +260,28 @@ function composeObservationEntry(o) {
       : "";
     text = `${o.body_or_object ?? "Body"} sight${zn}${ic}`;
   } else if (o.kind === "vertical") {
-    text = `${o.body_or_object ?? "object"} CPL`;
+    const r = Number.isFinite(o.radius_nm)
+      ? ` ${o.radius_nm.toFixed(1)} nm`
+      : "";
+    text = `${o.body_or_object ?? "object"} CPL${r}`;
   } else {
-    text = `${o.body_or_object ?? "object"} bearing`;
+    // The observed angle is the event — a bearing entry without it
+    // isn't navigable after the fact. Zero-padded like the tack text;
+    // "°T" is the standard nautical abbreviation for true (bearings are
+    // stored degrees-true — magnetic entries are converted at submit).
+    const b = Number.isFinite(o.azimuth_true)
+      ? ` ${String(((Math.round(o.azimuth_true) % 360) + 360) % 360).padStart(3, "0")}°T`
+      : "";
+    text = `${o.body_or_object ?? "object"} bearing${b}`;
   }
-  if (where) text += ` (${where})`;
   const body = {
     datetime: o.datetime,
     text,
     category: "navigation",
-    origin: "agent",
+    origin: "auto",
   };
   if (o.confirmed_by) body.author = o.confirmed_by;
-  if (where) {
+  if (hasPosition) {
     body.position = {
       latitude: o.latitude,
       longitude: o.longitude,

@@ -335,7 +335,7 @@ template.innerHTML = /* html */ `
     </form>
 
     <div class="editing-note" id="editing-note" hidden></div>
-    <ul class="status" id="status" hidden></ul>
+    <div class="status" id="status" hidden></div>
     <div class="error" id="error" hidden></div>
   </div>
 `;
@@ -880,6 +880,9 @@ class DrSightPanel extends HTMLElement {
           composed: true,
         }),
       );
+      // Leave the status/reduction readable briefly, then close the
+      // dialog — same pattern as the fix and current panels.
+      this.autoClose();
     } catch (err) {
       this.showError(err.message);
     }
@@ -1014,6 +1017,29 @@ class DrSightPanel extends HTMLElement {
     const el = this.shadowRoot.querySelector("#status");
     el.textContent = msg;
     el.hidden = false;
+  }
+
+  /** @returns {void} */
+  autoClose() {
+    if (this.closeTimer != null) clearTimeout(this.closeTimer);
+    this.closeTimer = setTimeout(() => this.dispatchClose(), 2500);
+  }
+
+  /** @returns {void} */
+  dispatchClose() {
+    if (this.closeTimer != null) {
+      clearTimeout(this.closeTimer);
+      this.closeTimer = null;
+    }
+    // Clear the transient status/reduction/error so the dialog reopens
+    // clean next time (the form is already reset by the submit flow).
+    for (const id of ["#status", "#reduction", "#error"]) {
+      const el = this.shadowRoot.querySelector(id);
+      if (el) el.hidden = true;
+    }
+    this.dispatchEvent(
+      new CustomEvent("dr-close", { bubbles: true, composed: true }),
+    );
   }
 
   readForm(form) {
