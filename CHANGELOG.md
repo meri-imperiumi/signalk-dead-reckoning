@@ -16,15 +16,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GL JS 5.24.0 and the official Leaflet bridge are vendored under
   `public/vendor/maplibre-gl/` (same policy as Leaflet — no CDN, no
   build step) and mounted via `L.maplibreGL`, so all DR overlays stay
-  plain Leaflet. The MapLibre style is built client-side by the pure
-  `maplibreStyleFor` (view-model): one vector source on the chart's
-  tile URL with native max zoom — vector charts keep rendering past
-  the raster maxNativeZoom ceiling — plus a dark sea background and
-  geometry-only fill/line/circle layers with marine styling for known
-  source-layer families (LNDARE/DEPARE/DEPCNT/COALNE/SOUNDG, generic
-  land/water/contour names, neutral palette otherwise). No symbol
-  layers, so no glyphs/sprite endpoints are ever requested — labels
-  remain the future corridor-downloader side of the blueprint.
+  plain Leaflet. When the corridor downloader's asset manifest
+  (`/plugins/signalk-corridor-tile-downloader/assets/manifest.json`)
+  advertises a mirrored Open Waters `style` URL, that style is mounted
+  wholesale — full marine symbology (buoys by shape and colour,
+  lights, restricted-area hatching), bathymetry contours and soundings
+  with labels, base map and hillshade, online and offline alike —
+  while terrarium-DEM (`webp`) stores stay mirror internals and never
+  appear as overlays. For sources without a manifest the style is
+  composed client-side by the pure `maplibreStyleFor` (view-model):
+  one vector source on the chart's absolute tile URL (MapLibre's
+  blob-URL workers can't resolve relative paths) with native max zoom
+  — vector charts keep rendering past the raster maxNativeZoom
+  ceiling — plus a dark sea background and geometry-only
+  fill/line/circle layers with marine styling for known source-layer
+  families (S-57 LNDARE/DEPARE/DEPCNT/COALNE/SOUNDG ids and the
+  OSM-marine names the corridor cache carries: seamark, waterway,
+  wetland, sea_area, light as amber dots). Chart-mount failures are
+  logged instead of vanishing. Right-clicking a charted symbol
+  (lighthouse, seamark, peak, island) resolves its charted name and
+  seeds the sight form's *Object* field — bearings are taken to
+  identified objects, not bare coordinates.
 - **Plotter-extension status tile for Freeboard-SK (work doc #19)** —
   the plugin now registers a `plotterExtensions` resource provider
   (Plotter Extensions API v1) so chart plotters that host the

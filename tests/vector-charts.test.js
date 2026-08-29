@@ -64,6 +64,26 @@ test("isVectorChart: pbf yes, anything else no", async () => {
   assert.strictEqual(vm.isVectorChart(undefined), false);
 });
 
+test("chartAssetsFromManifest: only a manifest with an absolute style URL counts", async () => {
+  const vm = await loadVm();
+  const style =
+    "http://host:3000/plugins/signalk-corridor-tile-downloader/assets/style.json";
+  assert.deepStrictEqual(
+    vm.chartAssetsFromManifest({ style, fonts: ["Noto Sans Regular"] }),
+    { style },
+  );
+  // No style (older downloader / mirror incomplete) → callers keep the
+  // composed-style fallback.
+  assert.strictEqual(vm.chartAssetsFromManifest({ fonts: [] }), null);
+  assert.strictEqual(
+    vm.chartAssetsFromManifest({ style: "/plugins/relative/style.json" }),
+    null,
+  );
+  assert.strictEqual(vm.chartAssetsFromManifest(null), null);
+  assert.strictEqual(vm.chartAssetsFromManifest(undefined), null);
+  assert.strictEqual(vm.chartAssetsFromManifest("junk"), null);
+});
+
 test("maplibreStyleFor: vector source wired to the chart tilemapUrl with zooms", async () => {
   const vm = await loadVm();
   const style = vm.maplibreStyleFor(VECTOR_CHART);
@@ -75,6 +95,45 @@ test("maplibreStyleFor: vector source wired to the chart tilemapUrl with zooms",
   assert.strictEqual(source.minzoom, 8);
   // Native max — MapLibre overzooms vector data beyond it.
   assert.strictEqual(source.maxzoom, 14);
+});
+
+test("absoluteTileUrl: root-relative urls gain the page origin", async () => {
+  const vm = await loadVm();
+  const realLocation = globalThis.location;
+  globalThis.location = { origin: "http://localhost:3000" };
+  try {
+    assert.strictEqual(
+      vm.absoluteTileUrl("/signalk/v1/api/resources/charts/x/{z}/{x}/{y}"),
+      "http://localhost:3000/signalk/v1/api/resources/charts/x/{z}/{x}/{y}",
+    );
+    // Absolute URLs pass through untouched.
+    assert.strictEqual(
+      vm.absoluteTileUrl("http://lan:81/tiles/{z}/{x}/{y}.pbf"),
+      "http://lan:81/tiles/{z}/{x}/{y}.pbf",
+    );
+    // Placeholders must survive verbatim — URL() would percent-encode
+    // {z} to %7Bz%7D and MapLibre's substitution would miss it.
+    assert.ok(!vm.absoluteTileUrl("/a/{z}").includes("%7B"));
+  } finally {
+    if (realLocation === undefined) delete globalThis.location;
+    else globalThis.location = realLocation;
+  }
+});
+
+test("maplibreStyleFor: tile urls are absolute in a browser context", async () => {
+  const vm = await loadVm();
+  const realLocation = globalThis.location;
+  globalThis.location = { origin: "http://localhost:3000" };
+  try {
+    const style = vm.maplibreStyleFor(VECTOR_CHART);
+    const source = style.sources.passage_cache;
+    assert.deepStrictEqual(source.tiles, [
+      `http://localhost:3000${VECTOR_CHART.url}`,
+    ]);
+  } finally {
+    if (realLocation === undefined) delete globalThis.location;
+    else globalThis.location = realLocation;
+  }
 });
 
 test("maplibreStyleFor: background first, no symbol layers (no glyphs endpoint)", async () => {
@@ -107,6 +166,57 @@ test("maplibreStyleFor: S-57 source layers get their family styling", async () =
   // Fill families draw fills only, line families lines only.
   assert.ok(!byId["passage_cache-COALNE-fill"], "no coastline fill");
   assert.ok(!byId["passage_cache-SOUNDG-line"], "no sounding line");
+});
+
+test("maplibreStyleFor: OSM-marine source layers get themed styling", async () => {
+  const vm = await loadVm();
+  // The layer names the corridor downloader's OSM-derived tiles carry
+  // (as seen on the live server's passage_cache) — none of these may
+  // fall through to the neutral default, or the chart renders blank-ish.
+  const style = vm.maplibreStyleFor({
+    ...VECTOR_CHART,
+    chartLayers: [
+      "land",
+      "light",
+      "sea_area",
+      "seamark",
+      "water",
+      "waterway",
+      "wetland",
+    ],
+  });
+  const byId = Object.fromEntries(style.layers.map((l) => [l.id, l]));
+  // sea_area rides the water family.
+  assert.strictEqual(
+    byId["passage_cache-sea_area-fill"].paint["fill-color"],
+    "#102a3d",
+  );
+  // seamark: teal circle + line, distinct from the neutral gray default.
+  assert.strictEqual(
+    byId["passage_cache-seamark-circle"].paint["circle-color"],
+    "#9fd6d9",
+  );
+  assert.strictEqual(
+    byId["passage_cache-waterway-line"].paint["line-color"],
+    "#2f6a80",
+  );
+  assert.strictEqual(
+    byId["passage_cache-wetland-fill"].paint["fill-color"],
+    "#233830",
+  );
+  // lights are amber dots.
+  assert.strictEqual(
+    byId["passage_cache-light-circle"].paint["circle-color"],
+    "#e0b458",
+  );
+  // None of them keep the neutral default colors.
+  for (const id of [
+    "passage_cache-seamark-fill",
+    "passage_cache-waterway-fill",
+    "passage_cache-wetland-fill",
+  ]) {
+    assert.notStrictEqual(byId[id].paint["fill-color"], "#1c2830");
+  }
 });
 
 test("maplibreStyleFor: paint order — fills before lines before circles", async () => {
@@ -202,4 +312,20 @@ test("vendor wiring: renderer, bridge and licenses vendored and referenced", () 
   assert.match(mapView, /vendor\/maplibre-gl\/maplibre-gl\.css/);
   assert.match(mapView, /isVectorChart/);
   assert.match(mapView, /L\.maplibreGL/);
+  // Mirror-first discovery: the downloader's asset manifest, when it
+  // carries a style URL, replaces the composed styles wholesale.
+  assert.match(mapView, /signalk-corridor-tile-downloader\/assets\/manifest\.json/);
+  assert.match(mapView, /chartAssetsFromManifest/);
+  assert.match(mapView, /__chart_mirror__/);
+  // Terrarium DEM (webp) stores are mirror internals, never overlays.
+  assert.match(mapView, /format !== "webp"/);
+  // Picks resolve charted symbol names (lights, marks, peaks) so
+  // bearings are taken to identified objects.
+  assert.match(mapView, /pickSymbolName/);
+  const sightPanel = fs.readFileSync(
+    path.join(__dirname, "..", "public", "dr-sight-panel.js"),
+    "utf8",
+  );
+  assert.match(sightPanel, /seedObjectPosition\(lat, lon, mode, label\)/);
+  assert.match(sightPanel, /input\[name="object"\]/);
 });

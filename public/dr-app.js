@@ -228,11 +228,12 @@ class DrApp extends HTMLElement {
       .querySelector("#dr-recenter")
       ?.addEventListener("click", () => this.map?.recenter());
     // Chart pick: right-click an object on the map → open the sight
-    // dialog with the object position pre-seeded.
+    // dialog with the object position pre-seeded (and its charted name,
+    // when the picked symbol carries one — light, seamark, peak…).
     this.map?.addEventListener("dr-pick-position", (e) => {
-      const { lat, lng, mode } = e.detail;
+      const { lat, lng, mode, label } = e.detail;
       openSight();
-      this.sight?.seedObjectPosition(lat, lng, mode);
+      this.sight?.seedObjectPosition(lat, lng, mode, label);
     });
 
     /** @type {HTMLDialogElement|null} */

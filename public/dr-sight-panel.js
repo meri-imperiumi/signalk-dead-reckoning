@@ -571,21 +571,29 @@ class DrSightPanel extends HTMLElement {
    * Pre-seeds an object-position fieldset from a chart pick (right-click
    * → "Add bearing to here" / "Distance CPL at here"). Switches to the
    * matching tab and fills the object/center coordinates (overwriting any
-   * prior value — a fresh pick is intentional). Used by dr-app when the
-   * map dispatches `dr-pick-position`.
+   * prior value — a fresh pick is intentional), plus the object *name*
+   * when the pick resolved a charted symbol (light, seamark, peak…):
+   * bearings are taken to identified objects, not bare coordinates.
+   * Used by dr-app when the map dispatches `dr-pick-position`.
    *
    * @param {number} lat
    * @param {number} lon
    * @param {"bearing"|"vertical"} mode
+   * @param {string} [label] - charted name of the picked object, if any
    * @returns {void}
    */
-  seedObjectPosition(lat, lon, mode) {
+  seedObjectPosition(lat, lon, mode, label) {
     const prefix = mode === "vertical" ? "center" : "object";
     const tab = mode === "vertical" ? "vertical" : "bearing";
     this.switchTab(tab);
+    const form = this.shadowRoot.querySelector(`#form-${tab}`);
     const fs = this.shadowRoot.querySelector(
       `fieldset.coord[data-prefix="${prefix}"]`,
     );
+    if (typeof label === "string" && label.length > 0) {
+      const nameInput = form?.querySelector('input[name="object"]');
+      if (nameInput) nameInput.value = label;
+    }
     if (!fs) return;
     // Force-fill (a chart pick overwrites, no dirty check).
     seedCoord(fs, "lat", lat, true);

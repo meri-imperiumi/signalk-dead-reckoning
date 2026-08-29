@@ -563,14 +563,53 @@ export function isVectorChart(chart) {
 }
 
 /**
+ * Makes a chart tilemapUrl absolute for MapLibre's style. MapLibre fetches
+ * tiles from a blob-URL worker where root-relative URLs (`/signalk/…`)
+ * can't resolve — every request fails with "URL is not valid or contains
+ * user credentials" / "Failed to parse URL". Absolute http(s) URLs pass
+ * through; outside a browser (unit tests) there's no origin to prepend.
+ *
+ * @param {string} url - chart tilemapUrl, possibly root-relative
+ * @returns {string} absolute tile URL (or unchanged when no page origin)
+ */
+export function absoluteTileUrl(url) {
+  if (/^https?:\/\//i.test(url)) return url;
+  const origin = globalThis.location?.origin;
+  return origin && origin !== "null" ? `${origin}${url}` : url;
+}
+
+/**
+ * Validates the corridor downloader's asset manifest
+ * (`/plugins/signalk-corridor-tile-downloader/assets/manifest.json`). When the
+ * downloader has mirrored the upstream chart style, the manifest carries
+ * its local `style` URL — the map view then mounts that style wholesale
+ * (full symbology, base map, bathymetry) instead of composing the
+ * geometry-only fallback style here. Anything that isn't a manifest with
+ * a usable style URL yields null so callers keep their fallback.
+ *
+ * @param {object|null|undefined} value - parsed manifest response body
+ * @returns {{style: string}|null}
+ */
+export function chartAssetsFromManifest(value) {
+  if (!value || typeof value !== "object") return null;
+  const style = value.style;
+  if (typeof style !== "string" || !/^https?:\/\//i.test(style)) {
+    return null;
+  }
+  return { style };
+}
+
+/**
  * Marine-tactical palette for the generated vector style: dark sea
  * background to match the app theme, land/depth families keyed by the
  * source-layer names chart producers actually use (S-57 ENC layer ids
  * from NOAA-converted MBTiles, generic OSM-ish names otherwise).
- * Geometry-only — no symbol layers, so no glyphs/sprite endpoints are
- * ever requested (offline-first; labels are the downloader-side seam).
+ * Geometry-only — this is the FALLBACK style for chart sources without
+ * a mirrored upstream style (chartAssetsFromManifest): when the corridor
+ * downloader serves the Open Waters style mirror, the map view mounts
+ * that instead, with the full symbology, labels, and hillshade.
  *
- * @typedef {{kind: "land"|"water"|"coastline"|"contour"|"point", styles: object}} VectorLayerFamily
+ * @typedef {{kind: "land"|"water"|"waterway"|"wetland"|"seamark"|"coastline"|"contour"|"point"|"light", styles: object}} VectorLayerFamily
  */
 const VECTOR_LAYER_FAMILIES = [
   // Land masses and built-up areas → solid dark-olive fills.
@@ -585,10 +624,38 @@ const VECTOR_LAYER_FAMILIES = [
   // Depth / water areas → translucent deep-blue fills.
   {
     kind: "water",
-    match: [/^water$/i, /^depare$/i, /^sea$/i, /^ocean$/i],
+    match: [/^water$/i, /^depare$/i, /^sea$/i, /^ocean$/i, /^sea_area$/i],
     styles: {
       fill: { "fill-color": "#102a3d", "fill-opacity": 0.55 },
       line: { "line-color": "#1c3c52", "line-width": 0.5 },
+    },
+  },
+  // Rivers / channels / canals → water-toned fills and lines.
+  {
+    kind: "waterway",
+    match: [/^waterway$/i, /^river$/i, /^canal$/i, /^stream$/i],
+    styles: {
+      fill: { "fill-color": "#14324a", "fill-opacity": 0.5 },
+      line: { "line-color": "#2f6a80", "line-width": 1 },
+    },
+  },
+  // Marsh / mangrove → muted green fills between land and water.
+  {
+    kind: "wetland",
+    match: [/^wetland$/i, /^marsh/i, /^mangrove$/i],
+    styles: {
+      fill: { "fill-color": "#233830", "fill-opacity": 0.6 },
+      line: { "line-color": "#35503f", "line-width": 0.6 },
+    },
+  },
+  // Buoys, beacons, restricted areas, moorings → visible teal marks.
+  {
+    kind: "seamark",
+    match: [/^seamark$/i, /^navigation/i],
+    styles: {
+      fill: { "fill-color": "#16394a", "fill-opacity": 0.45 },
+      line: { "line-color": "#4b8b99", "line-width": 0.9 },
+      circle: { "circle-color": "#9fd6d9", "circle-radius": 2 },
     },
   },
   // Coastlines → the crisp reference edge over the fills.
@@ -613,6 +680,15 @@ const VECTOR_LAYER_FAMILIES = [
     match: [/^soundg$/i, /^sounding/i, /^soundings$/i],
     styles: {
       circle: { "circle-color": "#4b8b99", "circle-radius": 1.5 },
+    },
+  },
+  // Lights (lighthouses, beacons) → amber dots that read instantly.
+  {
+    kind: "light",
+    match: [/^lights?$/i],
+    styles: {
+      circle: { "circle-color": "#e0b458", "circle-radius": 2.5 },
+      line: { "line-color": "#e0b458", "line-width": 0.6 },
     },
   },
 ];
@@ -643,8 +719,9 @@ function vectorLayerFamily(layerId) {
 
 /**
  * Builds a complete MapLibre style for a vector chart layer, entirely
- * client-side: one vector source on the chart's `tilemapUrl` (relative
- * URLs resolve against the app origin), a dark sea background, and a
+ * client-side: one vector source on the chart's `tilemapUrl` (made
+ * absolute — MapLibre's tile workers can't resolve relative URLs), a dark
+ * sea background, and a
  * fill/line/circle trio per source layer — a line layer only draws line
  * features, fills only polygons, circles only points, so the trio covers
  * any geometry without knowing the schema. The source's `maxzoom` is the
@@ -683,9 +760,19 @@ export function maplibreStyleFor(chart) {
     },
   ];
   // Paint order matters: area fills under lines under points; land
-  // before water so islands don't drown (both translucent otherwise).
+  // before water so islands don't drown (both translucent otherwise);
+  // seamark areas above the natural families so marks stay legible.
   const byKind = (kind) => families.filter((f) => f.family.kind === kind);
-  for (const kind of ["land", "water", "default", "coastline", "contour"]) {
+  for (const kind of [
+    "land",
+    "water",
+    "waterway",
+    "wetland",
+    "seamark",
+    "default",
+    "coastline",
+    "contour",
+  ]) {
     for (const { id, family } of byKind(kind)) {
       if (!family.styles.fill) continue;
       layers.push({
@@ -724,7 +811,7 @@ export function maplibreStyleFor(chart) {
     sources: {
       [sourceId]: {
         type: "vector",
-        tiles: [chart.url],
+        tiles: [absoluteTileUrl(chart.url)],
         minzoom: chart.minZoom,
         maxzoom: chart.maxZoom,
       },

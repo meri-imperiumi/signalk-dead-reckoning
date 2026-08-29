@@ -213,8 +213,11 @@ class DrMapView extends HTMLElement {
       this.follow = false;
     });
     // Chart pick: right-click / long-press opens a small context menu
-    // to pre-seed a sight form with the picked object position.
-    this.map.on("contextmenu", (e) => this.showPickMenu(e.latlng));
+    // to pre-seed a sight form with the picked object position (and the
+    // object's charted name, when a symbol was hit — see pickSymbolName).
+    this.map.on("contextmenu", (e) =>
+      this.showPickMenu(e.latlng, e.containerPoint),
+    );
     // Shadow DOM layout settles asynchronously after connectedCallback;
     // force Leaflet to recompute the container size on every resize or
     // tiles render jumbled and markers land off-screen.
@@ -233,34 +236,84 @@ class DrMapView extends HTMLElement {
     // when available, else the OSM online fallback. The first provider is
     // auto-selected either way — a blank chart on open reads as broken
     // (user feedback 2026-09); switching offline is one tap in the control.
-    // Vector charts (`format: 'pbf'`, work doc #20) mount MapLibre GL as
-    // one Leaflet layer via the vendored bridge; raster stay L.tileLayer.
-    fetch("/signalk/v1/api/resources/charts")
+    // Vector charts mount through MapLibre (work doc #20) in one of two
+    // modes: the corridor downloader's MIRRORED upstream style (full
+    // symbology — base map, bathymetry, labels, hillshade — discovered via
+    // its asset manifest) when available, else per-chart geometry-only
+    // styles composed client-side. Raster charts stay L.tileLayer; WebP
+    // (terrarium DEM) stores are mirror internals, never image overlays.
+    const chartsReady = fetch("/signalk/v1/api/resources/charts").then((r) =>
+      r.ok ? r.json() : null,
+    );
+    const manifestReady = fetch(
+      "/plugins/signalk-corridor-tile-downloader/assets/manifest.json",
+    )
       .then((r) => (r.ok ? r.json() : null))
-      .then((resource) => {
+      .catch(() => null);
+    Promise.all([chartsReady, manifestReady])
+      .then(([resource, manifest]) => {
         const configured = vm.parseChartLayers(resource);
         const charts =
           configured.length > 0 ? configured : [vm.DEFAULT_OSM_LAYER];
+        const vectorCharts = charts.filter((c) => vm.isVectorChart(c));
+        const rasterCharts = charts.filter(
+          (c) => !vm.isVectorChart(c) && c.format !== "webp",
+        );
         const bases = {};
-        for (const c of charts) {
+        const ordered = [];
+        const addBase = (label, layer) => {
+          // The control is keyed by display name — dedupe so two charts
+          // sharing a name don't clobber each other's radio entry.
+          let name = label;
+          for (let n = 2; bases[name]; n++) name = `${label} (${n})`;
+          bases[name] = layer;
+          ordered.push(layer);
+        };
+        const assets = vm.chartAssetsFromManifest(manifest);
+        let vectorMounted = false;
+        if (assets) {
+          if (typeof L.maplibreGL === "function") {
+            this.tileLayers.__chart_mirror__ = L.maplibreGL({
+              style: assets.style,
+            });
+            addBase("Open Waters chart", this.tileLayers.__chart_mirror__);
+            vectorMounted = true;
+          } else {
+            console.warn(
+              "mirrored chart style skipped: MapLibre bridge not loaded",
+            );
+          }
+        }
+        if (!vectorMounted) {
+          for (const c of vectorCharts) {
+            const layer = this.chartLayer(c);
+            if (!layer) continue;
+            this.tileLayers[c.identifier] = layer;
+            addBase(c.name, layer);
+          }
+        }
+        for (const c of rasterCharts) {
           const layer = this.chartLayer(c);
           if (!layer) continue;
           this.tileLayers[c.identifier] = layer;
-          // The control is keyed by display name — dedupe so two charts
-          // sharing a name don't clobber each other's radio entry.
-          let label = c.name;
-          for (let n = 2; bases[label]; n++) label = `${c.name} (${n})`;
-          bases[label] = layer;
+          addBase(c.name, layer);
         }
-        // Default to the first chart provider (list is name-sorted):
-        // first configured chart, or the OSM fallback when none.
-        this.tileLayers[charts[0].identifier]?.addTo(this.map);
+        // Default: the mirrored/composed vector chart when present, else
+        // the first configured provider (list is name-sorted).
+        const first =
+          this.tileLayers.__chart_mirror__ ??
+          this.tileLayers[charts[0].identifier] ??
+          ordered[0];
+        first?.addTo(this.map);
         if (Object.keys(bases).length > 1 || configured.length === 0) {
           L.control.layers(bases, {}, { collapsed: true }).addTo(this.map);
         }
       })
-      .catch(() => {
-        /* tile-less stays */
+      .catch((e) => {
+        // Offline stays tile-less by design, but a chart that fails to
+        // *mount* (e.g. MapLibre rejecting the style) must not vanish
+        // silently — that reads as "charts don't render" with no trace.
+        console.warn("chart layers not mounted:", e?.message || e);
       });
   }
 
@@ -301,22 +354,66 @@ class DrMapView extends HTMLElement {
   }
 
   /**
+   * Resolves the charted name of the symbol nearest a Leaflet container
+   * point — lights, seamarks, peaks, place labels rendered by the
+   * mirrored chart style (the composed fallback has no symbols).
+   * Bearings are taken to identified objects, so the pick menu and the
+   * sight form carry the name whenever one is hit. Small catchment box:
+   * an exact point query misses thin icons at high DPI.
+   *
+   * @param {L.Point|null|undefined} containerPoint
+   * @returns {string|null} symbol name, or null when nothing named is hit
+   */
+  pickSymbolName(containerPoint) {
+    const mirror = this.tileLayers.__chart_mirror__;
+    const gl = mirror?.getMaplibreMap?.();
+    if (!gl || !containerPoint) return null;
+    try {
+      // The bridge pads the GL canvas around the Leaflet viewport by
+      // `options.padding` (default 0.1) of the map size on each side —
+      // translate Leaflet container coords into GL canvas coords.
+      const size = this.map.getSize();
+      const pad = mirror.options?.padding ?? 0.1;
+      const x = containerPoint.x + size.x * pad;
+      const y = containerPoint.y + size.y * pad;
+      const hits = gl.queryRenderedFeatures({
+        left: x - 5,
+        top: y - 5,
+        right: x + 5,
+        bottom: y + 5,
+      });
+      for (const f of hits) {
+        if (f.layer?.type !== "symbol") continue;
+        const name = f.properties?.name;
+        if (typeof name === "string" && name.length > 0) return name;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Shows a small context menu at a chart point offering to pre-seed a
    * sight form with that position as the object. Dispatches
-   * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode }`.
+   * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode, label }`
+   * — `label` carries the picked symbol's charted name, when one was hit.
    *
    * @param {L.LatLng} latlng
+   * @param {L.Point|null|undefined} [containerPoint]
    * @returns {void}
    */
-  showPickMenu(latlng) {
+  showPickMenu(latlng, containerPoint) {
     // Remove any prior menu.
     this.hidePickMenu();
+    const label = this.pickSymbolName(containerPoint);
     const menu = document.createElement("div");
     menu.className = "dr-pick-menu";
-    menu.textContent = "Add observation at this point…";
+    const what = label ?? "this point";
+    menu.textContent = `Add observation at ${what}…`;
     const items = [
-      { label: " Bearing to here", mode: "bearing" },
-      { label: " Distance CPL at here", mode: "vertical" },
+      { label: ` Bearing to ${what}`, mode: "bearing" },
+      { label: ` Distance CPL at ${what}`, mode: "vertical" },
     ];
     for (const it of items) {
       const btn = document.createElement("button");
@@ -327,7 +424,12 @@ class DrMapView extends HTMLElement {
           new CustomEvent("dr-pick-position", {
             bubbles: true,
             composed: true,
-            detail: { lat: latlng.lat, lng: latlng.lng, mode: it.mode },
+            detail: {
+              lat: latlng.lat,
+              lng: latlng.lng,
+              mode: it.mode,
+              ...(label ? { label } : {}),
+            },
           }),
         );
       });
