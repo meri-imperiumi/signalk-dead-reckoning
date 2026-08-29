@@ -12,6 +12,7 @@ const { DatabaseSync } = require("node:sqlite");
 
 const makePlugin = require("../plugin/index.js");
 const celestial = require("../plugin/celestial.js");
+const { bearingDeg } = require("../plugin/geo.js");
 const {
   openDatabase,
   recordFix,
@@ -3699,4 +3700,197 @@ test("ground-track samples survive a plugin restart and still advance fixes (wor
   assert.strictEqual(byId[late].displacement, null);
   plugin2.stop();
   app.subscriptionmanager.subscriptions.length = 0;
+});
+
+test("magnetic heading + variation steers DR by true heading; source surfaces in status", async () => {
+  const { app, plugin, router } = makeStarted();
+  // Magnetic 089° with 11°E variation (Aitutaki–Niue magnitudes) →
+  // true 100°: DR must run east-southeast, not due east.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: -19, longitude: -165 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingMagnetic", value: (89 * Math.PI) / 180 },
+          { path: "navigation.magneticVariation", value: (11 * Math.PI) / 180 },
+          { path: "navigation.magneticVariation.source", value: "WMM 2025" },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 4500));
+  const positions = lastValues(app, "navigation.deadReckoning.position");
+  assert.ok(positions.length > 1, "DR positions published");
+  const p0 = positions[0];
+  const p1 = positions[positions.length - 1];
+  const moved = Math.hypot(
+    p1.latitude - p0.latitude,
+    p1.longitude - p0.longitude,
+  );
+  assert.ok(moved > 1e-5, `DR advanced (${moved} deg)`);
+  const brg = bearingDeg(p0, p1);
+  assert.ok(
+    Math.abs(brg - 100) < 3,
+    `DR track should bear ~100°T (magnetic 089° + 11°E variation), got ${brg}`,
+  );
+  // The watchkeeper can verify what steers DR, and from which model.
+  const { status, body } = router.invoke("get", "/status");
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.heading.mode, "magnetic+variation");
+  assert.strictEqual(body.heading.variationSource, "WMM 2025");
+  // A current model epoch does not warn.
+  assert.ok(
+    !app.statusMessages.some((m) => /variation source/.test(m)),
+    "no stale-variation warning for a current model",
+  );
+  plugin.stop();
+});
+
+test("magnetic heading without variation falls back uncorrected (legacy behavior)", async () => {
+  const { app, plugin, router } = makeStarted();
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: -19, longitude: -165 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingMagnetic", value: (90 * Math.PI) / 180 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 4500));
+  const positions = lastValues(app, "navigation.deadReckoning.position");
+  assert.ok(positions.length > 1, "DR positions published");
+  const p0 = positions[0];
+  const p1 = positions[positions.length - 1];
+  const brg = bearingDeg(p0, p1);
+  assert.ok(
+    Math.abs(brg - 90) < 3,
+    `uncorrected magnetic due east, got ${brg}`,
+  );
+  const { status, body } = router.invoke("get", "/status");
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.heading.mode, "magnetic");
+  assert.strictEqual(body.heading.variationSource, null);
+  plugin.stop();
+});
+
+test("expired WMM model epoch warns via plugin status", async () => {
+  const { app, plugin } = makeStarted();
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: -19, longitude: -165 },
+          },
+          { path: "navigation.magneticVariation.source", value: "WMM 2015" },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 2500));
+  assert.ok(
+    app.statusMessages.some((m) => /WMM 2015/.test(m) && /variation/.test(m)),
+    `expected a stale-model warning, got: ${JSON.stringify(app.statusMessages)}`,
+  );
+  plugin.stop();
+});
+
+test("self-published headingTrue echo is ignored (no feedback freeze)", async () => {
+  const { app, plugin } = makeStarted();
+  // Magnetic-only boat with variation: 089° + 11°E → true 100°.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: -19, longitude: -165 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingMagnetic", value: (89 * Math.PI) / 180 },
+          { path: "navigation.magneticVariation", value: (11 * Math.PI) / 180 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 3000));
+  // Feed our own published headingTrue back the way a real server does
+  // (self-labeled), carrying a wrong value (000°): it must be ignored —
+  // otherwise DR steering freezes on the echo instead of the live
+  // magnetic + variation.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        source: { label: "signalk-dead-reckoning", src: "dr" },
+        values: [{ path: "navigation.headingTrue", value: 0 }],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 3000));
+  // The plugin's own published headingTrue is the computed true value —
+  // not the injected 0°, and not the raw magnetic 089° either.
+  const echoes = lastValues(app, "navigation.headingTrue");
+  assert.ok(echoes.length > 0, "plugin publishes headingTrue");
+  const last = (echoes[echoes.length - 1] * 180) / Math.PI;
+  assert.ok(Math.abs(last - 100) < 1, `published headingTrue ${last}°`);
+  // And DR still steers by magnetic+variation.
+  const positions = lastValues(app, "navigation.deadReckoning.position");
+  assert.ok(positions.length > 1);
+  const brg = bearingDeg(positions[0], positions[positions.length - 1]);
+  assert.ok(Math.abs(brg - 100) < 3, `DR track ${brg}° after echo injection`);
+  plugin.stop();
+});
+
+test("bus headingTrue is used as-is — variation never applied twice", async () => {
+  const { app, plugin, router } = makeStarted();
+  // Instruments publish a corrected true heading directly, alongside the
+  // magnetic heading and variation it was derived from. DR must steer by
+  // the bus value (100°), not 100° + 11°.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: -19, longitude: -165 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: (100 * Math.PI) / 180 },
+          { path: "navigation.headingMagnetic", value: (89 * Math.PI) / 180 },
+          { path: "navigation.magneticVariation", value: (11 * Math.PI) / 180 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 3500));
+  const positions = lastValues(app, "navigation.deadReckoning.position");
+  assert.ok(positions.length > 1, "DR positions published");
+  const p0 = positions[0];
+  const p1 = positions[positions.length - 1];
+  const brg = bearingDeg(p0, p1);
+  assert.ok(
+    Math.abs(brg - 100) < 3,
+    `DR track ${brg}° (expected ~100, not 111)`,
+  );
+  const { status, body } = router.invoke("get", "/status");
+  assert.strictEqual(status, 200);
+  assert.strictEqual(body.heading.mode, "true");
+  plugin.stop();
 });

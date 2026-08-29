@@ -65,6 +65,7 @@ const {
 const {
   distanceNm,
   bearingDeg,
+  normalizeDeg360,
   METRES_PER_NM,
   knotsToMs,
   msToKnots,
@@ -222,6 +223,13 @@ const SUBSCRIPTION_PATHS = [
   "navigation.speedThroughWater",
   "navigation.headingMagnetic",
   "navigation.headingTrue",
+  // Variation (rad, east-positive) converts the magnetic-heading
+  // fallback to true heading — without it a magnetic-only install
+  // would dead-reckon off by the local variation (~11°E on the
+  // Aitutaki–Niue route). The .source path carries the variation
+  // provider's label (e.g. "WMM 2025") for epoch checking.
+  "navigation.magneticVariation",
+  "navigation.magneticVariation.source",
   "navigation.attitude",
   "environment.wind.angleApparent",
   "environment.wind.speedApparent",
@@ -449,6 +457,22 @@ module.exports = (app) => {
    * @type {{setTrue: number, drift: number, tier: number, source: string}|null}
    */
   let lastCurrent = null;
+
+  /**
+   * Which heading mode is steering the DR this tick — "true",
+   * "magnetic+variation", "magnetic" (uncorrected fallback), or null —
+   * plus the variation provider's source label (e.g. "WMM 2025") when
+   * one is subscribed. Surfaced via GET /status so the watchkeeper can
+   * verify DR is steering by true heading rather than trusting it.
+   * @type {{mode: string|null, variationSource: string|null}}
+   */
+  let headingSourceInfo = { mode: null, variationSource: null };
+
+  /** Variation source label last seen (raw, for the epoch check). */
+  let variationSource = null;
+
+  /** Variation source label already epoch-checked — warn once per label. */
+  let variationEpochChecked = null;
 
   /**
    * GPS-derived vessel speed (kn) from consecutive fixes — the motion
@@ -945,6 +969,19 @@ module.exports = (app) => {
     if (!delta?.updates) return;
     for (const update of delta.updates) {
       if (!update.values) continue;
+      // Our own published deltas come back through the subscription on a
+      // real server (publish targets vessels.self — the same paths we
+      // subscribe to). Ingesting them would close feedback loops: the
+      // headingTrue we publish would shadow the live magnetic heading +
+      // variation, freezing DR's steering at the first tick's value.
+      // Self-sourced updates are skipped.
+      if (
+        update.source?.label === PLUGIN_ID ||
+        (typeof update.$source === "string" &&
+          update.$source.includes(PLUGIN_ID))
+      ) {
+        continue;
+      }
       for (const v of update.values) {
         deltaState.set(v.path, v.value);
         // Seed the engine origin from the first GPS fix if we have none yet.
@@ -1066,14 +1103,57 @@ module.exports = (app) => {
     if (engine.logNmSinceOrigin < prevLogNm) idleRunNm = 0;
     prevLogNm = engine.logNmSinceOrigin;
 
-    // Heading: prefer true heading; fall back to magnetic (WMM correction
-    // applied upstream in v1 — see SPEC §12). If neither, hold position.
-    const headingTrueDeg =
-      headingTrueRad == null
-        ? headingMagRad == null
-          ? null
-          : radToDeg(headingMagRad)
-        : radToDeg(headingTrueRad);
+    // Heading: prefer true heading; fall back to magnetic corrected by
+    // the subscribed `navigation.magneticVariation` (rad, east-positive).
+    // Without a variation source the fallback would steer DR by the
+    // local variation (~11°E on the Aitutaki–Niue route) — kept for
+    // magnetic-only installs as the lesser evil, since DR that runs
+    // slightly wrong still tracks the ground track for running fixes.
+    // `headingSourceInfo` surfaces which mode is steering (plus the
+    // variation provider's own source label, e.g. "WMM 2025") so the
+    // watchkeeper can verify it instead of trusting it silently.
+    const variationRad = unwrapNumber(
+      deltaState.get("navigation.magneticVariation"),
+    );
+    const variationSourceRaw = deltaState.get(
+      "navigation.magneticVariation.source",
+    );
+    variationSource =
+      typeof variationSourceRaw === "string"
+        ? variationSourceRaw
+        : typeof variationSourceRaw?.value === "string"
+          ? variationSourceRaw.value
+          : null;
+    let headingTrueDeg = null;
+    if (headingTrueRad != null) {
+      headingTrueDeg = radToDeg(headingTrueRad);
+      headingSourceInfo = { mode: "true", variationSource };
+    } else if (headingMagRad != null) {
+      if (variationRad != null) {
+        headingTrueDeg = normalizeDeg360(
+          radToDeg(headingMagRad) + radToDeg(variationRad),
+        );
+        headingSourceInfo = { mode: "magnetic+variation", variationSource };
+      } else {
+        headingTrueDeg = radToDeg(headingMagRad);
+        headingSourceInfo = { mode: "magnetic", variationSource: null };
+      }
+    } else {
+      headingSourceInfo = { mode: null, variationSource };
+    }
+    // WMM-style variation sources carry a model epoch ("WMM 2025"),
+    // valid ~5 years. Past that the variation — and with it the
+    // magnetic-heading fallback — starts drifting; warn once per source
+    // label (§12-style expiry warning, mirroring the star almanac's).
+    if (variationSource && variationSource !== variationEpochChecked) {
+      variationEpochChecked = variationSource;
+      const epochYear = /\d{4}/.exec(variationSource);
+      if (epochYear && new Date().getFullYear() > Number(epochYear[0]) + 5) {
+        setStatus(
+          `Magnetic variation source "${variationSource}" is past its ~${Number(epochYear[0]) + 5} model validity — heading may drift`,
+        );
+      }
+    }
 
     // §3.1 `inertial-polar` (work doc #18): polar-derived STW fallback.
     // When the paddlewheel is missing (null) or sustained-fouled (§6.3
@@ -1416,7 +1496,13 @@ module.exports = (app) => {
         // path stays silent while on the fallback rather than publishing
         // a model value that masquerades as one (work doc #18).
         ...(onPolar ? {} : { [PATHS.stw]: stwMs }),
-        [PATHS.headingTrue]: headingTrueRad ?? headingMagRad,
+        // The computed true heading — headingTrue from the bus when it
+        // has one, magnetic + variation otherwise. Never the raw
+        // magnetic value: publishing that as headingTrue would both lie
+        // to other consumers and (via the subscription echo) freeze DR's
+        // steering at a stale value.
+        [PATHS.headingTrue]:
+          headingTrueDeg == null ? null : degToRad(headingTrueDeg),
         // §6.2 resolved vector on the standard current paths, in SI
         // units (setTrue rad, drift m/s). The DR-specific enrichment
         // (tier, source, manual-override TTL) rides REST /status.
@@ -2034,6 +2120,10 @@ module.exports = (app) => {
         // the UI's header readout can bootstrap without a delta.
         current: lastCurrent,
         manualCurrent,
+        // Which heading mode steers DR + the variation provider's label
+        // (e.g. "WMM 2025") — the watchkeeper's verification that DR is
+        // running on true heading, not magnetic-as-true.
+        heading: headingSourceInfo,
         // Work doc #23: the shadow vessel's context, when enabled, so
         // the DR webapp can filter it from its AIS target layer (the
         // webapp already renders the DR position as its own marker).

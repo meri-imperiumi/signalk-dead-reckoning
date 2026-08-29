@@ -32,6 +32,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no fix, rather than silently projecting a stale fix position.
 
 ### Fixed
+- **Moon sights were unusable: the lunar ephemeris was off by up to 1.5°
+  in GHA** (~90 NM of LOP error) despite its stated "~0.1°" accuracy
+  — the two-term truncation was nowhere near that. Moon GHA/Dec,
+  semi-diameter and horizontal parallax are now computed by
+  astronomy-engine to arcsecond class, with the distance-driven SD/HP
+  varying correctly over the anomalistic month (the previously fixed
+  SD 0.2725°/HP 0.95° were up to ~2′ wrong near apogee). Pinned by
+  snapshot tests and sanity-checked against the Astronomical Almanac's
+  low-precision series.
+- **DR no longer steers by raw magnetic heading when a variation source
+  is available.** The magnetic-heading fallback was used directly as
+  true heading, with no variation applied anywhere in the plugin — on
+  the Aitutaki–Niue route that would have steered the shadow boat
+  ~11° off (≈110 NM of lateral error over the passage) while
+  everything looked healthy. The plugin now subscribes to
+  `navigation.magneticVariation` (radians, east-positive) and applies it
+  to the fallback; `navigation.magneticVariation.source` (e.g.
+  "WMM 2025") is recorded and surfaced in `GET /status` as
+  `heading.mode` ("true" | "magnetic+variation" | "magnetic") plus
+  `heading.variationSource`, so the watchkeeper can verify what steers
+  DR instead of trusting it silently. A WMM-style source label past its
+  ~5-year model epoch ("WMM 2015") raises a plugin-status warning the
+  same way the star-almanac expiry does. Boats with no variation
+  source keep the old behavior (magnetic as-is) — visible as
+  `heading.mode: "magnetic"`.
+- **The plugin no longer ingests its own published deltas.** `publish`
+  targets `vessels.self` — the same paths the plugin subscribes to — so
+  on a real server its output came straight back through the
+  subscription. Two consequences: the `headingTrue` it published
+  (which, on a magnetic-only boat, was the raw magnetic value) would
+  shadow the live heading and **freeze DR's steering at the first
+  tick's value** for the rest of the passage; and the same echo
+  pattern could close feedback loops on any other published path.
+  Self-sourced updates (matched on the publish source label) are now
+  skipped at ingestion, and the published `headingTrue` is the
+  computed true heading — bus value when present, magnetic + variation
+  otherwise — never raw magnetic. The fake app in tests never fed
+  handleMessage output back, which is why the loop was invisible
+  there; new tests simulate the echo explicitly.
+- **The bundled star almanac's SHA values were wrong for several
+  stars, and mixed reference epochs.** Regulus was 12.5° off (~750 NM
+  of LOP error for anyone who sighted it), Hamal 2.9°, Polaris 3.1°,
+  Sirius/Schedar/Antares/Markab/Dubhe/Capella ~0.4° each; "Capella2"
+  was a duplicate of Capella; and the J2000 table was used with
+  of-date sidereal time, adding a systematic ~20′ (equinox precession)
+  to every star LOP by 2026. The table is now consistent J2000 mean
+  places — verified entry-by-entry against a Hipparcos-derived catalog
+  (d3-celestial's stars.6.json) to within ~0.5′ — and five southern-sky
+  navigational stars are bundled (Acrux, Hadar, Achernar, Miaplacidus,
+  Peacock): the South Pacific latitudes fix by the Southern Cross, not
+  Polaris. The of-date conversion is now the library's full
+  precession/nutation/aberration (see the ephemeris entry above).
 - **The multi-fix resolver now actually converges on the least-squares
   fix.** `leastSquaresFit()` — used for any fix combining three or more
   lines/circles of position, and as the fallback when two don't
@@ -70,6 +122,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate); no migration is needed.
 
 ### Changed
+- **Celestial ephemerides are now computed by astronomy-engine** (MIT,
+  pure JS, zero sub-dependencies, fully offline — 1.8 MB installed):
+  Sun and Moon geocentric apparent places (nautical-almanac
+  convention: geocentric, coordinates of date, parallax applied as a
+  sight correction rather than baked into the GP), stars from the
+  bundled J2000 almanac converted to the date by the library's
+  precession/nutation/aberration. The hand-rolled formulas — verified
+  against an independent Meeus reduction when written, but
+  hand-maintained data and truncations forever — are retired in favor
+  of a maintained library; the trade is 1.8 MB of disk against a reef.
+  The unused suncalc runtime dependency is removed. The wiring is
+  pinned in tests/ephemeris.test.js by snapshots plus independent
+  anchors: a from-scratch Meeus reduction for the Sun (≤0.7′, the
+  anchor's own accuracy class), the AA low-precision series for the
+  Moon (≤20′), and paper-almanac star values.
 - **The webapp's "Ghost Track" heading above the map is gone.** It
   wasted vertical space the map could use — the map card now opens with
   no chrome above it, so the chart starts higher on the page. The

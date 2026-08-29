@@ -1,34 +1,67 @@
 /**
  * Tests for celestial sight reduction (SPEC §13).
  *
- * Hc/Zn are cross-validated against suncalc (an independent implementation)
- * for the Sun; the star path is validated structurally and against the
- * Polaris special case (altitude ≈ observer latitude at high northern
- * latitudes; azimuth ≈ due north).
+ * Hc/Zn are cross-validated against astronomy-engine's Horizon (an
+ * independent horizontal-coordinate path through the same library) for
+ * the Sun; the star path is validated against paper-almanac anchors.
+ * Ephemeris snapshots and almanac anchors live in tests/ephemeris.test.js.
  * @file celestial.test.js
  */
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const suncalc = require("suncalc");
+const Astronomy = require("astronomy-engine");
 const celestial = require("../plugin/celestial.js");
 const almanac = require("../plugin/star-almanac.js");
 
-/** suncalc azimuth is measured from south, westward; convert to true bearing from north. */
-function suncalcBearing(p) {
-  return ((p.azimuth * 180) / Math.PI + 180 + 360) % 360;
+/** Sidereal time (GAST) in degrees, for deriving SHA of date from GHA. */
+function gastDeg(ms) {
+  return Astronomy.SiderealTime(new Date(ms)) * 15;
 }
 
-test("gmstDeg is in [0, 360) and advances ~15°/hour", () => {
-  const t0 = new Date("2026-01-01T00:00:00Z").getTime();
-  const t1 = t0 + 3600 * 1000; // +1h
-  const g0 = celestial.gmstDeg(t0);
-  const g1 = celestial.gmstDeg(t1);
-  assert.ok(g0 >= 0 && g0 < 360);
-  assert.ok(g1 >= 0 && g1 < 360);
-  const diff = (g1 - g0 + 360) % 360;
-  assert.ok(Math.abs(diff - 15.04) < 0.1, `expected ~15.04°/h, got ${diff}`);
+test("computeHcZn matches astronomy-engine Horizon (independent cross-check)", () => {
+  const cases = [
+    { t: "2026-06-21T10:00:00Z", obs: { latitude: 40, longitude: -70 } },
+    { t: "2026-12-21T22:00:00Z", obs: { latitude: 60, longitude: 5 } },
+    { t: "2026-09-23T12:00:00Z", obs: { latitude: -35, longitude: 18 } },
+    { t: "2026-08-15T22:30:00Z", obs: { latitude: -19, longitude: -165 } },
+  ];
+  for (const { t, obs } of cases) {
+    const ms = new Date(t).getTime();
+    const gp = celestial.sunGeographicPosition(ms);
+    const { hc_deg, zn_deg } = celestial.computeHcZn(obs, gp);
+    // Horizon path: the library's own horizontal-coordinate transform
+    // (refraction off — Hc is geometric).
+    const eq = Astronomy.Equator(
+      Astronomy.Body.Sun,
+      new Date(ms),
+      new Astronomy.Observer(obs.latitude, obs.longitude, 0),
+      true,
+      false,
+    );
+    const h = Astronomy.Horizon(
+      new Date(ms),
+      new Astronomy.Observer(obs.latitude, obs.longitude, 0),
+      eq.ra,
+      eq.dec,
+      null,
+    );
+    const aeAlt = h.altitude;
+    // astronomy-engine azimuth is measured clockwise from north.
+    assert.ok(
+      Math.abs(hc_deg - aeAlt) < 0.01,
+      `${t}: Hc ${hc_deg.toFixed(4)} vs astro-engine ${aeAlt.toFixed(4)}`,
+    );
+    if (aeAlt > 5) {
+      let dAz = Math.abs(zn_deg - h.azimuth);
+      dAz = Math.min(dAz, 360 - dAz);
+      assert.ok(
+        dAz < 0.05,
+        `${t}: Zn ${zn_deg.toFixed(3)} vs astro-engine ${h.azimuth.toFixed(3)}`,
+      );
+    }
+  }
 });
 
 test("sunGeographicPosition: Dec ≈ 23.44° at the June solstice", () => {
@@ -42,35 +75,6 @@ test("sunGeographicPosition: Dec ≈ -23.44° at the December solstice", () => {
   const t = new Date("2026-12-21T22:00:00Z").getTime();
   const gp = celestial.sunGeographicPosition(t);
   assert.ok(Math.abs(gp.declination_deg - -23.44) < 0.2);
-});
-
-test("computeHcZn matches suncalc altitude and azimuth (independent cross-check)", () => {
-  const cases = [
-    { t: "2026-06-21T10:00:00Z", obs: { latitude: 40, longitude: -70 } },
-    { t: "2026-12-21T22:00:00Z", obs: { latitude: 60, longitude: 5 } },
-    { t: "2026-09-23T12:00:00Z", obs: { latitude: -35, longitude: 18 } },
-  ];
-  for (const { t, obs } of cases) {
-    const ms = new Date(t).getTime();
-    const gp = celestial.sunGeographicPosition(ms);
-    const { hc_deg, zn_deg } = celestial.computeHcZn(obs, gp);
-    const p = suncalc.getPosition(new Date(ms), obs.latitude, obs.longitude);
-    const scAlt = (p.altitude * 180) / Math.PI;
-    const scAz = suncalcBearing(p);
-    assert.ok(
-      Math.abs(hc_deg - scAlt) < 0.15,
-      `${t}: Hc ${hc_deg.toFixed(3)} vs suncalc ${scAlt.toFixed(3)}`,
-    );
-    // Azimuth only meaningful when the body is well above the horizon.
-    if (scAlt > 5) {
-      let dAz = Math.abs(zn_deg - scAz);
-      dAz = Math.min(dAz, 360 - dAz);
-      assert.ok(
-        dAz < 0.5,
-        `${t}: Zn ${zn_deg.toFixed(1)} vs suncalc ${scAz.toFixed(1)}`,
-      );
-    }
-  }
 });
 
 test("Polaris: altitude ≈ observer latitude at 60N, azimuth ≈ due north", () => {
@@ -321,4 +325,36 @@ test("reduceNoonSight: produces an east-west LOP (azimuth 0 or 180)", () => {
     limb: "lower",
   });
   assert.ok(r.azimuth_true === 0 || r.azimuth_true === 180);
+});
+
+test("starGeographicPosition: of-date places match paper-almanac anchors", () => {
+  // At 2026-07-01 the paper almanac's of-date SHA/Dec for Vega ≈
+  // 80°33' / N38°48' and Regulus ≈ 207°34' / N11°51'. A J2000 table used
+  // without conversion to the date would sit ~0.3° (≈20 NM of LOP error)
+  // off; the library's precession/nutation/aberration closes the gap.
+  const t = Date.UTC(2026, 6, 1, 0, 0, 0);
+  const { starGeographicPosition } = celestial;
+
+  for (const [name, expSha, expDec] of [
+    ["Vega", 80.55, 38.8],
+    ["Regulus", 207.56, 11.84],
+  ]) {
+    const gp = starGeographicPosition(t, almanac.lookup(name));
+    const shaOfDate = (((gp.gha_deg - gastDeg(t)) % 360) + 360) % 360;
+    assert.ok(
+      Math.abs(shaOfDate - expSha) < 0.05,
+      `${name} SHA of date ${shaOfDate.toFixed(3)} vs almanac ~${expSha}`,
+    );
+    assert.ok(
+      Math.abs(gp.declination_deg - expDec) < 0.05,
+      `${name} Dec of date ${gp.declination_deg.toFixed(3)} vs almanac ~${expDec}`,
+    );
+    // Sanity: the of-date SHA differs from the J2000 table value by the
+    // accumulated precession (Vega ≈ 0.2°, Regulus ≈ 0.35°).
+    const tableSha = almanac.lookup(name).sha_deg;
+    assert.ok(
+      Math.abs(shaOfDate - tableSha) > 0.1,
+      `${name}: of-date SHA should differ from the J2000 table`,
+    );
+  }
 });

@@ -22,13 +22,16 @@
  *      offset by the intercept — exactly the form `recordLineOfPosition`
  *      and the fix resolver expect.
  *
- * Ephemeris (SPEC §13):
- *   - Sun and Moon: computed locally from the timestamp via standard
- *     formulas (the same `aa.quae.nl` derivation suncalc uses, but we
- *     need GHA/declination, which suncalc's public API doesn't expose).
- *   - Stars: from a bundled static almanac (plugin/star-almanac.js),
- *     GHA = GHA Aries + SHA, declination from the almanac. Proper motion
- *     is negligible over the almanac's stated valid epoch (§13).
+ * Ephemeris (SPEC §13): computed by astronomy-engine (MIT, pure JS,
+ * zero sub-dependencies, fully offline) — Sun and Moon geocentric
+ * apparent places, stars from the bundled J2000 almanac (verified
+ * against a Hipparcos-derived catalog) converted to the date by the
+ * library's precession/nutation/aberration. The nautical-almanac
+ * convention throughout is GEOCENTRIC, coordinates of date; parallax
+ * is applied as a separate sight correction (step 3), never baked into
+ * the GP. Library accuracy is arcsecond-class — far below sextant
+ * precision — and is pinned by paper-almanac anchors in
+ * tests/ephemeris.test.js.
  *
  * The module is pure: no DB, no I/O, no `new Date()` (the sight time is
  * passed in explicitly so reduction is deterministic and testable).
@@ -38,6 +41,7 @@
  * @file celestial.js
  */
 
+const Astronomy = require("astronomy-engine");
 const { normalizeDeg360 } = require("./geo.js");
 
 /** Radians per degree. */
@@ -46,35 +50,24 @@ const RAD = Math.PI / 180;
 const DEG = 180 / Math.PI;
 /** Mean obliquity of the ecliptic (J2000), degrees. */
 const OBLIQUITY_DEG = 23.4397;
+/** Sun radius, km (IAU nominal). */
+const SUN_RADIUS_KM = 695700;
+/** Moon radius, km. */
+const MOON_RADIUS_KM = 1737.4;
+/** Earth equatorial radius, km. */
+const EARTH_EQ_RADIUS_KM = 6378.14;
 
 /**
- * Greenwich Mean Sidereal Time in degrees [0, 360), for a given UTC
- * timestamp. Standard USNO formula; used to turn SHA → GHA for stars and
- * RA → GHA for Sun/Moon.
- *
- * @param {number} epochMs - Date.getTime() value (UTC ms)
- * @returns {number}
- */
-function gmstDeg(epochMs) {
-  const jd = epochMs / 86400000 + 2440587.5;
-  const T = (jd - 2451545.0) / 36525;
-  const g =
-    280.46061837 +
-    360.98564736629 * (jd - 2451545.0) +
-    0.000387933 * T * T -
-    (T * T * T) / 38710000;
-  return normalizeDeg360(g);
-}
-
-/**
- * Reduces an ecliptic longitude/latitude to right ascension (degrees).
+ * Reduces an ecliptic longitude/latitude to right ascension (degrees),
+ * for a given obliquity (degrees).
  *
  * @param {number} lonDeg - ecliptic longitude, degrees
  * @param {number} latDeg - ecliptic latitude, degrees (0 for the Sun)
+ * @param {number} [epsDeg=OBLIQUITY_DEG] - obliquity of the ecliptic
  * @returns {number} RA, degrees
  */
-function raFromEcliptic(lonDeg, latDeg) {
-  const e = OBLIQUITY_DEG * RAD;
+function raFromEcliptic(lonDeg, latDeg, epsDeg = OBLIQUITY_DEG) {
+  const e = epsDeg * RAD;
   const l = lonDeg * RAD;
   const b = latDeg * RAD;
   const ra = Math.atan2(
@@ -85,14 +78,16 @@ function raFromEcliptic(lonDeg, latDeg) {
 }
 
 /**
- * Reduces an ecliptic longitude/latitude to declination (degrees).
+ * Reduces an ecliptic longitude/latitude to declination (degrees), for
+ * a given obliquity (degrees).
  *
  * @param {number} lonDeg
  * @param {number} latDeg
+ * @param {number} [epsDeg=OBLIQUITY_DEG] - obliquity of the ecliptic
  * @returns {number} declination, degrees [-90, 90]
  */
-function decFromEcliptic(lonDeg, latDeg) {
-  const e = OBLIQUITY_DEG * RAD;
+function decFromEcliptic(lonDeg, latDeg, epsDeg = OBLIQUITY_DEG) {
+  const e = epsDeg * RAD;
   const l = lonDeg * RAD;
   const b = latDeg * RAD;
   const dec = Math.asin(
@@ -102,71 +97,96 @@ function decFromEcliptic(lonDeg, latDeg) {
 }
 
 /**
- * Sun's geographic position at a timestamp: GHA and declination.
- *
- * Derived from the low-precision solar position formulas (good to ~0.01°,
- * ample for sextant work). Same source as suncalc (aa.quae.nl).
+ * Geocentric apparent GHA/Dec from true-ecliptic-of-date coordinates.
+ * The obliquity (true, of date) and Greenwich apparent sidereal time
+ * both come from the library, so nutation is included on both sides of
+ * GHA = GAST − RA — the nautical-almanac convention.
  *
  * @param {number} epochMs
+ * @param {number} lonDeg - ecliptic longitude of date, degrees
+ * @param {number} latDeg - ecliptic latitude of date, degrees
  * @returns {{gha_deg: number, declination_deg: number}}
+ */
+function ghaDecFromEcliptic(epochMs, lonDeg, latDeg) {
+  const date = new Date(epochMs);
+  const eps = Astronomy.e_tilt(Astronomy.MakeTime(date)).tobl;
+  const ra = raFromEcliptic(lonDeg, latDeg, eps);
+  const dec = decFromEcliptic(lonDeg, latDeg, eps);
+  const gastDeg = Astronomy.SiderealTime(date) * 15;
+  return { gha_deg: normalizeDeg360(gastDeg - ra), declination_deg: dec };
+}
+
+/**
+ * Sun's geographic position at a timestamp: GHA, declination, and the
+ * apparent semi-diameter from the true Earth–Sun distance (varies
+ * 0.263–0.274° over the year — the fixed mean left up to ±0.3′).
+ *
+ * @param {number} epochMs
+ * @returns {{gha_deg: number, declination_deg: number, semi_diameter_deg: number}}
  */
 function sunGeographicPosition(epochMs) {
-  const d = epochMs / 86400000 - 10957.5; // days since J2000
-  const M = normalizeDeg360(357.5291 + 0.98560028 * d); // mean anomaly
-  const C =
-    1.9148 * Math.sin(M * RAD) +
-    0.02 * Math.sin(2 * M * RAD) +
-    0.0003 * Math.sin(3 * M * RAD); // equation of center
-  const lon = normalizeDeg360(280.4665 + 0.9856474 * d + C); // true ecliptic longitude
-  const ra = raFromEcliptic(lon, 0);
-  const dec = decFromEcliptic(lon, 0);
-  // GHA = GMST − RA (Greenwich hour angle of the body).
-  const gha = normalizeDeg360(gmstDeg(epochMs) - ra);
-  return { gha_deg: gha, declination_deg: dec };
+  const ecl = Astronomy.SunPosition(new Date(epochMs));
+  const distKm = ecl.vec.Length() * Astronomy.KM_PER_AU;
+  return {
+    ...ghaDecFromEcliptic(epochMs, ecl.elon, ecl.elat),
+    semi_diameter_deg: Math.asin(SUN_RADIUS_KM / distKm) * DEG,
+  };
 }
 
 /**
- * Moon's geographic position at a timestamp: GHA and declination.
- *
- * Low-precision lunar position (good to ~0.1°). Same source as suncalc.
+ * Moon's geographic position at a timestamp: GHA, declination, plus the
+ * semi-diameter and horizontal parallax from the true distance. The
+ * distance varies ±5.5% over the anomalistic month — the previously
+ * fixed SD 0.2725°/HP 0.95° were up to ~2′ wrong near apogee.
  *
  * @param {number} epochMs
- * @returns {{gha_deg: number, declination_deg: number}}
+ * @returns {{gha_deg: number, declination_deg: number, semi_diameter_deg: number, horizontal_parallax_deg: number}}
  */
 function moonGeographicPosition(epochMs) {
-  const d = epochMs / 86400000 - 10957.5; // days since J2000
-  const L = normalizeDeg360(218.316 + 13.176396 * d); // mean longitude
-  const M = normalizeDeg360(134.963 + 13.064993 * d); // mean anomaly
-  const F = normalizeDeg360(93.272 + 13.22935 * d); // argument of latitude
-  // Ecliptic longitude with the two largest correction terms.
-  const lon =
-    L +
-    6.289 * Math.sin(M * RAD) -
-    1.274 * Math.sin((2 * L - 2 * M) * RAD) +
-    0.658 * Math.sin(2 * F * RAD) -
-    0.186 * Math.sin((2 * L - 2 * M + 2 * F) * RAD);
-  // Ecliptic latitude (small, from F).
-  const lat =
-    5.128 * Math.sin(F * RAD) +
-    0.28 * Math.sin((M + F) * RAD) -
-    0.28 * Math.sin((M - F) * RAD);
-  const ra = raFromEcliptic(lon, lat);
-  const dec = decFromEcliptic(lon, lat);
-  const gha = normalizeDeg360(gmstDeg(epochMs) - ra);
-  return { gha_deg: gha, declination_deg: dec };
+  const ecl = Astronomy.EclipticGeoMoon(new Date(epochMs));
+  const distKm = ecl.dist * Astronomy.KM_PER_AU;
+  return {
+    ...ghaDecFromEcliptic(epochMs, ecl.lon, ecl.lat),
+    semi_diameter_deg: Math.asin(MOON_RADIUS_KM / distKm) * DEG,
+    horizontal_parallax_deg: Math.asin(EARTH_EQ_RADIUS_KM / distKm) * DEG,
+  };
 }
 
 /**
- * A star's geographic position, given GHA Aries (GMST) and the star's
- * SHA + declination from the bundled almanac.
+ * A star's geographic position at a timestamp: GHA and declination.
+ * The bundled almanac's J2000 mean place is registered with the library
+ * (`DefineStar`), which returns the apparent place of date — full
+ * precession, nutation and aberration.
+ *
+ * `DefineStar` mutates its slot globally; the single-threaded
+ * sight-reduction path re-registers per lookup, which is fine for
+ * per-sight (rare) events, not per-tick use.
  *
  * @param {number} epochMs
  * @param {{sha_deg: number, declination_deg: number}} star
  * @returns {{gha_deg: number, declination_deg: number}}
  */
 function starGeographicPosition(epochMs, star) {
-  const gha = normalizeDeg360(gmstDeg(epochMs) + star.sha_deg);
-  return { gha_deg: gha, declination_deg: star.declination_deg };
+  const date = new Date(epochMs);
+  const raHours = (360 - normalizeDeg360(star.sha_deg)) / 15;
+  Astronomy.DefineStar(
+    Astronomy.Body.Star1,
+    raHours,
+    star.declination_deg,
+    100,
+  );
+  const eq = Astronomy.Equator(
+    Astronomy.Body.Star1,
+    date,
+    new Astronomy.Observer(0, 0, 0),
+    true,
+    true,
+  );
+  const gastDeg = Astronomy.SiderealTime(date) * 15;
+  return {
+    gha_deg: normalizeDeg360(gastDeg - eq.ra * 15),
+    declination_deg: eq.dec,
+  };
 }
 
 /**
@@ -312,20 +332,21 @@ function reduceSight(input) {
   const body = input.body;
   if (body === "Sun") {
     gp = sunGeographicPosition(epochMs);
-    // Sun semi-diameter ≈ 0.2666° (varies ~0.263–0.274). Use the mean;
-    // the variation is below sextant-reading precision for v1.
-    const sd = 0.2666;
+    // Apparent semi-diameter from the true Earth–Sun distance
+    // (0.263–0.274° over the year).
+    const sd = gp.semi_diameter_deg;
     semiDiameterDeg =
       input.limb === "upper" ? -sd : input.limb === "lower" ? sd : null;
   } else if (body === "Moon") {
     gp = moonGeographicPosition(epochMs);
-    // Moon semi-diameter ≈ 0.2725° (mean; HP ≈ 0.95°). Parallax-in-altitude
-    // correction ≈ HP * cos(Ha); included as a rough mean for v1.
-    const sd = 0.2725;
+    // Semi-diameter and horizontal parallax from the true distance
+    // (varies ±5.5% over the anomalistic month). Parallax-in-altitude
+    // correction = HP·cos(Ha).
+    const sd = gp.semi_diameter_deg;
     semiDiameterDeg =
       input.limb === "upper" ? -sd : input.limb === "lower" ? sd : null;
     const ha = (input.hs_deg + (input.index_correction_deg ?? 0)) * RAD;
-    parallaxDeg = 0.95 * Math.cos(ha); // horizontal parallax scaled by cos(Ha)
+    parallaxDeg = gp.horizontal_parallax_deg * Math.cos(ha);
   } else if (input.almanac) {
     const star = input.almanac.lookup(body);
     if (!star) throw new Error(`unknown body: ${body}`);
@@ -463,7 +484,6 @@ function reduceNoonSight(input) {
 }
 
 module.exports = {
-  gmstDeg,
   raFromEcliptic,
   decFromEcliptic,
   sunGeographicPosition,
