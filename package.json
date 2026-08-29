@@ -1,6 +1,6 @@
 {
   "name": "@meri-imperiumi/signalk-dead-reckoning",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Offline-first dead reckoning and sensor fusion engine for Signal K",
   "main": "plugin/index.js",
   "scripts": {
