@@ -177,7 +177,6 @@ template.innerHTML = /* html */ `
   </section>
 
   <section class="sk-card">
-    <h2>Ghost Track <button id="dr-recenter" title="Follow DR position">◎</button></h2>
     <dr-map-view id="dr-map"></dr-map-view>
   </section>
 
@@ -228,9 +227,6 @@ class DrApp extends HTMLElement {
 
     /** @type {import("./dr-map-view.js").default|null} */
     this.map = root.querySelector("#dr-map");
-    root
-      .querySelector("#dr-recenter")
-      ?.addEventListener("click", () => this.map?.recenter());
     // Chart pick: right-click an object on the map → open the sight
     // dialog with the object position pre-seeded (and its charted name,
     // when the picked symbol carries one — light, seamark, peak…). AIS

@@ -71,6 +71,37 @@ class DrMapView extends HTMLElement {
         font: 12px/1.4 ui-monospace, "Fira Code", monospace;
         font-variant-numeric: tabular-nums;
       }
+      /* Re-center (follow DR position) control: the bottom-left corner
+         is the last free spot — zoom is top-left, layers top-right,
+         the divergence chip bottom-right. Filled means auto-follow is
+         ON; dragging the map pauses follow and outlines the button. */
+      .dr-recenter {
+        position: absolute;
+        bottom: 8px;
+        left: 8px;
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 48px;
+        min-height: 48px;
+        padding: 0;
+        font-size: 1.2rem;
+        line-height: 1;
+        background-color: rgba(17, 20, 20, 0.8);
+        border: 1px solid rgba(75, 139, 153, 0.5);
+        color: var(--color-teal, #4b8b99);
+      }
+      .dr-recenter:hover:not(:disabled),
+      .dr-recenter:active:not(:disabled) {
+        background-color: var(--color-teal, #4b8b99);
+        color: var(--bg-base, #080a0c);
+      }
+      .dr-recenter.engaged {
+        background-color: var(--color-teal, #4b8b99);
+        color: var(--bg-base, #080a0c);
+        border-color: var(--color-teal, #4b8b99);
+      }
       .dr-pick-menu {
         position: absolute;
         z-index: 1000;
@@ -163,11 +194,29 @@ class DrMapView extends HTMLElement {
     chip.appendChild(chipText);
     chip.appendChild(spark);
 
+    // Re-center (follow DR) control — floated over the map's bottom-left
+    // corner now that the "Ghost Track" heading is gone, so the map
+    // opens higher with no chrome above it. Calls recenter() directly;
+    // the .engaged class mirrors the follow flag (set here, cleared on
+    // drag, re-set on click).
+    const recenterBtn = document.createElement("button");
+    recenterBtn.type = "button";
+    recenterBtn.id = "dr-recenter";
+    recenterBtn.className = "dr-recenter engaged";
+    recenterBtn.textContent = "◎";
+    recenterBtn.title = "Follow DR position";
+    recenterBtn.setAttribute("aria-label", "Follow DR position");
+    recenterBtn.setAttribute("aria-pressed", "true");
+    recenterBtn.addEventListener("click", () => this.recenter());
+
     const host = document.createElement("div");
     host.className = "map-host";
     host.appendChild(wrap);
     host.appendChild(chip);
+    host.appendChild(recenterBtn);
     root.appendChild(host);
+    /** @type {HTMLButtonElement} */
+    this.recenterBtn = recenterBtn;
 
     /** @type {HTMLDivElement} */
     this.mapEl = wrap;
@@ -239,6 +288,8 @@ class DrMapView extends HTMLElement {
     }
     this.map.on("dragstart", () => {
       this.follow = false;
+      this.recenterBtn?.classList.remove("engaged");
+      this.recenterBtn?.setAttribute("aria-pressed", "false");
     });
     // Chart pick: right-click / long-press opens a small context menu
     // to pre-seed a sight form with the picked object position (and the
@@ -427,6 +478,8 @@ class DrMapView extends HTMLElement {
   /** @returns {void} */
   recenter() {
     this.follow = true;
+    this.recenterBtn?.classList.add("engaged");
+    this.recenterBtn?.setAttribute("aria-pressed", "true");
     if (this.lastDrPosition && this.map) {
       this.map.panTo(this.lastDrPosition);
     }

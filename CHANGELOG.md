@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **The webapp's "Ghost Track" heading above the map is gone.** It
+  wasted vertical space the map could use — the map card now opens with
+  no chrome above it, so the chart starts higher on the page. The
+  "follow DR position" recenter button (◎) that lived on that heading
+  moved into the map view as a floating control in the bottom-left
+  corner (the last free corner: zoom is top-left, layers top-right, the
+  divergence chip bottom-right). It now reflects the follow state —
+  filled while auto-follow is on, outlined after a drag pans the map
+  freely, refilled on click — so a heading-less floating button still
+  reads its state at a glance.
+
 ## [0.6.1] - 2026-08-28
 
 ### Changed
