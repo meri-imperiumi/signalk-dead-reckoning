@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Passage replay backtest tool** (`tools/replay-passage.js`, minimal
+  SPEC §10.2 scope): replays a historical passage from the Signal K
+  History API through the real DR engine and reports how the shadow
+  boat diverged from GPS. Fetches a range in chunks at native 10s
+  resolution, forward-fills sparse sensors (unwrapping the signed AWA
+  across ±π through gybes), queries `navigation.attitude.roll`
+  (radians) directly — the attitude object itself is not recorded, only
+  its component paths — so heel reaches the matrix bins, seeds the DR
+  origin at the first GPS fix and never re-anchors it. Four variants run side by side: cold (no
+  training, tier-5 zero current), learning (Training Mode on, mirroring
+  a first live passage), plus the same two with a SCUD satellite-derived
+  current source — daily 0.25° fields from the PacIOOS ERDDAP,
+  nearest-cell in space, time-interpolated over source holes (and held
+  at the span ends), resolved at the shadow boat's own position. Also
+  derives the implied current (ground vector minus water-track vector)
+  as a diagnostic of what DR is missing. Outputs an hourly divergence
+  table, an implied-vs-SCUD current comparison, a GeoJSON track file,
+  full-resolution samples, and a self-contained SVG HTML report. A
+  `--stw-scale` option multiplies STW end-to-end (engine, training,
+  matrix lookup) to test paddlewheel-calibration hypotheses against a
+  passage.
+  Smoketests cover URL building, row parsing/filling, the current-grid
+  interpolation, and three synthetic passages (no-drift, known-current,
+  leeway absorbed by training).
+
 ## [0.7.0] - 2026-08-29
 
 ### Added
