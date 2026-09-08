@@ -830,3 +830,56 @@ test("confirmFix: running fix records derived_from_fix_id and attaches the sight
   assert.strictEqual(attached.used_in_fix_id, res.fix_id);
   db.close();
 });
+
+test("evaluateObservationPlausibility: implied speed gate (sea trial 2026-08-31)", () => {
+  const {
+    evaluateObservationPlausibility,
+    MAX_IMPLIED_SPEED_KN,
+  } = require("../plugin/fix-pipeline.js");
+  // The Antarctica sight: 3054 NM in ~21.9 h ≈ 139 kn.
+  const bad = evaluateObservationPlausibility({
+    displacementNm: 3054,
+    elapsedS: 21.9 * 3600,
+  });
+  assert.strictEqual(bad.ok, false);
+  assert.ok(bad.impliedKn > MAX_IMPLIED_SPEED_KN);
+  // A plausible 20 NM excursion 22 h after the last fix (< 1 kn implied).
+  const ok = evaluateObservationPlausibility({
+    displacementNm: 20,
+    elapsedS: 22 * 3600,
+  });
+  assert.strictEqual(ok.ok, true);
+  // Displacements inside realistic observation quality (~5 nm) always
+  // pass, even with zero elapsed (fresh origin).
+  const small = evaluateObservationPlausibility({
+    displacementNm: 4,
+    elapsedS: 0,
+  });
+  assert.strictEqual(small.ok, true);
+  // No displacement or pre-origin observations skip the gate.
+  assert.strictEqual(
+    evaluateObservationPlausibility({ displacementNm: null, elapsedS: 100 })
+      .skipped,
+    true,
+  );
+  assert.strictEqual(
+    evaluateObservationPlausibility({ displacementNm: 6, elapsedS: -10 })
+      .skipped,
+    true,
+  );
+  // Zero elapsed with a large displacement implies infinite speed.
+  const instant = evaluateObservationPlausibility({
+    displacementNm: 10,
+    elapsedS: 0,
+  });
+  assert.strictEqual(instant.ok, false);
+  assert.strictEqual(instant.impliedKn, Infinity);
+});
+
+test("defaultOriginErrorNm: GNSS metre-scale, human observations ~5 nm", () => {
+  const { defaultOriginErrorNm } = require("../plugin/fix-pipeline.js");
+  assert.strictEqual(defaultOriginErrorNm("gps"), 0.05);
+  assert.strictEqual(defaultOriginErrorNm("celestial"), 5);
+  assert.strictEqual(defaultOriginErrorNm("manual"), 5);
+  assert.strictEqual(defaultOriginErrorNm("bearing"), 5);
+});

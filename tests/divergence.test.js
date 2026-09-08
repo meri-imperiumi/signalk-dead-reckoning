@@ -109,13 +109,23 @@ test("missing input holds timers and state", () => {
   assert.strictEqual(r.transition, "raise");
 });
 
-test("zero radius with any divergence exceeds; zero/zero does not", () => {
+test("zero radius with real divergence exceeds; sub-resolution noise does not", () => {
+  // Sea trial 2026-08-27: "0.00 nm exceeds expected 0.00 nm" — float
+  // epsilon against a fresh zero-radius origin raised the advisory on
+  // GPS noise. EPS_NM is now instrument resolution (~9 m).
   const s = createDivergenceState();
-  const r = divergenceTick(s, { divergenceNm: 0.001, radiusNm: 0, dtS: 30 });
-  assert.strictEqual(r.transition, "raise");
+  const tiny = divergenceTick(s, {
+    divergenceNm: 0.001,
+    radiusNm: 0,
+    dtS: 30,
+  });
+  assert.strictEqual(tiny.transition, null, "1.85 m divergence is noise");
   const s2 = createDivergenceState();
-  const r2 = divergenceTick(s2, { divergenceNm: 0, radiusNm: 0, dtS: 30 });
-  assert.strictEqual(r2.transition, null); // 0 > 0 is false → inside
+  const real = divergenceTick(s2, { divergenceNm: 0.05, radiusNm: 0, dtS: 30 });
+  assert.strictEqual(real.transition, "raise");
+  const s3 = createDivergenceState();
+  const s4 = divergenceTick(s3, { divergenceNm: 0, radiusNm: 0, dtS: 30 });
+  assert.strictEqual(s4.transition, null); // 0 > 0 is false → inside
 });
 
 test("opts.factor is respected", () => {

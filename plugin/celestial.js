@@ -58,6 +58,22 @@ const MOON_RADIUS_KM = 1737.4;
 const EARTH_EQ_RADIUS_KM = 6378.14;
 
 /**
+/**
+ * Maximum distance of the Sun's LHA from the meridian (deg) for a
+ * sight to be accepted as a noon sight (sea trial 2026-08-31 guard).
+ * ~20° ≈ 80 minutes from transit — generous versus the ~30 min a
+ * navigator would actually shoot around LAN, but far below the ~100°
+ * the trial's 07:05-local sights carried.
+ */
+const NOON_MAX_LHA_DEG = 20;
+
+/**
+ * Maximum computed-vs-assumed latitude discrepancy (deg) accepted from
+ * a noon sight before it is refused as implausible (~720 NM).
+ */
+const NOON_MAX_LAT_DELTA_DEG = 12;
+
+/**
  * Reduces an ecliptic longitude/latitude to right ascension (degrees),
  * for a given obliquity (degrees).
  *
@@ -437,6 +453,18 @@ function reduceNoonSight(input) {
   const gp = sunGeographicPosition(epochMs);
   const dec = gp.declination_deg;
 
+  // 1b. Meridian-transit guard (sea trial 2026-08-31): a sight taken
+  // hours from local noon reduces to garbage latitudes (both trial
+  // sights were morning sights that landed at −69°/−32°). LHA is 0
+  // (or 360) exactly on the meridian; refuse sights far from transit.
+  const lhaDeg = normalizeDeg360(gp.gha_deg + assumed.longitude);
+  const fromMeridianDeg = Math.min(lhaDeg, 360 - lhaDeg);
+  if (fromMeridianDeg > NOON_MAX_LHA_DEG) {
+    throw new Error(
+      `Sun is ${fromMeridianDeg.toFixed(0)}° from the meridian (LHA ${lhaDeg.toFixed(1)}°) at the sight time — not a noon sight. Uncheck "Noon sight" for an intercept-method reduction, or verify the sight time`,
+    );
+  }
+
   // 2. Ho from Hs (same corrections as a normal sight; limb sights apply).
   const sd = 0.2666;
   const semiDiameterDeg =
@@ -462,6 +490,17 @@ function reduceNoonSight(input) {
   const sunSouth = dec < assumed.latitude;
   const latitude = sunSouth ? dec + z : dec - z;
 
+  // 3b. Computed-vs-assumed sanity (sea trial 2026-08-31): even a sight
+  // near transit can be mis-entered (wrong limb, IC, time). A computed
+  // latitude a whole ocean away from the assumed/DR position is far
+  // more likely a bad sight than a 700 NM DR error — refuse it.
+  const latDeltaDeg = Math.abs(latitude - assumed.latitude);
+  if (latDeltaDeg > NOON_MAX_LAT_DELTA_DEG) {
+    throw new Error(
+      `Noon sight latitude ${latitude.toFixed(1)}° is ${latDeltaDeg.toFixed(1)}° from the assumed ${assumed.latitude.toFixed(1)}° — check the sight altitude, limb and index correction`,
+    );
+  }
+
   // Azimuth: 180° (due south) when the Sun is south of the observer,
   // 0° (due north) when it's north. Either yields an east-west LOP.
   const azimuth = sunSouth ? 180 : 0;
@@ -484,6 +523,8 @@ function reduceNoonSight(input) {
 }
 
 module.exports = {
+  NOON_MAX_LHA_DEG,
+  NOON_MAX_LAT_DELTA_DEG,
   raFromEcliptic,
   decFromEcliptic,
   sunGeographicPosition,

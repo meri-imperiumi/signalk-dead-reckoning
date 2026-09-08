@@ -15,9 +15,15 @@ const {
   isGpsReliable,
   computeObservation,
   tick,
+  detectManeuver,
   GROSS_JUMP_NM,
   ROT_TRANSIENT_DEG_S,
   SETTLE_SUSTAIN_S,
+  TRANSIENT_MAX_S,
+  STABILIZE_HEEL_DEG,
+  STABILIZE_AWA_DEG,
+  STABILIZE_HEADING_DEG,
+  stabilizeTolerances,
 } = require("../plugin/training.js");
 
 /**
@@ -232,88 +238,244 @@ test("computeObservation returns null with insufficient inputs", () => {
   );
 });
 
-test("updateTransient opens a window on a high rate-of-turn", () => {
+/**
+ * Drives `seconds` of sustained rotation at `rateDegS` (deg/s) starting
+ * from heading `from`, one snapshot per second. Returns the next
+ * timestamp. A real tack/gybe sustains its turn across the ROT window;
+ * wave yaw does not — the tests below mirror that distinction.
+ *
+ * @param {import("../plugin/training.js").TrainingState} st
+ * @param {object} o
+ * @returns {number} next timestamp (s)
+ */
+function sustainedTurn(st, o) {
+  // Seed the starting heading so the ROT window fills from t = o.t.
+  updateTransient(st, {
+    headingDeg: o.from,
+    heelDeg: o.heel ?? 0,
+    awaDeg: o.awa ?? 45,
+    timestampS: o.t,
+    seaState: o.seaState ?? null,
+  });
+  const t = o.t;
+  for (let i = 1; i <= o.seconds; i++) {
+    const heading = o.from + o.rateDegS * i;
+    updateTransient(st, {
+      headingDeg: heading,
+      heelDeg: o.heel ?? 0,
+      awaDeg: o.awa ?? 45,
+      timestampS: t + i,
+      seaState: o.seaState ?? null,
+    });
+  }
+  return t + o.seconds;
+}
+
+test("updateTransient opens a window on a sustained high rate-of-turn", () => {
   const st = new TrainingState();
-  updateTransient(st, {
-    headingDeg: 0,
-    heelDeg: 10,
-    awaDeg: 45,
-    timestampS: 0,
-  });
-  // 60° turn in 1s = 60°/s, well above threshold.
-  updateTransient(st, {
-    headingDeg: 60,
-    heelDeg: 5,
-    awaDeg: 80,
-    timestampS: 1,
-  });
+  sustainedTurn(st, { t: 0, from: 0, rateDegS: 10, seconds: 7, awa: 80 });
   assert.strictEqual(st.transient, true);
-  assert.strictEqual(st.transientOpenAtS, 1);
+  // The window opens only once the ROT window is full (6 s of history).
+  assert.strictEqual(st.transientOpenAtS, 6);
+});
+
+test("a single tick of wave yaw does not open a window (sea trial 2026-08-31)", () => {
+  const st = new TrainingState();
+  // Steady for 7 s to fill the ROT window…
+  sustainedTurn(st, { t: 0, from: 60, rateDegS: 0, seconds: 7, awa: 80 });
+  assert.strictEqual(st.transient, false);
+  // …then one second of 8° yaw (surfing a wave) and steadying again.
+  updateTransient(st, {
+    headingDeg: 68,
+    heelDeg: 4,
+    awaDeg: 85,
+    timestampS: 8,
+  });
+  updateTransient(st, {
+    headingDeg: 68,
+    heelDeg: 4,
+    awaDeg: 85,
+    timestampS: 9,
+  });
+  assert.strictEqual(st.transient, false, "single-tick yaw must not open");
 });
 
 test("updateTransient closes only after sustained re-stabilization", () => {
   const st = new TrainingState();
-  updateTransient(st, {
-    headingDeg: 0,
-    heelDeg: 10,
-    awaDeg: 45,
-    timestampS: 0,
+  sustainedTurn(st, {
+    t: 0,
+    from: 0,
+    rateDegS: 10,
+    seconds: 7,
+    heel: 5,
+    awa: 80,
   });
-  updateTransient(st, {
-    headingDeg: 60,
-    heelDeg: 5,
-    awaDeg: 80,
-    timestampS: 1,
-  }); // open
   assert.strictEqual(st.transient, true);
-
-  // Re-stabilize: heel and AWA held steady at the open-window values for
-  // the sustained interval. Steady values are the *post-turn* ones.
-  const heelSteady = 5;
-  const awaSteady = 80;
-  for (let t = 2; t < 2 + SETTLE_SUSTAIN_S + 1; t++) {
+  const settledHeading = 70;
+  // The ROT window keeps containing turn samples for ~ROT_WINDOW_S after
+  // the turn stops (re-anchoring + resetting the clock), so settle loops
+  // run past SETTLE_SUSTAIN_S by that decay margin.
+  for (let t = 8; t < 8 + SETTLE_SUSTAIN_S + 8; t++) {
     updateTransient(st, {
-      headingDeg: 60,
-      heelDeg: heelSteady,
-      awaDeg: awaSteady,
+      headingDeg: settledHeading,
+      heelDeg: 5,
+      awaDeg: 80,
       timestampS: t,
     });
   }
   assert.strictEqual(st.transient, false);
 });
 
-test("updateTransient resets the settle clock on a renewed high rate-of-turn", () => {
+test("updateTransient resets the settle clock on a renewed window rate-of-turn", () => {
   const st = new TrainingState();
-  updateTransient(st, {
-    headingDeg: 0,
-    heelDeg: 10,
-    awaDeg: 45,
-    timestampS: 0,
+  let t = sustainedTurn(st, {
+    t: 0,
+    from: 0,
+    rateDegS: 10,
+    seconds: 7,
+    heel: 5,
+    awa: 80,
   });
-  updateTransient(st, {
-    headingDeg: 60,
-    heelDeg: 5,
-    awaDeg: 80,
-    timestampS: 1,
-  }); // open
-  // Almost settle...
-  for (let t = 2; t < 2 + SETTLE_SUSTAIN_S - 1; t++) {
+  // Almost settle…
+  for (let i = 1; i < SETTLE_SUSTAIN_S; i++) {
     updateTransient(st, {
-      headingDeg: 60,
+      headingDeg: 70,
       heelDeg: 5,
       awaDeg: 80,
-      timestampS: t,
+      timestampS: ++t,
     });
   }
-  // Another sharp turn mid-settle resets the clock; window stays open.
-  updateTransient(st, {
-    headingDeg: 120,
-    heelDeg: 0,
-    awaDeg: 100,
-    timestampS: 2 + SETTLE_SUSTAIN_S - 1,
+  // Another sustained turn mid-settle resets the clock; window stays open.
+  t = sustainedTurn(st, {
+    t,
+    from: 70,
+    rateDegS: 10,
+    seconds: 7,
+    heel: 0,
+    awa: 100,
   });
   assert.strictEqual(st.transient, true);
   assert.strictEqual(st.stabilizedS, 0);
+});
+
+test("stabilizeTolerances scale with sea state, flat-water base preserved", () => {
+  const base = stabilizeTolerances(null);
+  assert.strictEqual(base.heelDeg, STABILIZE_HEEL_DEG);
+  assert.strictEqual(base.awaDeg, STABILIZE_AWA_DEG);
+  assert.strictEqual(base.headingDeg, STABILIZE_HEADING_DEG);
+  const ss4 = stabilizeTolerances(4);
+  assert.strictEqual(ss4.heelDeg, STABILIZE_HEEL_DEG + 6);
+  assert.strictEqual(ss4.awaDeg, STABILIZE_AWA_DEG + 8);
+  assert.strictEqual(ss4.headingDeg, STABILIZE_HEADING_DEG + 6);
+});
+
+test("ss3-4 swell motion re-stabilizes within scaled tolerances (sea trial latch)", () => {
+  const st = new TrainingState({ settleSustainS: 10 });
+  let t = sustainedTurn(st, {
+    t: 0,
+    from: 280,
+    rateDegS: 8,
+    seconds: 7,
+    heel: 4,
+    awa: -120,
+  });
+  assert.strictEqual(st.transient, true);
+  // Let the ROT window decay past the turn (anchors stay at the turn-end
+  // values: heel 4, heading 336 — the swell's center)…
+  for (let i = 0; i < 8; i++) {
+    updateTransient(st, {
+      headingDeg: 336,
+      heelDeg: 4,
+      awaDeg: -120,
+      timestampS: ++t,
+      seaState: 4,
+    });
+  }
+  assert.strictEqual(st.transient, true, "settle window not yet sustained");
+  // …then broad-reach seaway: heel ±5° and heading ±8° around the settled
+  // values at swell period — the ss4 tolerances (heel 8°, heading 11°)
+  // must absorb it and the window must close.
+  for (let i = 1; i <= 20; i++) {
+    updateTransient(st, {
+      headingDeg: 336 + (i % 2 === 0 ? 8 : -8),
+      heelDeg: 4 + (i % 2 === 0 ? 5 : -5),
+      awaDeg: -120,
+      timestampS: ++t,
+      seaState: 4,
+    });
+  }
+  assert.strictEqual(st.transient, false, "ss4 seaway must re-stabilize");
+});
+
+test("the same swell motion in flat-water tolerances keeps the window open", () => {
+  const st = new TrainingState({ settleSustainS: 10 });
+  let t = sustainedTurn(st, {
+    t: 0,
+    from: 280,
+    rateDegS: 8,
+    seconds: 7,
+    heel: 4,
+    awa: -120,
+  });
+  for (let i = 0; i < 8; i++) {
+    updateTransient(st, {
+      headingDeg: 336,
+      heelDeg: 4,
+      awaDeg: -120,
+      timestampS: ++t,
+    });
+  }
+  for (let i = 1; i <= 20; i++) {
+    updateTransient(st, {
+      headingDeg: 336 + (i % 2 === 0 ? 8 : -8),
+      heelDeg: 4 + (i % 2 === 0 ? 5 : -5),
+      awaDeg: -120,
+      timestampS: ++t,
+    });
+  }
+  assert.strictEqual(
+    st.transient,
+    true,
+    "base tolerances must not absorb ss4 swell",
+  );
+});
+
+test("TRANSIENT_MAX_S force-closes a latched window without a maneuver", () => {
+  const st = new TrainingState();
+  let t = sustainedTurn(st, {
+    t: 0,
+    from: 280,
+    rateDegS: 8,
+    seconds: 7,
+    heel: 4,
+    awa: -120,
+  });
+  assert.strictEqual(st.transient, true);
+  // Prime detectManeuver's per-tick edge tracking while open.
+  assert.strictEqual(
+    detectManeuver(st, { awaDeg: -120, headingDeg: 336 }),
+    null,
+  );
+  // Sailing on in seaway, never within flat-water tolerance…
+  for (let i = 1; i <= TRANSIENT_MAX_S; i++) {
+    updateTransient(st, {
+      headingDeg: 336 + (i % 2 === 0 ? 8 : -8),
+      heelDeg: 4 + (i % 2 === 0 ? 5 : -5),
+      awaDeg: -120,
+      timestampS: ++t,
+    });
+  }
+  assert.strictEqual(
+    st.transient,
+    false,
+    "latch breaker must close the window",
+  );
+  assert.strictEqual(st.suppressManeuver, true);
+  assert.strictEqual(
+    detectManeuver(st, { awaDeg: -120, headingDeg: 336 }),
+    null,
+    "forced close must not classify a maneuver",
+  );
 });
 
 test("tick is not eligible during an open transient window", () => {
@@ -321,15 +483,18 @@ test("tick is not eligible during an open transient window", () => {
   // Prime ground truth with two benign fixes.
   tick(st, snap({ timestampS: 0, gps: { latitude: 60, longitude: 24 } }));
   tick(st, snap({ timestampS: 1, gps: { latitude: 60, longitude: 24.0001 } }));
-  // Now a sharp turn opens the window.
-  const r = tick(
-    st,
-    snap({
-      timestampS: 2,
-      headingTrueDeg: 60,
-      gps: { latitude: 60, longitude: 24.0002 },
-    }),
-  );
+  // A sustained turn opens the window.
+  let r = null;
+  for (let t = 2; t <= 9; t++) {
+    r = tick(
+      st,
+      snap({
+        timestampS: t,
+        headingTrueDeg: 10 * (t - 1),
+        gps: { latitude: 60, longitude: 24.0002 },
+      }),
+    );
+  }
   assert.strictEqual(r.transient, true);
   assert.strictEqual(r.eligible, false);
 });
@@ -338,26 +503,32 @@ test("tick resumes eligibility after the transient window closes", () => {
   const st = new TrainingState();
   tick(st, snap({ timestampS: 0, gps: { latitude: 60, longitude: 24 } }));
   tick(st, snap({ timestampS: 1, gps: { latitude: 60, longitude: 24.0001 } }));
-  // Open transient at t=2 (snap defaults heel=10, awa=45, recorded at open).
-  tick(
-    st,
-    snap({
-      timestampS: 2,
-      headingTrueDeg: 60,
-      gps: { latitude: 60, longitude: 24.0002 },
-    }),
-  );
-  // Settle: hold the post-turn heading but heel/AWA matching the open-window
-  // values, past SETTLE_SUSTAIN_S.
-  for (let t = 3; t < 3 + SETTLE_SUSTAIN_S + 1; t++) {
+  let t = 1;
+  for (let i = 1; i <= 7; i++) {
+    t += 1;
     tick(
       st,
       snap({
         timestampS: t,
-        headingTrueDeg: 60,
+        headingTrueDeg: 10 * i,
         awaDeg: 45,
         heelDeg: 10,
-        gps: { latitude: 60, longitude: 24.0002 + t * 0.00001 },
+        gps: { latitude: 60, longitude: 24.0002 },
+      }),
+    );
+  }
+  // Settle: hold the post-turn heading but heel/AWA matching the open-window
+  // values, past SETTLE_SUSTAIN_S.
+  for (let i = 0; i < SETTLE_SUSTAIN_S + 8; i++) {
+    t += 1;
+    tick(
+      st,
+      snap({
+        timestampS: t,
+        headingTrueDeg: 70,
+        awaDeg: 45,
+        heelDeg: 10,
+        gps: { latitude: 60, longitude: 24.0002 + i * 0.00001 },
       }),
     );
   }
@@ -365,8 +536,8 @@ test("tick resumes eligibility after the transient window closes", () => {
   const r = tick(
     st,
     snap({
-      timestampS: 3 + SETTLE_SUSTAIN_S + 2,
-      headingTrueDeg: 60,
+      timestampS: t + 2,
+      headingTrueDeg: 70,
       awaDeg: 45,
       heelDeg: 10,
       stwKn: 5,
@@ -374,11 +545,8 @@ test("tick resumes eligibility after the transient window closes", () => {
     }),
   );
   assert.strictEqual(r.transient, false);
-  // Eligibility also needs a fresh SOG/COG derivation; ensure the path
-  // doesn't crash and observation is computed when eligible.
   if (r.eligible) assert.ok(r.observation);
 });
-
 test("classifyManeuver: tack across the 0/360 seam and at mid angles", () => {
   const { classifyManeuver } = require("../plugin/training.js");
   // Starboard close-hauled (~30°) to port (~330°) — crosses the seam.
@@ -398,126 +566,114 @@ test("classifyManeuver: gybe across 180", () => {
 });
 
 test("detectManeuver fires on the transient close edge with the open AWA", () => {
-  const { TrainingState, detectManeuver, SETTLE_SUSTAIN_S } =
-    require("../plugin/training.js");
   const st = new TrainingState();
-  // Prime the previous-heading so the first snapshot can compute ROT.
   let t = 0;
-  const snap = (heading, awa) => ({
-    headingDeg: heading,
-    heelDeg: 0,
-    awaDeg: awa,
-    timestampS: t++,
-  });
-
-  // Steady starboard close-hauled, then snap the heading: ROT opens the window.
-  let tr = false;
-  tr = require("../plugin/training.js").updateTransient(st, snap(350, 30));
-  assert.strictEqual(tr, false);
-  tr = require("../plugin/training.js").updateTransient(st, snap(30, 330));
-  assert.strictEqual(tr, true);
+  const at = (heading, awa, ts) =>
+    updateTransient(st, {
+      headingDeg: heading,
+      heelDeg: 0,
+      awaDeg: awa,
+      timestampS: ts,
+    });
+  // Steady starboard close-hauled…
+  for (let i = 0; i < 7; i++) at(350, 30, t++);
+  // …then a sustained tack onto port: opens the window once ROT is
+  // measurable across the full window; the pre-maneuver AWA (30) is
+  // retained for classification.
+  for (let i = 1; i <= 7; i++) at(350 + 6 * i, 330, t++);
+  assert.strictEqual(st.transient, true);
   // While the window is open: no maneuver detection.
-  assert.strictEqual(detectManeuver(st, { awaDeg: 330, headingDeg: 30 }), null);
-  // Re-stabilize on port: heel/AWA steady for SETTLE_SUSTAIN_S closes it.
-  for (let i = 0; i < SETTLE_SUSTAIN_S; i++) {
-    tr = require("../plugin/training.js").updateTransient(st, snap(30, 330));
-  }
-  assert.strictEqual(tr, false);
+  assert.strictEqual(
+    detectManeuver(st, { awaDeg: 330, headingDeg: 392 % 360 }),
+    null,
+  );
+  // Re-stabilize on port (plus ROT-window decay margin) closes it.
+  const settled = 392 % 360;
+  for (let i = 0; i < SETTLE_SUSTAIN_S + 8; i++) at(settled, 330, t++);
+  assert.strictEqual(st.transient, false);
   // Falling edge: tack detected with the new heading.
-  const m = detectManeuver(st, { awaDeg: 330, headingDeg: 30 });
-  assert.deepStrictEqual(m, { direction: "tack", newHeadingDeg: 30 });
+  const m = detectManeuver(st, { awaDeg: 330, headingDeg: settled });
+  assert.deepStrictEqual(m, { direction: "tack", newHeadingDeg: settled });
   // Not a second time.
-  assert.strictEqual(detectManeuver(st, { awaDeg: 330, headingDeg: 30 }), null);
+  assert.strictEqual(
+    detectManeuver(st, { awaDeg: 330, headingDeg: settled }),
+    null,
+  );
 });
 
 test("detectManeuver: a window that closed without an AWA band crossing yields null", () => {
-  const { TrainingState, updateTransient, detectManeuver, SETTLE_SUSTAIN_S } =
-    require("../plugin/training.js");
   const st = new TrainingState();
   let t = 0;
-  const snap = (heading, awa) => ({
-    headingDeg: heading,
-    heelDeg: 0,
-    awaDeg: awa,
-    timestampS: t++,
-  });
-  updateTransient(st, snap(100, 100));
-  updateTransient(st, snap(140, 100)); // hard course change opens the window; AWA stays ~100
-  for (let i = 0; i < SETTLE_SUSTAIN_S; i++)
-    updateTransient(st, snap(140, 100));
+  const at = (heading, awa, ts) =>
+    updateTransient(st, {
+      headingDeg: heading,
+      heelDeg: 0,
+      awaDeg: awa,
+      timestampS: ts,
+    });
+  for (let i = 0; i < 7; i++) at(100, 100, t++);
+  for (let i = 1; i <= 7; i++) at(100 + 6 * i, 100, t++); // hard sustained change, AWA stays ~100
+  for (let i = 0; i < SETTLE_SUSTAIN_S + 8; i++) at(142, 100, t++);
   assert.strictEqual(st.transient, false);
   assert.strictEqual(
-    detectManeuver(st, { awaDeg: 100, headingDeg: 140 }),
+    detectManeuver(st, { awaDeg: 100, headingDeg: 142 }),
     null,
   );
 });
 
 test("transient window stays open while the heading is still settling", () => {
-  const { TrainingState, updateTransient, detectManeuver } =
-    require("../plugin/training.js");
   const st = new TrainingState({ settleSustainS: 2 });
   let t = 0;
-  const snap = (heading, awa) => ({
-    headingDeg: heading,
-    heelDeg: 0,
-    awaDeg: awa,
-    timestampS: t++,
-  });
-
-  updateTransient(st, snap(350, 30)); // steady starboard close-hauled
-  updateTransient(st, snap(30, 330)); // tack: ROT spike opens the window
-  // Heel + AWA steady, but the boat keeps bearing away 8°/tick — the
-  // heading reference refreshes as ROT stays high, window stays open,
-  // and even low-ROT drift of >5°/tick must NOT accumulate settle time.
-  updateTransient(st, snap(38, 330)); // 8°/s: still ROT-transient
-  updateTransient(st, snap(46, 330)); // 8°/s: still transient
-  assert.strictEqual(st.transient, true, "window open while heading swings");
-  assert.strictEqual(detectManeuver(st, { awaDeg: 330, headingDeg: 46 }), null);
-
+  const at = (heading, awa, ts) =>
+    updateTransient(st, {
+      headingDeg: heading,
+      heelDeg: 0,
+      awaDeg: awa,
+      timestampS: ts,
+    });
+  for (let i = 0; i < 7; i++) at(350, 30, t++); // steady starboard close-hauled
+  for (let i = 1; i <= 7; i++) at(350 + 6 * i, 330, t++); // sustained tack opens
+  // Heel + AWA steady, but the boat keeps bearing away — sustained ROT
+  // above the threshold keeps refreshing the reference and resetting the
+  // settle clock.
+  for (let i = 1; i <= 8; i++) at(392 + 5 * i, 330, t++);
+  assert.strictEqual(
+    st.transient,
+    true,
+    "window open while heading still swings",
+  );
+  // Prime detectManeuver's per-tick edge tracking while open (it is
+  // called every tick in production).
+  assert.strictEqual(
+    detectManeuver(st, { awaDeg: 330, headingDeg: 432 }),
+    null,
+  );
   // Now hold steady on the settled course: settle clock accumulates and
   // the close edge fires with the *settled* heading.
-  updateTransient(st, snap(48, 330));
-  updateTransient(st, snap(48, 330));
+  const settled = 432;
+  for (let i = 0; i < 4; i++) at(settled, 330, t++);
   assert.strictEqual(st.transient, false, "closed after heading settled");
-  const m = detectManeuver(st, { awaDeg: 330, headingDeg: 48 });
-  assert.deepStrictEqual(m, { direction: "tack", newHeadingDeg: 48 });
+  const m = detectManeuver(st, { awaDeg: 330, headingDeg: settled });
+  assert.deepStrictEqual(m, { direction: "tack", newHeadingDeg: settled });
 });
 
-test("a window whose heel/AWA steadied but heading drifts >5° does not close", () => {
-  const { TrainingState, updateTransient } = require("../plugin/training.js");
+test("a window whose heel/AWA steadied but heading drifts past tolerance does not close", () => {
   const st = new TrainingState({ settleSustainS: 2 });
   let t = 0;
-  const snap = (heading, awa) => ({
-    headingDeg: heading,
-    heelDeg: 0,
-    awaDeg: awa,
-    timestampS: t++,
-  });
-  updateTransient(st, snap(350, 30));
-  updateTransient(st, snap(30, 330)); // open
-  // Low-ROT (2°/s < 3°/s gate) but steady 6° drift per tick: each tick is
-  // outside the 5° band of the frozen reference → settle clock never runs.
-  updateTransient(st, snap(36, 330)); // ROT 6/s — actually transient; use 2° steps
-  // (6°/s ROT > 3 threshold anyway; to test the band specifically, freeze
-  // the reference first with a slow tick, then drift slowly.)
-  updateTransient(st, snap(37, 330)); // ROT 1/s < 3: reference frozen at 37
-  updateTransient(st, snap(44, 330)); // ROT 7/s — high again, refreshes
-  // Simpler direct case: ROT low, drift 6° over two ticks = 3°/s (< gate):
-  const st2 = new TrainingState({ settleSustainS: 2 });
-  let u = 0;
-  const snap2 = (heading, awa) => ({
-    headingDeg: heading,
-    heelDeg: 0,
-    awaDeg: awa,
-    timestampS: u++,
-  });
-  updateTransient(st2, snap2(350, 30));
-  updateTransient(st2, snap2(30, 330)); // open, reference heading = 30
-  updateTransient(st2, snap2(36, 330)); // 6°/s → ROT high, reference → 36
-  updateTransient(st2, snap2(39, 330)); // 3°/s — at gate, not above: drift continues
-  assert.strictEqual(st2.transient, true);
-  // |39−36| = 3 ≤ 5 → headingOk, but settle only 1s < 2s: still open.
-  updateTransient(st2, snap2(42, 330)); // |42−36| = 6 > 5 → NOT ok, reset
-  assert.strictEqual(st2.stabilizedS, 0, "settle clock reset by heading drift");
-  assert.strictEqual(st2.transient, true);
+  const at = (heading, awa, ts) =>
+    updateTransient(st, {
+      headingDeg: heading,
+      heelDeg: 0,
+      awaDeg: awa,
+      timestampS: ts,
+    });
+  for (let i = 0; i < 7; i++) at(350, 30, t++);
+  for (let i = 1; i <= 7; i++) at(350 + 6 * i, 330, t++); // open, heading 392
+  // ROT falls below the gate; the reference freezes — then a slow drift
+  // beyond the heading tolerance must reset the settle clock.
+  at(394, 330, t++);
+  at(396, 330, t++);
+  at(403, 330, t++); // |403−394| > 5° from the frozen reference
+  assert.strictEqual(st.stabilizedS, 0, "settle clock reset by heading drift");
+  assert.strictEqual(st.transient, true);
 });

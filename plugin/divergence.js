@@ -44,12 +44,14 @@ const DEFAULT_SUSTAIN_S = 30;
 const DEFAULT_CLEAR_S = 30;
 
 /**
- * Deadband (nm) on the exceedance comparison. At 2 mm this is far below
- * any instrument resolution; it exists so that a post-snap divergence of
- * floating-point epsilon (~1e-9 nm from repeated destinationPoint calls)
- * against an exactly-zero radius does not count as exceeding.
+ * Deadband (nm) on the exceedance comparison — instrument resolution,
+ * not floating-point epsilon. At 2 mm (the previous value) a divergence
+ * a hair over the threshold prints as "0.27 nm exceeds expected 0.27 nm"
+ * (sea trial 2026-08-30…09-05), and a zero-radius fresh fix lets GPS
+ * noise raise the advisory as "0.00 nm exceeds expected 0.00 nm". At
+ * ~9 m real disagreement is required before it counts as exceeding.
  */
-const EPS_NM = 1e-6;
+const EPS_NM = 0.005;
 
 /**
  * Creates a fresh monitor state.

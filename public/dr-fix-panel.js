@@ -365,13 +365,16 @@ class DrFixPanel extends HTMLElement {
   }
 
   /**
-   * @returns {Record<string, string>}
+   * @returns {Record<string, string | boolean>}
    */
   readForm() {
     const data = {};
     if (!this.form) return data;
     for (const el of this.form.querySelectorAll("input, select")) {
-      if (el.name) data[el.name] = el.value;
+      // Checkbox .value is always "on" — checked state lives in .checked
+      // (sea trial 2026-08-31 lesson from the sight panel's noon bug).
+      if (el.name)
+        data[el.name] = el.type === "checkbox" ? el.checked : el.value;
     }
     return data;
   }

@@ -77,7 +77,11 @@ const {
   recordCircularPositionLine,
   attachObservationsToFix,
 } = require("./db.js");
-const { resolveCandidateFix, confirmFix } = require("./fix-pipeline.js");
+const {
+  resolveCandidateFix,
+  confirmFix,
+  evaluateObservationPlausibility,
+} = require("./fix-pipeline.js");
 const { reduceSight, reduceNoonSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
 const { registerPlotterExtension } = require("./plotterext.js");
@@ -305,6 +309,18 @@ const DEFAULT_CONFIG = {
   },
   training: {
     settleSustainS: null, // null → module default (10s)
+    rotWindowS: null, // null → module default (6s)
+  },
+  /**
+   * Fix-confirmation guard (sea trial 2026-08-31: a garbage sight was
+   * confirmed as a fix 3058 NM from DR and snapped the shadow boat to
+   * 69°S). A candidate farther than maxDisplacementNm from the current
+   * DR origin is rejected on confirm unless the request carries
+   * `force: true`. Fixes that don't reset the DR origin (resets: false,
+   * e.g. logbook-only backfills) are exempt.
+   */
+  fixes: {
+    maxDisplacementNm: 100,
   },
   weatherCurrent: {
     enabled: true,
@@ -341,6 +357,7 @@ const deps = {
   attachObservationsToFix,
   resolveCandidateFix,
   confirmFix,
+  evaluateObservationPlausibility,
   computeRadius,
   createDivergenceState,
   divergenceTick,
@@ -676,6 +693,10 @@ module.exports = (app) => {
         ...DEFAULT_CONFIG.divergence,
         ...(opts.divergence ?? {}),
       };
+      config.fixes = {
+        ...DEFAULT_CONFIG.fixes,
+        ...(opts.fixes ?? {}),
+      };
       config.sensorHealth = {
         ...DEFAULT_CONFIG.sensorHealth,
         ...(opts.sensorHealth ?? {}),
@@ -759,6 +780,7 @@ module.exports = (app) => {
       }
       training = new deps.TrainingState({
         settleSustainS: config.training.settleSustainS,
+        rotWindowS: config.training.rotWindowS,
       });
       divergence = deps.createDivergenceState();
       fouledFlag = deps.createFlagState();
@@ -784,6 +806,17 @@ module.exports = (app) => {
       // continues the uncertainty polygon rather than resetting it.
       const logSinceOrigin = deps.getState(db, "dr_log_since_origin");
       if (logSinceOrigin) engine.logNmSinceOrigin = Number(logSinceOrigin) || 0;
+      const elapsedSinceOriginS = deps.getState(
+        db,
+        "dr_elapsed_since_origin_s",
+      );
+      if (elapsedSinceOriginS != null) {
+        engine.elapsedSinceOriginS = Number(elapsedSinceOriginS) || 0;
+      }
+      const originErrorNm = deps.getState(db, "dr_origin_error_nm");
+      if (originErrorNm != null) {
+        engine.originErrorNm = Number(originErrorNm) || 0;
+      }
 
       // Shadow vessel (work doc #21): publish the DR position as a synthetic
       // vessels.<id> target so chart plotters render it. The context is a
@@ -1055,7 +1088,37 @@ module.exports = (app) => {
       });
     }
 
-    if (opts.resets !== false) engine.snapToFix(fix);
+    if (opts.resets !== false)
+      engine.snapToFix(fix, opts.estimatedErrorNm ?? 0.05);
+  }
+
+  /**
+   * Speed-plausibility gate for observation submission (sea trial
+   * 2026-09-06): an observation whose reduction implies the vessel
+   * traveled faster than MAX_IMPLIED_SPEED_KN from the last origin-reset
+   * fix is a bad sight or bad input, not navigation — reject it at entry
+   * so the user can fix it in the form.
+   *
+   * Returns a rejection message, or null when the observation passes
+   * (or cannot be judged — no DR origin, or the observation predates it).
+   *
+   * @param {number|null} displacementNm - implied displacement from the
+   *   DR origin to the reduced observation (nm): intercept magnitude for
+   *   a celestial sight, perpendicular distance to a bearing LOP,
+   *   radial miss for a CPL
+   * @param {number} observationEpochMs - the observation's own timestamp
+   * @returns {string|null}
+   */
+  function implausibleObservationMsg(displacementNm, observationEpochMs) {
+    if (!engine?.origin) return null;
+    const elapsedS =
+      engine.elapsedSinceOriginS - (Date.now() - observationEpochMs) / 1000;
+    const verdict = deps.evaluateObservationPlausibility({
+      displacementNm,
+      elapsedS,
+    });
+    if (verdict.skipped || verdict.ok) return null;
+    return `Observation implies ${verdict.impliedKn.toFixed(0)} kn since the last fix (${displacementNm.toFixed(1)} NM in ${(Math.max(elapsedS, 0) / 3600).toFixed(1)} h) — physically impossible; check the sight altitude, time, and assumed position`;
   }
 
   /**
@@ -1346,6 +1409,7 @@ module.exports = (app) => {
         awaDeg,
         awsKn,
         heelDeg: heel ?? 0,
+        seaState: seaState === "unknown" ? null : Number(seaState),
         propulsionState: deltaState.get("propulsion.main.state"),
         current,
         lookupLeewayDeg: corrections.leeway_angle,
@@ -1439,6 +1503,9 @@ module.exports = (app) => {
       });
       const u = deps.computeRadius({
         elapsedDistanceNm: engine.logNmSinceOrigin,
+        elapsedS: engine.elapsedSinceOriginS,
+        currentTier: current.tier,
+        originErrorNm: engine.originErrorNm,
         effectiveHitCount: corrections.hit_count,
         deviationRows: devRows,
         stwKn,
@@ -1468,9 +1535,10 @@ module.exports = (app) => {
           config.divergence,
         );
         if (d.transition === "raise") {
+          const margin = d.divergenceNm - d.expectedNm;
           publishNotification(PATHS.divergenceAdvisory, {
             state: "alert",
-            message: `DR-GPS divergence ${d.divergenceNm.toFixed(2)} nm exceeds expected ${d.expectedNm.toFixed(2)} nm (uncertainty × ${config.divergence.factor}) — consider taking a fix`,
+            message: `DR-GPS divergence ${d.divergenceNm.toFixed(2)} nm exceeds expected ${d.expectedNm.toFixed(2)} nm by ${margin.toFixed(2)} nm (uncertainty × ${config.divergence.factor}) — consider taking a fix`,
           });
         } else if (d.transition === "clear") {
           publishNotification(PATHS.divergenceAdvisory, {
@@ -2090,6 +2158,15 @@ module.exports = (app) => {
     deps.setState(db, "dr_log_nm", String(engine.logNm));
     deps.setState(db, "dr_trip_log_nm", String(engine.tripLogNm));
     deps.setState(db, "dr_log_since_origin", String(engine.logNmSinceOrigin));
+    // Sea trial 2026-09-06: elapsed time drives the current-knowledge
+    // term of the uncertainty cone — a restart must not zero it, or the
+    // cone collapses mid-excursion and "since last fix" under-reports.
+    deps.setState(
+      db,
+      "dr_elapsed_since_origin_s",
+      String(Math.round(engine.elapsedSinceOriginS)),
+    );
+    deps.setState(db, "dr_origin_error_nm", String(engine.originErrorNm));
   }
 
   // --- REST API ----------------------------------------------------------
@@ -2278,6 +2355,26 @@ module.exports = (app) => {
           .json({ message: "assumed_lat, assumed_lon, azimuth_true required" });
         return;
       }
+      // Speed-plausibility gate: perpendicular distance from the DR
+      // origin to the bearing line. `azimuth_true` is the line's NORMAL
+      // (celestial Zn; bearing rotated +90), so the perpendicular
+      // distance is the projection of the origin offset onto the normal.
+      if (engine.origin) {
+        const lopPoint = { latitude: b.assumed_lat, longitude: b.assumed_lon };
+        const d = deps.distanceNm(lopPoint, engine.origin);
+        const brg = deps.bearingDeg(lopPoint, engine.origin);
+        const perp = Math.abs(
+          d * Math.cos(((brg - b.azimuth_true) * Math.PI) / 180),
+        );
+        const gateMsg = implausibleObservationMsg(
+          perp,
+          Date.parse(b.timestamp ?? new Date().toISOString()),
+        );
+        if (gateMsg) {
+          res.status(400).json({ message: gateMsg });
+          return;
+        }
+      }
       const id = deps.recordLineOfPosition(db, {
         timestamp: b.timestamp ?? new Date().toISOString(),
         lop_type: b.lop_type || "bearing",
@@ -2335,6 +2432,24 @@ module.exports = (app) => {
           .json({ message: "center_lat, center_lon, radius_nm required" });
         return;
       }
+      // Speed-plausibility gate: radial miss between the DR origin and
+      // the circle of position.
+      if (engine.origin) {
+        const miss = Math.abs(
+          deps.distanceNm(
+            { latitude: b.center_lat, longitude: b.center_lon },
+            engine.origin,
+          ) - b.radius_nm,
+        );
+        const gateMsg = implausibleObservationMsg(
+          miss,
+          Date.parse(b.timestamp ?? new Date().toISOString()),
+        );
+        if (gateMsg) {
+          res.status(400).json({ message: gateMsg });
+          return;
+        }
+      }
       const id = deps.recordCircularPositionLine(db, {
         timestamp: b.timestamp ?? new Date().toISOString(),
         cpl_type: b.cpl_type || "vertical-angle",
@@ -2344,6 +2459,9 @@ module.exports = (app) => {
         radius_uncertainty_nm: b.radius_uncertainty_nm ?? null,
         source_object: b.source_object ?? null,
         confirmed_by: b.confirmed_by ?? null,
+        // Raw inputs (schema v2) for backtesting.
+        raw_angle_deg: b.angle_deg ?? null,
+        object_height_m: b.height_m ?? null,
       });
       const obsBy = b.confirmed_by || usernameFromCookies(req.cookies) || null;
       writeLogbookEntry(
@@ -2427,6 +2545,20 @@ module.exports = (app) => {
         res.status(400).json({ message: err.message });
         return;
       }
+      // Speed-plausibility gate (sea trial 2026-09-06): a reduction that
+      // puts the vessel somewhere unreachable since the last fix is a
+      // bad sight or bad input — reject at entry, in the form.
+      const assumedForGate = b.assumed_position ?? engine.origin;
+      const gateDisplacementNm = assumedForGate
+        ? b.noon
+          ? Math.abs(result.assumed_lat - assumedForGate.latitude) * 60
+          : Math.abs(result.intercept_nm)
+        : null;
+      const gateMsg = implausibleObservationMsg(gateDisplacementNm, b.epoch_ms);
+      if (gateMsg) {
+        res.status(400).json({ message: gateMsg });
+        return;
+      }
       const lopId = deps.recordLineOfPosition(db, {
         timestamp: new Date(b.epoch_ms).toISOString(),
         lop_type: "celestial",
@@ -2436,6 +2568,13 @@ module.exports = (app) => {
         intercept_nm: result.intercept_nm,
         body_or_object: result.body,
         confirmed_by: b.confirmed_by ?? null,
+        // Raw inputs + computed altitudes (schema v2) for backtesting.
+        raw_hs_deg: b.hs_deg,
+        index_correction_deg: b.index_correction_deg ?? null,
+        eye_height_m: b.eye_height_m ?? null,
+        limb: b.limb ?? null,
+        ho_deg: result.ho_deg,
+        hc_deg: result.hc_deg,
       });
       const obsBy = b.confirmed_by || usernameFromCookies(req.cookies) || null;
       writeLogbookEntry(
@@ -2553,7 +2692,19 @@ module.exports = (app) => {
         res.status(400).json({ message: "observations not resolvable" });
         return;
       }
-      res.json({ candidate });
+      // Preview context (sea trial 2026-08-31): surface how far the
+      // candidate sits from the current DR origin so the UI can flag a
+      // gross candidate before a human confirms it.
+      const displacementNm = engine.origin
+        ? deps.distanceNm(engine.origin, candidate)
+        : null;
+      res.json({
+        candidate,
+        displacement_nm: displacementNm,
+        gross:
+          displacementNm != null &&
+          displacementNm > config.fixes.maxDisplacementNm,
+      });
     });
 
     /**
@@ -2661,6 +2812,21 @@ module.exports = (app) => {
       if (!candidate) {
         res.status(400).json({ message: "observations not resolvable" });
         return;
+      }
+
+      // Gross-displacement guard (sea trial 2026-08-31): a candidate a
+      // whole ocean away from the DR origin is a bad sight or bad input,
+      // not navigation. Reject on confirm unless explicitly forced;
+      // fixes that don't reset the origin (logbook-only backfills) pass.
+      if (resets && engine.origin) {
+        const displacementNm = deps.distanceNm(engine.origin, candidate);
+        if (displacementNm > config.fixes.maxDisplacementNm && !b.force) {
+          res.status(422).json({
+            message: `Fix is ${displacementNm.toFixed(1)} NM from the current DR position — beyond the ${config.fixes.maxDisplacementNm} NM sanity cap. Check the sight/coordinates, or re-confirm with force if this is really right`,
+            displacement_nm: displacementNm,
+          });
+          return;
+        }
       }
 
       const result = deps.confirmFix(db, candidate, engine, helpers, {

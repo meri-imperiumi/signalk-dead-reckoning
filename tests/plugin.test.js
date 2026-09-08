@@ -6,6 +6,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { mkdtemp, rm } = require("node:fs/promises");
+const { mkdtempSync } = require("node:fs");
 const { join } = require("node:path");
 const { tmpdir } = require("node:os");
 const { DatabaseSync } = require("node:sqlite");
@@ -45,7 +46,10 @@ test.after(async () => {
  */
 function makeStarted() {
   const app = new FakeSignalKApp();
-  app.dataPath = tempDir;
+  // Fresh data dir per call: the speed-plausibility gate and restart
+  // persistence make cross-test DB leakage (a stale restored DR origin)
+  // observable, so each test owns its database.
+  app.dataPath = mkdtempSync(join(tmpdir(), "dr-plugin-"));
   const plugin = makePlugin(app);
   plugin.start({});
   const router = new FakeRouter();
@@ -2332,14 +2336,15 @@ test("logbook: completed tack writes one entry, debounced for a second maneuver"
     return { ok: true, status: 201 };
   };
   try {
-    // Short settle + debounce so the test runs fast; fast tick so ROT
-    // accumulates over seconds, not ticks. Settle (1s) must elapse after
-    // the turn before the entry fires, and the debounce (10s) keeps the
-    // second maneuver suppressed for the remainder of the test.
+    // Short settle, ROT window and debounce so the test runs fast. The
+    // transient window opens only on a turn sustained across the ROT
+    // window (1 s at 100 ms ticks) and closes after re-stabilization,
+    // firing the tack entry on the falling edge; the debounce (10 s)
+    // keeps the second maneuver suppressed for the remainder.
     plugin.start({
       tickIntervalMs: 100,
       logbook: { enabled: true, token: "tok", tackDebounceS: 10 },
-      training: { settleSustainS: 1 },
+      training: { settleSustainS: 1, rotWindowS: 1 },
     });
     const router = new FakeRouter();
     plugin.registerWithRouter(router);
@@ -2360,14 +2365,19 @@ test("logbook: completed tack writes one entry, debounced for a second maneuver"
           },
         ],
       });
-    // Steady starboard close-hauled for a few ticks (AWA 30° starboard).
-    for (let i = 0; i < 5; i++) emit(350, (30 * Math.PI) / 180);
-    await new Promise((r) => setTimeout(r, 150));
-    // Snap onto port (heading 30, AWA 330°) — ROT spike opens the window.
-    for (let i = 0; i < 5; i++) emit(30, (330 * Math.PI) / 180);
-    // Settle: heel+AWA+heading must hold for settleSustainS after the turn
-    // stops, then the entry fires. 2.5s ≫ 1s settle + fetch margin.
-    await new Promise((r) => setTimeout(r, 2500));
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // A sustained tack: ~20 deg/s for 2 s crosses the 1 s ROT window well
+    // above the 3 deg/s gate — a snap-change-only turn no longer opens
+    // the window (sea-trial rolling-ROT fix).
+    for (let i = 0; i <= 20; i++) {
+      emit((350 + i * 2) % 360, ((i < 10 ? 30 : 330) * Math.PI) / 180);
+      await sleep(100);
+    }
+    // Settle: heading/heel/AWA steady past settleSustainS + window decay.
+    for (let i = 0; i < 25; i++) {
+      emit(30, (330 * Math.PI) / 180);
+      await sleep(100);
+    }
     const tacks = posts.filter((p) => /Tack to/.test(p.body.text));
     assert.strictEqual(
       tacks.length,
@@ -2378,8 +2388,14 @@ test("logbook: completed tack writes one entry, debounced for a second maneuver"
     assert.ok(tacks[0].body.datetime);
 
     // An immediate second maneuver inside the debounce window logs nothing.
-    for (let i = 0; i < 5; i++) emit(350, (30 * Math.PI) / 180);
-    await new Promise((r) => setTimeout(r, 2500));
+    for (let i = 0; i <= 20; i++) {
+      emit((30 + i * 2) % 360, ((i < 10 ? 330 : 30) * Math.PI) / 180);
+      await sleep(100);
+    }
+    for (let i = 0; i < 25; i++) {
+      emit(70, (30 * Math.PI) / 180);
+      await sleep(100);
+    }
     const tacks2 = posts.filter((p) => /Tack to/.test(p.body.text));
     assert.strictEqual(
       tacks2.length,
@@ -2654,7 +2670,7 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
       lop_type: "bearing",
       assumed_lat: 60,
       assumed_lon: 24,
-      azimuth_true: 135,
+      azimuth_true: 116,
       body_or_object: "lighthouse",
     });
     assert.strictEqual(status, 200);
@@ -2662,7 +2678,7 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
     assert.strictEqual(posts.length, 1, "observation logbook entry POSTed");
     const entry = posts[0].body;
     assert.strictEqual(entry.category, "navigation");
-    assert.match(entry.text, /lighthouse bearing 135°T/);
+    assert.match(entry.text, /lighthouse bearing 116°T/);
     assert.strictEqual(entry.position.source, "DR");
     // The entry's position is the vessel's DR, not the object's charted
     // position (assumed_lat/lon 60,24 is the lighthouse).
@@ -3660,7 +3676,7 @@ test("ground-track samples survive a plugin restart and still advance fixes (wor
 
   // "Restart": a fresh plugin instance over the same data dir/db.
   const app2 = new FakeSignalKApp();
-  app2.dataPath = tempDir;
+  app2.dataPath = app.dataPath;
   const plugin2 = makePlugin(app2);
   plugin2.start({});
   const router2 = new FakeRouter();
@@ -3675,8 +3691,11 @@ test("ground-track samples survive a plugin restart and still advance fixes (wor
   }).body.lop_id;
   const late = router2.invoke("post", "/fix/lop", {
     lop_type: "bearing",
+    // N-S line (azimuth 90 = normal) essentially through the vessel —
+    // a 0.4° offset would put the sight 12 NM off a seconds-old origin
+    // and the speed-plausibility gate would (correctly) reject it.
     assumed_lat: 60,
-    assumed_lon: 24.4,
+    assumed_lon: 24.001,
     azimuth_true: 90,
     timestamp: new Date(lateTs).toISOString(),
   }).body.lop_id;

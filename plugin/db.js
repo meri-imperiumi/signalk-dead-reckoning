@@ -88,6 +88,12 @@ const SCHEMA_DDL = [
     body_or_object TEXT,
     confirmed_by TEXT,
     used_in_fix_id INTEGER,
+    raw_hs_deg REAL,
+    index_correction_deg REAL,
+    eye_height_m REAL,
+    limb TEXT,
+    ho_deg REAL,
+    hc_deg REAL,
     FOREIGN KEY (used_in_fix_id) REFERENCES fixes(fix_id)
   )`,
 
@@ -102,6 +108,8 @@ const SCHEMA_DDL = [
     source_object TEXT,
     confirmed_by TEXT,
     used_in_fix_id INTEGER,
+    raw_angle_deg REAL,
+    object_height_m REAL,
     FOREIGN KEY (used_in_fix_id) REFERENCES fixes(fix_id)
   )`,
 
@@ -193,18 +201,86 @@ function openDatabase(dbPath) {
   for (const stmt of SCHEMA_DDL) {
     db.exec(stmt);
   }
-  // v1 → v2: running-fix provenance column on `fixes`. Fresh databases
-  // get the column from the DDL above; existing ones are altered in
-  // place. The stored version is read *after* the DDL (it creates
-  // dr_state_store on a fresh database, where there is nothing to
-  // migrate) and *before* the new version is recorded below.
-  const storedVersion = getState(db, "schema_version");
-  if (storedVersion != null && Number(storedVersion) < 2) {
-    db.exec("ALTER TABLE fixes ADD COLUMN derived_from_fix_id INTEGER");
-  }
+  migrate(db);
   // Record schema version so future migrations can branch on it.
   setState(db, "schema_version", String(SCHEMA_VERSION));
   return db;
+}
+
+/**
+ * Column additions applied via ALTER TABLE, guarded by PRAGMA table_info
+ * so each is idempotent. Run unconditionally on open — the sea-trial
+ * database carried a schema_version written by a build whose numbering
+ * doesn't match this tree's history, so version-gated migrations would
+ * silently skip. Each step is cheap (one PRAGMA read).
+ *
+ * @type {Array<{table: string, column: string, ddl: string}>}
+ */
+const COLUMN_MIGRATIONS = [
+  // Schema v2 (running fix): provenance for single-observation running
+  // fixes advanced from a previous confirmed fix.
+  {
+    table: "fixes",
+    column: "derived_from_fix_id",
+    ddl: "ALTER TABLE fixes ADD COLUMN derived_from_fix_id INTEGER",
+  },
+  // Schema v2 (sea trial 2026-09-06): persist the raw user-entered sight
+  // inputs so reductions can be re-run/backtested without algebraic
+  // archaeology.
+  {
+    table: "lines_of_position",
+    column: "raw_hs_deg",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN raw_hs_deg REAL",
+  },
+  {
+    table: "lines_of_position",
+    column: "index_correction_deg",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN index_correction_deg REAL",
+  },
+  {
+    table: "lines_of_position",
+    column: "eye_height_m",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN eye_height_m REAL",
+  },
+  {
+    table: "lines_of_position",
+    column: "limb",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN limb TEXT",
+  },
+  {
+    table: "lines_of_position",
+    column: "ho_deg",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN ho_deg REAL",
+  },
+  {
+    table: "lines_of_position",
+    column: "hc_deg",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN hc_deg REAL",
+  },
+  {
+    table: "circular_position_lines",
+    column: "raw_angle_deg",
+    ddl: "ALTER TABLE circular_position_lines ADD COLUMN raw_angle_deg REAL",
+  },
+  {
+    table: "circular_position_lines",
+    column: "object_height_m",
+    ddl: "ALTER TABLE circular_position_lines ADD COLUMN object_height_m REAL",
+  },
+];
+
+/**
+ * Applies pending column migrations.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @returns {void}
+ */
+function migrate(db) {
+  for (const step of COLUMN_MIGRATIONS) {
+    const columns = db.prepare(`PRAGMA table_info(${step.table})`).all();
+    const exists = columns.some((c) => c.name === step.column);
+    if (!exists) db.exec(step.ddl);
+  }
 }
 
 /**
@@ -348,8 +424,9 @@ function recordLineOfPosition(db, r) {
   const stmt = db.prepare(
     `INSERT INTO lines_of_position (
        timestamp, lop_type, assumed_lat, assumed_lon, azimuth_true,
-       intercept_nm, body_or_object, confirmed_by
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       intercept_nm, body_or_object, confirmed_by,
+       raw_hs_deg, index_correction_deg, eye_height_m, limb, ho_deg, hc_deg
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const info = stmt.run(
     r.timestamp,
@@ -360,6 +437,14 @@ function recordLineOfPosition(db, r) {
     r.intercept_nm ?? null,
     r.body_or_object ?? null,
     r.confirmed_by ?? null,
+    // Raw user-entered sight inputs (schema v2): so a reduction can be
+    // re-run/backtested later without reconstructing Hs from the result.
+    r.raw_hs_deg ?? null,
+    r.index_correction_deg ?? null,
+    r.eye_height_m ?? null,
+    r.limb ?? null,
+    r.ho_deg ?? null,
+    r.hc_deg ?? null,
   );
   return Number(info.lastInsertRowid);
 }
@@ -386,8 +471,9 @@ function recordCircularPositionLine(db, r) {
   const stmt = db.prepare(
     `INSERT INTO circular_position_lines (
        timestamp, cpl_type, center_lat, center_lon, radius_nm,
-       radius_uncertainty_nm, source_object, confirmed_by
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       radius_uncertainty_nm, source_object, confirmed_by,
+       raw_angle_deg, object_height_m
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const info = stmt.run(
     r.timestamp,
@@ -398,6 +484,8 @@ function recordCircularPositionLine(db, r) {
     r.radius_uncertainty_nm ?? null,
     r.source_object ?? null,
     r.confirmed_by ?? null,
+    r.raw_angle_deg ?? null,
+    r.object_height_m ?? null,
   );
   return Number(info.lastInsertRowid);
 }

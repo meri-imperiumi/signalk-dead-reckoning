@@ -358,3 +358,70 @@ test("starGeographicPosition: of-date places match paper-almanac anchors", () =>
     );
   }
 });
+
+test("reduceNoonSight: rejects a sight far from the meridian (sea trial 2026-08-31)", () => {
+  // The trial's first Sun sight: 07:05 local at 161.6W — the Sun ~74°
+  // from the meridian. The noon reduction computed a latitude of −69.3°
+  // and the pipeline confirmed it as a fix 3058 NM from DR.
+  const t = Date.parse("2026-08-31T17:52:33Z");
+  const dr = { latitude: -18.4, longitude: -161.6 };
+  assert.throws(
+    () =>
+      celestial.reduceNoonSight({
+        body: "Sun",
+        hs_deg: 12.07, // reconstructed from the stored noon result
+        eye_height_m: 2,
+        epoch_ms: t,
+        dr_position: dr,
+        limb: "lower",
+      }),
+    /meridian/,
+  );
+});
+
+test("reduceNoonSight: near transit but computed latitude far from DR is refused", () => {
+  // Local noon at 161.6W on 2026-08-31 (~22:29Z); a mis-entered altitude
+  // yielding a latitude ~32° from the DR position must not reduce.
+  const t = Date.parse("2026-08-31T22:29:00Z");
+  const dr = { latitude: -18.4, longitude: -161.6 };
+  const gp = celestial.sunGeographicPosition(t);
+  const badLat = -50;
+  // For the reduction to land at badLat: z = dec − lat (sun-north branch)
+  // → Ho = 90 − (dec − badLat).
+  const trueHo = 90 - (gp.declination_deg - badLat);
+  const hs =
+    trueHo +
+    celestial.dipArcmin(2) / 60 +
+    celestial.refractionArcmin(trueHo) / 60 -
+    0.2666;
+  assert.throws(
+    () =>
+      celestial.reduceNoonSight({
+        body: "Sun",
+        hs_deg: hs,
+        eye_height_m: 2,
+        epoch_ms: t,
+        dr_position: dr,
+        limb: "lower",
+      }),
+    /check the sight altitude|from the assumed/,
+  );
+});
+
+test("reduceNoonSight: a genuine near-meridian sight still reduces (guard margins)", () => {
+  // 10° from transit — inside the 20° guard, a legitimate LAN sight.
+  const t = Date.parse("2026-08-31T22:29:00Z") + 40 * 60 * 1000; // +40 min ≈ 10°
+  const dr = { latitude: -18.4, longitude: -161.6 };
+  const gp = celestial.sunGeographicPosition(t);
+  const trueHo = 90 - Math.abs(-18.4 - gp.declination_deg);
+  const hs = trueHo + celestial.dipArcmin(2) / 60 - 0.2666;
+  const r = celestial.reduceNoonSight({
+    body: "Sun",
+    hs_deg: hs,
+    eye_height_m: 2,
+    epoch_ms: t,
+    dr_position: dr,
+    limb: "lower",
+  });
+  assert.ok(Math.abs(r.assumed_lat - -18.4) < 1);
+});

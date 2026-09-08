@@ -453,10 +453,10 @@ function confirmFix(db, candidate, engine, helpers, opts = {}) {
   }
 
   if (resets && engine) {
-    engine.snapToFix({
-      latitude: candidate.latitude,
-      longitude: candidate.longitude,
-    });
+    engine.snapToFix(
+      { latitude: candidate.latitude, longitude: candidate.longitude },
+      opts.estimatedErrorRadius ?? defaultOriginErrorNm(candidate.source_type),
+    );
   }
 
   return {
@@ -467,9 +467,81 @@ function confirmFix(db, candidate, engine, helpers, opts = {}) {
   };
 }
 
+/**
+ * Default origin error radius (nm) by fix source when the client doesn't
+ * supply one. GNSS positions are metre-scale; every human observation
+ * (celestial sight, bearing, vertical angle, manual entry) is realistically
+ * ~5 nm in seagoing conditions — the uncertainty cone must not collapse to
+ * GPS-level confidence after a sight fix (sea-trial discussion 2026-09-06:
+ * a celestial sight is rarely more accurate than ~5 nm).
+ *
+ * @param {string} sourceType
+ * @returns {number}
+ */
+function defaultOriginErrorNm(sourceType) {
+  return sourceType === "gps" ? 0.05 : 5;
+}
+
+/**
+ * Maximum implied vessel speed (kn) for an observation to be physically
+ * plausible: how fast the boat would have had to travel from the last
+ * origin-reset fix to be where the reduced observation puts it (sea
+ * trial 2026-08-31: the Antarctica sight implied ~140 kn).
+ */
+const MAX_IMPLIED_SPEED_KN = 50;
+
+/**
+ * Displacement (nm) below which the gate never rejects: a real-world
+ * celestial sight or bearing is rarely better than ~5 nm accurate, so a
+ * displacement inside that band is normal observation quality and none
+ * of the gate's business (it also keeps right-after-a-fix geometry —
+ * elapsed ≈ 0, small offsets — from implying absurd speeds). Beyond it,
+ * the implied-speed test applies.
+ */
+const MIN_GATE_DISPLACEMENT_NM = 5;
+
+/**
+ * Speed-plausibility gate for observation submission. Given the
+ * displacement a reduced observation implies (perpendicular distance from
+ * the DR origin to the LOP/CPL, or the intercept magnitude for a celestial
+ * sight) and the seconds elapsed from the last origin-reset fix *at the
+ * observation time*, returns whether the implied speed is physically
+ * plausible. Displacements below MIN_GATE_DISPLACEMENT_NM always pass.
+ *
+ * Pure logic — unit-testable without Signal K.
+ *
+ * @param {object} input
+ * @param {number} [input.displacementNm] - implied displacement (nm);
+ *   null/undefined skips the gate (no reduction to judge)
+ * @param {number|null} [input.elapsedS] - seconds since the last
+ *   origin-reset fix at the observation time; null/negative (observation
+ *   predates the origin, e.g. a backfill) skips the gate
+ * @returns {{ok: boolean, skipped: boolean, impliedKn: number|null}}
+ */
+function evaluateObservationPlausibility(input) {
+  const disp = input.displacementNm;
+  if (disp == null || !Number.isFinite(disp) || disp < 0) {
+    return { ok: true, skipped: true, impliedKn: null };
+  }
+  if (disp <= MIN_GATE_DISPLACEMENT_NM) {
+    return { ok: true, skipped: false, impliedKn: null };
+  }
+  const elapsedS = input.elapsedS;
+  if (elapsedS == null || !Number.isFinite(elapsedS) || elapsedS < 0) {
+    return { ok: true, skipped: true, impliedKn: null };
+  }
+  // Zero elapsed with a large displacement implies infinite speed.
+  const impliedKn = elapsedS > 0 ? disp / (elapsedS / 3600) : Infinity;
+  return { ok: impliedKn <= MAX_IMPLIED_SPEED_KN, skipped: false, impliedKn };
+}
+
 module.exports = {
   resolveCandidateFix,
   confirmFix,
   loadObservationsById,
   advanceToLatest,
+  defaultOriginErrorNm,
+  evaluateObservationPlausibility,
+  MAX_IMPLIED_SPEED_KN,
+  MIN_GATE_DISPLACEMENT_NM,
 };

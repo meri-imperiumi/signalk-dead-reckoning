@@ -611,7 +611,13 @@ class DrApp extends HTMLElement {
    * Streams a delta into the view-model and re-renders. Deltas from
    * other vessels (the `vessels.*` AIS subscription, work doc #23) feed
    * the target store instead — own vessel (by real context or the
-   * literal `vessels.self`) and the DR shadow vessel are excluded.
+   * literal `vessels.self`) is processed here. The DR shadow vessel
+   * (work doc #21/#23) is dropped entirely: it renders from
+   * `navigation.deadReckoning.position`, and letting its deltas through
+   * here overwrote the own-vessel GPS position with the ghost position
+   * (sea trial 2026-09-05: the map boat flipped ~50 NM back and forth,
+   * and fix #9 recorded the ghost as a "GNSS" fix 87.5 km from the
+   * boat).
    *
    * @param {object} delta
    * @returns {void}
@@ -623,9 +629,9 @@ class DrApp extends HTMLElement {
       typeof ctx === "string" &&
       ctx.startsWith("vessels.") &&
       ctx !== "vessels.self" &&
-      ctx !== selfCtx &&
-      ctx !== this.shadowContext
+      ctx !== selfCtx
     ) {
+      if (ctx === this.shadowContext) return;
       vm.applyAisDelta(this.aisStore, delta);
       this.renderAis();
       return;

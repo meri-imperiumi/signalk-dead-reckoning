@@ -1042,10 +1042,18 @@ class DrSightPanel extends HTMLElement {
     );
   }
 
+  /**
+   * @param {HTMLFormElement} form
+   * @returns {Record<string, string | boolean>}
+   */
   readForm(form) {
     const data = {};
     for (const el of form.querySelectorAll("input, select")) {
-      if (el.name) data[el.name] = el.value;
+      // Sea trial 2026-08-31: a checkbox's .value is always the string
+      // "on" regardless of checked state — every celestial sight was
+      // POSTed with noon:true. Checked state lives in .checked.
+      if (el.name)
+        data[el.name] = el.type === "checkbox" ? el.checked : el.value;
     }
     return data;
   }

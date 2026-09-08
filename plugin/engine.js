@@ -51,6 +51,10 @@ class DeadReckoningEngine {
    * @param {{latitude: number, longitude: number}|null} [opts.origin]
    * @param {number} [opts.logNm] - cumulative water-track log (nm)
    * @param {number} [opts.tripLogNm]
+   * @param {number} [opts.originErrorNm] - error radius of the fix that
+   *   seeded the origin (nm); floors the uncertainty cone until distance
+   *   run outgrows it (a celestial fix is realistically ~5 nm accurate —
+   *   the cone must not collapse to GPS-level confidence below that)
    */
   constructor(opts = {}) {
     /** @type {{latitude: number, longitude: number}|null} */
@@ -66,6 +70,8 @@ class DeadReckoningEngine {
      * uncertainty-polygon growth axis (DR error compounds with distance
      * more honestly than with time). */
     this.logNmSinceOrigin = 0;
+    /** @type {number} error radius of the origin-seeding fix (nm) */
+    this.originErrorNm = opts.originErrorNm ?? 0;
     /** @type {string} active calculation method (SPEC §3.1) */
     this.method = "inertial-paddlewheel";
     /** @type {boolean} whether DR is authoritative for navigation.position */
@@ -75,15 +81,18 @@ class DeadReckoningEngine {
   /**
    * Snaps the DR origin to a confirmed fix, recording the elapsed time so
    * that deviation-rate can be computed later (SPEC §4.5, §9.3). Does not
-   * touch the running logs.
+   * touch the running logs. `originErrorNm` seeds the uncertainty cone's
+   * floor with the fix's own error radius.
    *
    * @param {{latitude: number, longitude: number}} fix
+   * @param {number} [originErrorNm] - the fix's error radius (nm)
    * @returns {void}
    */
-  snapToFix(fix) {
+  snapToFix(fix, originErrorNm = 0) {
     this.origin = { latitude: fix.latitude, longitude: fix.longitude };
     this.elapsedSinceOriginS = 0;
     this.logNmSinceOrigin = 0;
+    this.originErrorNm = Math.max(0, originErrorNm);
   }
 
   /**

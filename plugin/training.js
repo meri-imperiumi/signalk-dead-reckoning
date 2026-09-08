@@ -78,6 +78,44 @@ const STABILIZE_AWA_DEG = 10.0;
 const STABILIZE_HEADING_DEG = 5.0;
 
 /**
+ * Rate-of-turn measurement window (s). ROT is measured across this
+ * window, not tick-to-tick: a single second of wave-driven yaw (sea
+ * trial 2026-08-30…09-05: sustained surfing yaw on a broad reach held
+ * the transient window open for days) must not open a maneuver window —
+ * a real tack/gybe sustains its turn across the whole window.
+ */
+const ROT_WINDOW_S = 6.0;
+
+/**
+ * Maximum transient window duration (s) — the latch breaker. A
+ * tack/gybe completes in well under two minutes; if the window is
+ * still open after this long the boat is simply sailing in seaway and
+ * the window closes without a maneuver classification (the flag keeps
+ * training gated only for real maneuvers).
+ */
+const TRANSIENT_MAX_S = 300.0;
+
+/**
+ * Stabilize tolerances scale with sea state (Douglas scale 0–9): the
+ * base constants describe flat water, where ±2° of heel motion is a
+ * real course change. In ss3–4 swell the *motion itself* is ±3–5° at
+ * swell period — the sea-trial window never closed because the
+ * tolerances were tighter than the seaway. Scaling keeps flat-water
+ * behavior unchanged (sea state 0/unknown → base).
+ *
+ * @param {number|null} seaState - Douglas sea state 0–9, or null/unknown
+ * @returns {{heelDeg: number, awaDeg: number, headingDeg: number}}
+ */
+function stabilizeTolerances(seaState) {
+  const ss = seaState == null ? 0 : Math.max(0, Math.min(9, seaState));
+  return {
+    heelDeg: STABILIZE_HEEL_DEG + 1.5 * ss,
+    awaDeg: STABILIZE_AWA_DEG + 2.0 * ss,
+    headingDeg: STABILIZE_HEADING_DEG + 1.5 * ss,
+  };
+}
+
+/**
  * Minimum elapsed seconds between two GPS fixes for a SOG/COG derivation
  * to be trusted (avoids divide-by-tiny-dt blowups at high report rates).
  */
@@ -106,10 +144,13 @@ class TrainingState {
    * @param {object} [opts] - tunable overrides (mainly for fast tests;
    *   production uses the module constants)
    * @param {number} [opts.settleSustainS] - §6.4 re-stabilization window
+   * @param {number} [opts.rotWindowS] - ROT measurement window
    */
   constructor(opts = {}) {
     /** @type {number} §6.4 settle window (s), overridable */
     this.settleSustainS = opts.settleSustainS ?? SETTLE_SUSTAIN_S;
+    /** @type {number} ROT measurement window (s), overridable */
+    this.rotWindowS = opts.rotWindowS ?? ROT_WINDOW_S;
     /** @type {{latitude:number, longitude:number, timestampS:number}|null} last accepted GPS fix */
     this.lastGps = null;
     /** @type {number|null} smoothed ground-truth SOG (kn) */
@@ -120,6 +161,9 @@ class TrainingState {
     this.lastHeadingDeg = null;
     /** @type {number|null} timestamp (s) of last heading sample */
     this.lastHeadingAtS = null;
+    /** @type {Array<{tS: number, headingDeg: number}>} rolling heading
+     * history for window ROT (oldest first; spans ROT_WINDOW_S) */
+    this.rotHistory = [];
     /** @type {boolean} paddlewheel fouled (§6.3) */
     this.fouled = false;
     /** @type {boolean} tack/gybe transient window open (§6.4) */
@@ -142,6 +186,9 @@ class TrainingState {
     this.lastAwaDeg = null;
     /** @type {number|null} seconds of sustained re-stabilization so far */
     this.stabilizedS = 0;
+    /** @type {boolean} transient window closed by TRANSIENT_MAX_S, not by
+     * re-stabilization — the close edge must not classify a maneuver */
+    this.suppressManeuver = false;
   }
 }
 
@@ -195,24 +242,43 @@ function detectFouling(s) {
 }
 
 /**
- * Updates the tack/gybe transient window (SPEC §6.4). Opens when rate-of-
- * turn exceeds the threshold; closes only after heel and AWA re-stabilize
- * within tolerance for a sustained interval. Returns the new transient
- * flag.
+ * Updates the tack/gybe transient window (SPEC §6.4). Opens when the
+ * rate of turn measured over a ROT_WINDOW_S rolling window exceeds the
+ * threshold — tick-to-tick wave yaw in seaway must not open it (sea
+ * trial 2026-08-30…09-05: a broad reach in ss3–4 held the window open
+ * for days). Closes when heel, AWA and heading re-stabilize within
+ * sea-state-scaled tolerance for a sustained interval, or forcibly
+ * after TRANSIENT_MAX_S. Returns the new transient flag.
  *
  * @param {TrainingState} st
- * @param {object} s - {headingDeg, heelDeg, awaDeg, timestampS}
+ * @param {object} s - {headingDeg, heelDeg, awaDeg, timestampS, seaState?}
  * @returns {boolean} transient flag after update
  */
 function updateTransient(st, s) {
+  // Rolling-window ROT: heading change across the window / window span.
+  st.rotHistory.push({
+    tS: s.timestampS,
+    headingDeg: s.headingDeg,
+    awaDeg: s.awaDeg,
+  });
+  const windowStart = s.timestampS - (st.rotWindowS ?? ROT_WINDOW_S);
+  // Keep the last sample at/before windowStart so the measured span is
+  // always >= the window (otherwise float/tick jitter leaves e.g. a 0.9 s
+  // span against a 1.0 s window and ROT stops computing exactly when the
+  // turn is at its steepest).
+  while (st.rotHistory.length > 2 && st.rotHistory[1].tS <= windowStart) {
+    st.rotHistory.shift();
+  }
+  const rotNow = st.rotHistory[st.rotHistory.length - 1];
+  const rotBase = st.rotHistory[0];
   let rot = 0;
-  if (
-    st.lastHeadingDeg != null &&
-    st.lastHeadingAtS != null &&
-    s.timestampS > st.lastHeadingAtS
-  ) {
-    const dt = s.timestampS - st.lastHeadingAtS;
-    rot = Math.abs(angleDelta(s.headingDeg, st.lastHeadingDeg)) / dt;
+  // ROT counts only once the window is full: a single tick of yaw
+  // (however large) says nothing about a sustained turn.
+  const rotWindowS = st.rotWindowS ?? ROT_WINDOW_S;
+  if (rotNow.tS - rotBase.tS >= rotWindowS) {
+    rot =
+      Math.abs(angleDelta(rotNow.headingDeg, rotBase.headingDeg)) /
+      (rotNow.tS - rotBase.tS);
   }
 
   if (!st.transient) {
@@ -222,17 +288,34 @@ function updateTransient(st, s) {
       st.transientHeelDeg = s.heelDeg;
       st.transientAwaDeg = s.awaDeg;
       st.transientHeadingDeg = s.headingDeg;
-      // §9.4: the pre-maneuver wind side is the previous tick's AWA —
-      // by the time the rate-of-turn gate trips, the bow may already be
-      // through the wind.
-      st.maneuverAwaDeg = st.lastAwaDeg ?? s.awaDeg;
+      // §9.4: the pre-maneuver wind side is the AWA at the base of the
+      // ROT window — by the time a sustained turn fills the window, the
+      // previous tick's AWA has already flipped with the bow
+      // ("lastAwaDeg" carried the pre-maneuver value only when ROT was
+      // measured tick-to-tick).
+      st.maneuverAwaDeg = st.rotHistory[0]?.awaDeg ?? st.lastAwaDeg ?? s.awaDeg;
       st.stabilizedS = 0;
+      st.suppressManeuver = false;
     }
+  } else if (
+    s.timestampS - (st.transientOpenAtS ?? s.timestampS) >
+    TRANSIENT_MAX_S
+  ) {
+    // Latch breaker: a maneuver completes in minutes. Still open after
+    // TRANSIENT_MAX_S means the boat is sailing in seaway, not turning —
+    // close without classifying a maneuver.
+    st.transient = false;
+    st.transientOpenAtS = null;
+    st.stabilizedS = 0;
+    st.suppressManeuver = true;
+    st.rotHistory = [
+      { tS: s.timestampS, headingDeg: s.headingDeg, awaDeg: s.awaDeg },
+    ];
   } else {
-    const heelOk =
-      Math.abs(s.heelDeg - st.transientHeelDeg) <= STABILIZE_HEEL_DEG;
+    const tol = stabilizeTolerances(s.seaState ?? null);
+    const heelOk = Math.abs(s.heelDeg - st.transientHeelDeg) <= tol.heelDeg;
     const awaOk =
-      Math.abs(angleDelta(s.awaDeg, st.transientAwaDeg)) <= STABILIZE_AWA_DEG;
+      Math.abs(angleDelta(s.awaDeg, st.transientAwaDeg)) <= tol.awaDeg;
     // §9.4: the heading must also have stopped swinging — heel and wind
     // can steady before the boat has finished bearing away onto its final
     // course, and the logged "new heading" must be the settled course, not
@@ -240,8 +323,9 @@ function updateTransient(st, s) {
     const headingOk =
       st.transientHeadingDeg != null &&
       Math.abs(angleDelta(s.headingDeg, st.transientHeadingDeg)) <=
-        STABILIZE_HEADING_DEG;
-    // A new high rate-of-turn resets the settle clock (it's still transient).
+        tol.headingDeg;
+    // A new high window rate-of-turn resets the settle clock (it's still
+    // transient).
     if (rot > ROT_TRANSIENT_DEG_S) {
       st.transientHeelDeg = s.heelDeg;
       st.transientAwaDeg = s.awaDeg;
@@ -336,6 +420,7 @@ function detectManeuver(st, s) {
   const was = st._prevTransient ?? false;
   st._prevTransient = st.transient;
   if (!was || st.transient) return null;
+  if (st.suppressManeuver) return null; // closed by TRANSIENT_MAX_S, not a maneuver
   // Falling edge: the window just closed. The pre-maneuver AWA is
   // retained on the state by updateTransient for exactly this read.
   if (st.maneuverAwaDeg == null) return null;
@@ -462,6 +547,8 @@ function computeObservation(inputs) {
  * @param {number|null} s.heelDeg
  * @param {string} s.propulsionState - 'started' | 'stopped' | other
  * @param {{setTrue:number, drift:number, tier:number}} s.current - resolved current
+ * @param {number|null} [s.seaState] - Douglas sea state 0–9 (scales §6.4
+ *   stabilize tolerances; null/unknown → flat-water base)
  * @param {number} s.lookupLeewayDeg
  * @param {number} s.lookupSpeedLoss
  * @returns {{observation: object|null, eligible: boolean, fouled: boolean, transient: boolean}}
@@ -512,6 +599,7 @@ function tick(st, s) {
     heelDeg: s.heelDeg ?? 0,
     awaDeg: s.awaDeg ?? 0,
     timestampS: s.timestampS,
+    seaState: s.seaState ?? null,
   });
 
   // --- Eligibility (SPEC §6.1) ------------------------------------------
@@ -561,10 +649,13 @@ module.exports = {
   SOG_MOVING_KN,
   AWS_MOVING_KN,
   ROT_TRANSIENT_DEG_S,
+  ROT_WINDOW_S,
+  TRANSIENT_MAX_S,
   SETTLE_SUSTAIN_S,
   STABILIZE_HEEL_DEG,
   STABILIZE_AWA_DEG,
   STABILIZE_HEADING_DEG,
+  stabilizeTolerances,
   GROSS_JUMP_NM,
   GROUND_TRUTH_ALPHA,
   TACK_AWA_MAX_DEG,

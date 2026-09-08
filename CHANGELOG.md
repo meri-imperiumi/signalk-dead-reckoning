@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Celestial sights are no longer silently forced through the noon
+  (meridian-altitude) reducer** (sea trial 2026-08-31, Aitutaki→Niue:
+  both Sun sights reduced to −69.3°/−31.9°). The sight panel's
+  `readForm()` read checkboxes via `el.value` — always the string
+  `"on"` regardless of checked state — so every sight was POSTed with
+  `noon: true`. Checkboxes are now read via `el.checked` (both panels).
+- **The webapp no longer overwrites its own-vessel GPS position with
+  the DR shadow boat's** (sea trial: the map boat flipped ~50 NM
+  between GPS and the ghost, and fix #9 recorded the ghost position as
+  a "GNSS" fix 87.5 km from the boat). Deltas whose context is the
+  shadow vessel now route to neither the AIS target store nor the
+  own-vessel view-model.
+
+### Changed
+- **The uncertainty cone now grows with current-knowledge**, not just
+  distance run (sea trial: 88 km of DR-vs-GPS divergence while the
+  polygon "expected" ~2 NM). Radius combines the distance-run error
+  and a per-tier current residual (manual 0.25 kn, weather/pilot
+  0.3 kn, zero-vector 1.0 kn) root-sum-square; the fallback margin
+  rose from 1° to 4° per NM run (measured open-loop rates were
+  7–12× the old value); the empirical rate is now a median with a
+  2 kn per-row cap (the spec's original intent — a garbage 3058 NM
+  correction previously poisoned an EWMA at "145 kn"); the floor rose
+  to 0.05 NM and the origin's own error radius seeds it (a celestial
+  fix is realistically ~5 nm — the cone never claims GPS confidence
+  below that).
+- **The divergence advisory no longer flaps after every fix or print
+  "0.27 nm exceeds expected 0.27 nm"**: the exceedance deadband is
+  instrument-scale (0.005 NM) instead of float epsilon, and the alert
+  message states the exceedance margin.
+- **"Tack/gybe in progress" no longer latches open for the whole
+  passage** in ss3–4 seaway: rate-of-turn is measured over a 6 s
+  rolling window (a single second of wave yaw can't open it), the
+  re-stabilization tolerances scale with sea state, and a window still
+  open after 5 minutes force-closes without classifying a maneuver.
+  The pre-maneuver AWA for tack/gybe classification is now taken from
+  the base of the ROT window (the previous tick's AWA has already
+  flipped with the bow by the time the window opens).
+
 ### Added
 - **Passage replay backtest tool** (`tools/replay-passage.js`, minimal
   SPEC §10.2 scope): replays a historical passage from the Signal K
@@ -32,6 +72,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Smoketests cover URL building, row parsing/filling, the current-grid
   interpolation, and three synthetic passages (no-drift, known-current,
   leeway absorbed by training).
+- **Observation submission is speed-plausibility-gated**: a sight,
+  bearing or vertical-angle observation whose reduction implies the
+  vessel traveled faster than 50 kn since the last fix (e.g. the
+  trial's 3058 NM Antarctica sight ≈ 140 kn) is rejected with an
+  explanatory message in the form, so the user can fix the entry.
+  Displacements within realistic observation quality (~5 NM) always
+  pass.
+- **Noon sights carry meridian and sanity guards**: a sight whose Sun
+  is more than 20° from the meridian (LHA), or whose computed latitude
+  lands more than 12° from the assumed/DR position, is refused rather
+  than reduced into garbage.
+- **Fix confirmation carries a gross-displacement guard**: confirming
+  a fix more than 100 NM (configurable, `fixes.maxDisplacementNm`)
+  from the current DR origin is rejected with 422 unless the request
+  carries `force: true`; `/fix/resolve` previews the candidate's
+  displacement and flags gross candidates.
+- **Raw sight inputs are persisted** (`raw_hs_deg`, index correction,
+  eye height, limb, computed Ho/Hc on lines_of_position; angle/height
+  on circular_position_lines) so reductions can be re-run and
+  backtested — reconstructing the trial's sights from the stored
+  noon results required algebraic archaeology.
+- **`elapsedSinceOriginS` and the origin error radius survive plugin
+  restarts** (persisted alongside `last_known_good_fix`), so "since
+  last fix" and the cone no longer reset mid-excursion on a restart.
 
 ## [0.7.0] - 2026-08-29
 
@@ -165,6 +229,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anchors: a from-scratch Meeus reduction for the Sun (≤0.7′, the
   anchor's own accuracy class), the AA low-precision series for the
   Moon (≤20′), and paper-almanac star values.
+
 - **The webapp's "Ghost Track" heading above the map is gone.** It
   wasted vertical space the map could use — the map card now opens with
   no chrome above it, so the chart starts higher on the page. The
