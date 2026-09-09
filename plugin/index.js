@@ -62,6 +62,7 @@ const {
   polarSpeedSample,
   polarSpeedAverage,
 } = require("./polar.js");
+const { loadActivePolarModel } = require("./resource-polar.js");
 const {
   distanceNm,
   bearingDeg,
@@ -242,6 +243,16 @@ const SUBSCRIPTION_PATHS = [
   // "polar speed" output enabled). Running-averaged before use — the
   // raw delta flaps gust-by-gust (work doc #18).
   "performance.polarSpeed",
+  // §3.1 inertial-polar, resource path: when the delta feed above is
+  // absent, the polar speed is computed in-process from the water-
+  // referenced true wind (the same input the polar performance plugin
+  // consumes) and the active `polars` resource (signalk-polar-
+  // management contract: `polars.activePolar` pointer + derating
+  // `polars.performanceFactor`).
+  "environment.wind.speedTrue",
+  "environment.wind.angleTrueWater",
+  "polars.activePolar",
+  "polars.performanceFactor",
   "navigation.state",
   "propulsion.main.state",
   // Sea state: SPEC §3.2 subscribes environment.seaState; the logbook
@@ -284,11 +295,14 @@ const DEFAULT_CONFIG = {
   },
   /**
    * §3.1 inertial-polar fallback (work doc #18): running-average window
-   * and staleness cutoff for `performance.polarSpeed`. The raw delta is
-   * a step-function polar lookup driven by gusty wind — averaged over
-   * windowS before integration. Once the feed is quiet for staleS
-   * (e.g. wind out-of-table → nulls), DR falls to the honest idle
-   * branch instead of holding a frozen speed.
+   * and staleness cutoff for the polar speed — both the
+   * `performance.polarSpeed` delta feed (polar performance plugin) and
+   * the in-process lookup against the active `polars` resource (polar
+   * management contract) share the same discipline. The raw speed is a
+   * step-function polar lookup driven by gusty wind — averaged over
+   * windowS before integration. Once a source goes quiet for staleS
+   * (delta feed stops, wind out-of-table, dead wind instrument), DR
+   * falls to the honest idle branch instead of holding a frozen speed.
    */
   polar: {
     enabled: true,
@@ -400,6 +414,7 @@ const deps = {
   createPolarSpeedState,
   polarSpeedSample,
   polarSpeedAverage,
+  loadActivePolarModel,
   createShadowVesselPublisher,
   resolveShadowVelocity,
   distanceNm,
@@ -558,6 +573,36 @@ module.exports = (app) => {
   let polarState = null;
 
   /**
+   * §3.1 inertial-polar, resource path: the active polar speed model
+   * loaded from the `polars` resource (signalk-polar-management
+   * contract). Null when no provider is installed or no polar is
+   * active — the path is strictly optional. Refreshed when the
+   * `polars.activePolar` / `polars.performanceFactor` deltas move.
+   * @type {import("./resource-polar.js").PolarSpeedModel|null}
+   */
+  let polarModel = null;
+
+  /** Resource id of the loaded polar (refresh cache key). */
+  let polarLoadedId = null;
+
+  /** Cached table for `polarLoadedId` (factor-only changes rebuild). */
+  let polarLoadedTable = null;
+
+  /** A model refresh is already queued (deltas can arrive in bursts). */
+  let polarRefreshQueued = false;
+
+  /** Arrival time (ms) of the last usable `performance.polarSpeed` delta. */
+  let lastPolarDeltaTs = 0;
+
+  /**
+   * Arrival time (ms) of the last true-wind delta — the resource-path
+   * lookup must go stale with its input, not integrate a frozen wind
+   * forever (a dead wind instrument would otherwise sail the shadow
+   * boat on at a frozen polar speed).
+   */
+  let lastTrueWindTs = 0;
+
+  /**
    * Previous tick's debounced fouling verdict — the inertial-polar
    * source decision reads it before this tick's training pass runs.
    * @type {boolean}
@@ -651,7 +696,7 @@ module.exports = (app) => {
           type: "boolean",
           title: "Use polar-derived speed when the paddlewheel is unavailable",
           description:
-            "When speed through water is missing or the paddlewheel is fouled, integrate the running-averaged performance.polarSpeed from signalk-polar-performance-plugin (SPEC §3.1 inertial-polar). Requires that plugin installed and configured with its polar speed output enabled.",
+            "When speed through water is missing or the paddlewheel is fouled, integrate polar-derived speed (SPEC §3.1 inertial-polar). Source preference: the running-averaged performance.polarSpeed from signalk-polar-performance-plugin when that feed is live; otherwise the active polar from a `polars` resource provider (signalk-polar-management) interpolated from true wind. The resource path needs no configuration beyond selecting an active polar there.",
           default: DEFAULT_CONFIG.polar.enabled,
         },
         "polar.windowS": {
@@ -786,6 +831,12 @@ module.exports = (app) => {
       fouledFlag = deps.createFlagState();
       movingFlag = deps.createFlagState();
       polarState = deps.createPolarSpeedState();
+      polarModel = null;
+      polarLoadedId = null;
+      polarLoadedTable = null;
+      polarRefreshQueued = false;
+      lastPolarDeltaTs = 0;
+      lastTrueWindTs = 0;
       fouledActive = false;
       clockS = 0;
 
@@ -874,6 +925,12 @@ module.exports = (app) => {
 
       publishMeta();
       setStatus("Dead reckoning started");
+
+      // §3.1 resource polar: the active-polar pointer may already be on
+      // the bus (published before this plugin started) — load once at
+      // start via the getSelfPath fallback; later pointer/factor moves
+      // refresh through the polars.* deltas.
+      refreshPolarModel();
 
       // Plotter-extension host integration (work doc #19): advertise
       // the status-tile manifest to chart plotters (Freeboard-SK ≥3.0)
@@ -965,6 +1022,12 @@ module.exports = (app) => {
       fouledFlag = null;
       movingFlag = null;
       polarState = null;
+      polarModel = null;
+      polarLoadedId = null;
+      polarLoadedTable = null;
+      polarRefreshQueued = false;
+      lastPolarDeltaTs = 0;
+      lastTrueWindTs = 0;
       fouledActive = false;
       if (sensorHealthIssue) {
         publishNotification(PATHS.sensorHealth, {
@@ -1030,14 +1093,85 @@ module.exports = (app) => {
         // nothing — the average must age out, not decay toward zero.
         if (v.path === "performance.polarSpeed" && polarState) {
           const ms = unwrapNumber(v.value);
+          if (ms != null) lastPolarDeltaTs = Date.now();
           deps.polarSpeedSample(
             polarState,
             { tsMs: Date.now(), speedKn: ms == null ? null : ms * MS_TO_KN },
             { windowMs: config.polar.windowS * 1000 },
           );
         }
+        // §3.1 inertial-polar, resource path: pointer/factor moves
+        // schedule a model refresh (id-cached — a factor-only change
+        // rebuilds the model without refetching the table).
+        if (
+          v.path === "polars.activePolar" ||
+          v.path === "polars.performanceFactor"
+        ) {
+          schedulePolarRefresh();
+        }
+        // True-wind arrival timestamp: staleness gate for the resource-
+        // path lookup (see lastTrueWindTs).
+        if (
+          v.path === "environment.wind.speedTrue" ||
+          v.path === "environment.wind.angleTrueWater"
+        ) {
+          lastTrueWindTs = Date.now();
+        }
       }
     }
+  }
+
+  /**
+   * Reloads the active polar model from the `polars` resource.
+   *
+   * Mirrors signalk-energy-predictor: reads the `polars.activePolar`
+   * pointer (published by polar tools like signalk-polar-management),
+   * fetches the referenced table in-process via the resource provider
+   * API, and caches by resource id so a factor-only change rebuilds
+   * without a refetch. No provider, no active polar, or a bad table
+   * all degrade to a null model — the resource path is strictly
+   * optional and never disturbs the delta-feed path.
+   *
+   * @returns {Promise<void>}
+   */
+  async function refreshPolarModel() {
+    try {
+      const readValue = (p) => deltaState.get(p) ?? app.getSelfPath?.(p);
+      const { model, id, table } = await deps.loadActivePolarModel({
+        app,
+        readValue,
+        cachedId: polarLoadedId,
+        cachedTable: polarLoadedTable,
+      });
+      if (model !== polarModel || id !== polarLoadedId) {
+        if (model) {
+          app.debug(
+            `Active polar '${id}' loaded (performanceFactor ${model.performanceFactor})`,
+          );
+        } else if (polarModel) {
+          app.debug("Active polar no longer available");
+        }
+      }
+      polarModel = model;
+      polarLoadedId = id;
+      polarLoadedTable = table;
+    } catch (err) {
+      app.error(`Polar model refresh failed: ${err?.message ?? err}`);
+    }
+  }
+
+  /**
+   * Queues a single model refresh per delta burst.
+   *
+   * @returns {void}
+   */
+  function schedulePolarRefresh() {
+    if (polarRefreshQueued) return;
+    polarRefreshQueued = true;
+    Promise.resolve().then(() => {
+      polarRefreshQueued = false;
+      return refreshPolarModel();
+    });
   }
 
   /**
@@ -1227,6 +1361,40 @@ module.exports = (app) => {
     // freezing. Gates: underway (wind on a moored mast must not sail the
     // shadow boat off the dock), sailing (a polar is meaningless under
     // power), a live non-stale average, and a heading to steer it by.
+    //
+    // Resource path (signalk-polar-management contract): with the delta
+    // feed quiet, the polar speed is computed in-process from the active
+    // `polars` resource and the water-referenced true wind — sampled
+    // into the same running average, so the existing averaging/staleness
+    // behavior carries over unchanged. The live `performance.polarSpeed`
+    // feed always wins when present: it is the fuller product (damped
+    // wind, its own table selection). A quiet true wind stops the
+    // sampling — the average then ages out rather than integrating a
+    // frozen wind at a frozen speed.
+    const polarDeltaQuiet =
+      Date.now() - lastPolarDeltaTs > config.polar.staleS * 1000;
+    const polarSource = polarDeltaQuiet ? "polar-resource" : "polar";
+    if (
+      config.polar.enabled &&
+      polarDeltaQuiet &&
+      polarModel &&
+      Date.now() - lastTrueWindTs <= config.polar.staleS * 1000
+    ) {
+      const twsMs = unwrapNumber(deltaState.get("environment.wind.speedTrue"));
+      const twaRad = unwrapNumber(
+        deltaState.get("environment.wind.angleTrueWater"),
+      );
+      if (twsMs != null && twaRad != null) {
+        deps.polarSpeedSample(
+          polarState,
+          {
+            tsMs: Date.now(),
+            speedKn: polarModel.speedAt(twsMs, twaRad) * MS_TO_KN,
+          },
+          { windowMs: config.polar.windowS * 1000 },
+        );
+      }
+    }
     const polar = config.polar.enabled
       ? deps.polarSpeedAverage(polarState, {
           nowMs: Date.now(),
@@ -1450,7 +1618,9 @@ module.exports = (app) => {
     if (onPolar && stwKn == null) {
       setSensorHealth(
         "polar",
-        `Paddlewheel speed unavailable — DR is integrating polar-derived speed (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`,
+        polarSource === "polar-resource" && polarModel
+          ? `Paddlewheel speed unavailable — DR is integrating speed from the active polar resource '${polarModel.id}' (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`
+          : `Paddlewheel speed unavailable — DR is integrating polar-derived speed (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`,
       );
     } else if (fouled) {
       setSensorHealth(
@@ -1593,7 +1763,7 @@ module.exports = (app) => {
           status: underway ? "underway" : "warm",
           transient: tr.transient,
           fouled,
-          speedSource: onPolar ? "polar" : "paddlewheel",
+          speedSource: onPolar ? polarSource : "paddlewheel",
         },
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
         // Always published: null while suppressed (moored/anchored or no
@@ -2201,6 +2371,15 @@ module.exports = (app) => {
         // (e.g. "WMM 2025") — the watchkeeper's verification that DR is
         // running on true heading, not magnetic-as-true.
         heading: headingSourceInfo,
+        // The active polar resource backing the §3.1 resource-path
+        // fallback, when one is loaded — the watchkeeper's check that
+        // the polar DR falls back to is the one they selected.
+        polar: polarModel
+          ? {
+              id: polarModel.id,
+              performanceFactor: polarModel.performanceFactor,
+            }
+          : null,
         // Work doc #23: the shadow vessel's context, when enabled, so
         // the DR webapp can filter it from its AIS target layer (the
         // webapp already renders the DR position as its own marker).

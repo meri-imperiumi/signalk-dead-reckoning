@@ -34,7 +34,8 @@
     "recommends": [
       "@meri-imperiumi/signalk-autostate",
       "@meri-imperiumi/signalk-logbook",
-      "signalk-polar-performance-plugin"
+      "signalk-polar-performance-plugin",
+      "signalk-polar-management"
     ],
     "screenshots": [
       "./doc/dr-map.png",

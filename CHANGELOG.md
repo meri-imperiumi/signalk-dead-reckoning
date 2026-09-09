@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Polar speed fallback now also works without
+  signalk-polar-performance-plugin**: when its `performance.polarSpeed`
+  feed is absent, DR computes the speed in-process from the active
+  `polars` resource (the signalk-polar-management contract — the
+  `polars.activePolar` pointer and `polars.performanceFactor` derating
+  multiplier) interpolated from water-referenced true wind
+  (`environment.wind.speedTrue` / `angleTrueWater`). The resource path
+  shares the existing running-average window and staleness cutoff, is
+  zero-configuration (engages when an active polar is selected, stays
+  dormant otherwise), and a live `performance.polarSpeed` feed still
+  outranks it. The DR state's `speedSource` distinguishes `polar`
+  (delta feed) from `polar-resource`, the sensor-health alert names the
+  active resource id, and GET /status mirrors the loaded polar. A dead
+  wind instrument ages the average out to the honest idle branch
+  instead of integrating a frozen wind at a frozen speed.
+
 ## [0.8.0] - 2026-09-09
 
 ### Fixed

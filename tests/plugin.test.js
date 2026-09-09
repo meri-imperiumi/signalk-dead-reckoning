@@ -86,6 +86,10 @@ test("start subscribes to the SPEC §3.2 sensor paths", () => {
     "navigation.state",
     "propulsion.main.state",
     "performance.polarSpeed",
+    "environment.wind.speedTrue",
+    "environment.wind.angleTrueWater",
+    "polars.activePolar",
+    "polars.performanceFactor",
   ]) {
     assert.ok(subscribed.includes(path), `not subscribed to ${path}`);
   }
@@ -3406,6 +3410,349 @@ test("inertial-polar: paddlewheel recovery flips method back and clears the aler
       ),
       `no clear transition: ${JSON.stringify(alerts)}`,
     );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+// --- inertial-polar, resource path (signalk-polar-management contract) ----
+
+/**
+ * Canonical test polar (m/s, rad): TWS [4, 12] × TWA [30°, 180°].
+ * Midpoint (8 m/s, 105°) interpolates to the 4-corner mean: 3 m/s
+ * ≈ 5.8 kn; at performanceFactor 0.5, 1.5 m/s ≈ 2.9 kn.
+ */
+const RESOURCE_TABLE = {
+  kind: "polarTable",
+  axes: { tws: [4, 12], twa: [Math.PI / 6, Math.PI] },
+  values: {
+    boatSpeedMatrix: [
+      [2.0, 1.0],
+      [6.0, 3.0],
+    ],
+  },
+  symmetry: { portStarboardSymmetric: true },
+};
+const MID_TWA = (Math.PI / 6 + Math.PI) / 2;
+
+/**
+ * Emits an active-polar selection + a water-referenced true-wind state,
+ * as signalk-polar-management and the derived-data wind paths do.
+ *
+ * @param {FakeSignalKApp} app
+ * @param {{twsMs?: number, twaRad?: number, factor?: number}} [wind]
+ */
+function emitResourcePolar(
+  app,
+  { twsMs = 8, twaRad = MID_TWA, factor = 1 } = {},
+) {
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "polars.activePolar",
+            value: { href: "/resources/polars/test" },
+          },
+          { path: "polars.performanceFactor", value: factor },
+          { path: "environment.wind.speedTrue", value: twsMs },
+          { path: "environment.wind.angleTrueWater", value: twaRad },
+        ],
+      },
+    ],
+  });
+}
+
+test("resource polar: missing STW + active polar resource → integrates without performance.polarSpeed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-res-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  app.registerResourceProvider({
+    type: "polars",
+    methods: { getResource: async () => RESOURCE_TABLE },
+  });
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: Math.PI / 2 },
+          ],
+        },
+      ],
+    });
+    // No STW, no polar yet → honest idle with the fallback-zero token.
+    await new Promise((r) => setTimeout(r, 150));
+    let methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "fallback-zero",
+      JSON.stringify(methods.slice(-3)),
+    );
+
+    emitResourcePolar(app);
+    await new Promise((r) => setTimeout(r, 400));
+
+    methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "inertial-polar",
+      JSON.stringify(methods.slice(-3)),
+    );
+
+    const states = lastValues(app, "navigation.deadReckoning.state").filter(
+      (s) => s.status === "underway",
+    );
+    assert.ok(states.length > 0, "no underway state on resource polar");
+    assert.strictEqual(
+      states[states.length - 1].speedSource,
+      "polar-resource",
+      JSON.stringify(states[states.length - 1]),
+    );
+
+    // DR advanced on the interpolated polar speed (heading 90° → east).
+    const positions = lastValues(app, "navigation.deadReckoning.position");
+    assert.ok(positions.length > 1, "no DR positions on resource polar");
+    assert.ok(
+      positions[positions.length - 1].longitude > positions[0].longitude,
+      `DR did not advance: ${JSON.stringify(positions.map((p) => p.longitude))}`,
+    );
+
+    // The sensor STW output stays silent — same rule as the delta feed.
+    assert.strictEqual(
+      lastValues(app, "navigation.speedThroughWater").length,
+      0,
+      "plugin published navigation.speedThroughWater while on resource polar",
+    );
+
+    // The alert names the active resource, and /status mirrors it.
+    const alerts = lastValues(
+      app,
+      "notifications.navigation.deadReckoning.status",
+    );
+    assert.ok(
+      alerts.some((a) => a.state === "alert" && /'test'/.test(a.message)),
+      `no resource-polar alert: ${JSON.stringify(alerts)}`,
+    );
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const status = router.invoke("get", "/status");
+    assert.strictEqual(status.body.polar.id, "test");
+    assert.strictEqual(status.body.polar.performanceFactor, 1);
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("resource polar: performance factor derates the integrated speed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-res-factor-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  app.registerResourceProvider({
+    type: "polars",
+    methods: { getResource: async () => RESOURCE_TABLE },
+  });
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: Math.PI / 2 },
+          ],
+        },
+      ],
+    });
+    emitResourcePolar(app, { factor: 0.5 });
+    await new Promise((r) => setTimeout(r, 400));
+    const methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "inertial-polar",
+      JSON.stringify(methods.slice(-3)),
+    );
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const status = router.invoke("get", "/status");
+    assert.strictEqual(status.body.polar.performanceFactor, 0.5);
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("resource polar: a live performance.polarSpeed feed outranks the resource", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-res-precedence-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  app.registerResourceProvider({
+    type: "polars",
+    methods: { getResource: async () => RESOURCE_TABLE },
+  });
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 50, saveIntervalMs: 60000 });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: Math.PI / 2 },
+          ],
+        },
+      ],
+    });
+    emitResourcePolar(app);
+    await new Promise((r) => setTimeout(r, 400));
+    let states = lastValues(app, "navigation.deadReckoning.state").filter(
+      (s) => s.status === "underway",
+    );
+    assert.strictEqual(states[states.length - 1].speedSource, "polar-resource");
+
+    // The polar performance plugin's own output appears → it wins.
+    await emitPolarSpeed(app, Array(8).fill(polarMs(5)));
+    await new Promise((r) => setTimeout(r, 300));
+    states = lastValues(app, "navigation.deadReckoning.state").filter(
+      (s) => s.status === "underway",
+    );
+    assert.strictEqual(
+      states[states.length - 1].speedSource,
+      "polar",
+      JSON.stringify(states[states.length - 1]),
+    );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("resource polar: dead true wind ages the average out to the honest idle branch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-res-stale-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  app.registerResourceProvider({
+    type: "polars",
+    methods: { getResource: async () => RESOURCE_TABLE },
+  });
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 50,
+    saveIntervalMs: 60000,
+    polar: { windowS: 60, staleS: 0.3 },
+  });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: Math.PI / 2 },
+          ],
+        },
+      ],
+    });
+    emitResourcePolar(app);
+    await new Promise((r) => setTimeout(r, 300));
+    const methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(methods[methods.length - 1], "inertial-polar");
+
+    // Wind instrument goes silent → sampling stops, the average ages
+    // out past staleS → idle, fallback-zero (not a frozen wind speed).
+    await new Promise((r) => setTimeout(r, 600));
+    const methods2 = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods2[methods2.length - 1],
+      "fallback-zero",
+      JSON.stringify(methods2.slice(-3)),
+    );
+    const states = lastValues(app, "navigation.deadReckoning.state");
+    const last = states[states.length - 1];
+    assert.strictEqual(last.status, "idle");
+    assert.strictEqual(last.reason, "no speed through water");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("resource polar: clearing the active pointer ages DR off polar without crashing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-polar-res-clear-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  app.registerResourceProvider({
+    type: "polars",
+    methods: { getResource: async () => RESOURCE_TABLE },
+  });
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 50,
+    saveIntervalMs: 60000,
+    polar: { windowS: 60, staleS: 0.3 },
+  });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: Math.PI / 2 },
+          ],
+        },
+      ],
+    });
+    emitResourcePolar(app);
+    await new Promise((r) => setTimeout(r, 300));
+    let methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(methods[methods.length - 1], "inertial-polar");
+
+    // The watchkeeper deselects the polar (management publishes null).
+    // Ticks keep running while the model is gone and the average still
+    // holds ≤staleS of samples — the race window must not crash — then
+    // DR falls to the honest idle branch.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [{ values: [{ path: "polars.activePolar", value: null }] }],
+    });
+    await new Promise((r) => setTimeout(r, 700));
+
+    methods = lastValues(app, "navigation.deadReckoning.method");
+    assert.strictEqual(
+      methods[methods.length - 1],
+      "fallback-zero",
+      JSON.stringify(methods.slice(-3)),
+    );
+    assert.deepStrictEqual(app.errors, []);
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    assert.strictEqual(router.invoke("get", "/status").body.polar, null);
   } finally {
     plugin.stop();
   }

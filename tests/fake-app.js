@@ -38,6 +38,17 @@ class FakeSignalKApp extends EventEmitter {
     this.resourceProviders = [];
     /** @type {Array<{path: string, handler: Function}>} app-level middleware mounts (e.g. plotterext static) */
     this.middleware = [];
+    /**
+     * Resource facade mirroring the server's `app.resourcesApi`:
+     * getResource dispatches to the matching registered provider.
+     */
+    this.resourcesApi = {
+      getResource: async (type, id) => {
+        const provider = this.resourceProviders.find((p) => p.type === type);
+        if (!provider) throw new Error(`No provider for resource ${type}`);
+        return provider.methods.getResource(id);
+      },
+    };
   }
 
   /**
