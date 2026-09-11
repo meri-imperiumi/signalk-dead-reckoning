@@ -365,6 +365,53 @@ test("access request client: 501/404 → null (open server)", async () => {
   }
 });
 
+test("access request client: 403 → 'forbidden' (device access requests disallowed — must not read as open server)", async () => {
+  // signalk-server with security enabled but allowDeviceAccessRequests
+  // off completes the request with statusCode 403. Misreading that as
+  // "no access-request flow" made the plugin probe tokenless writes,
+  // eat the admin gate's 401, and loop — the 401-flood bug.
+  const access = createAccessRequestClient({
+    baseUrl: "http://x",
+    fetchImpl: async () => ({
+      ok: false,
+      status: 403,
+      json: async () => ({ state: "COMPLETED", statusCode: 403 }),
+    }),
+  });
+  assert.strictEqual(
+    await access.request({ clientId: "u", description: "d" }),
+    "forbidden",
+  );
+});
+
+test("access request client: 400/5xx → 'unreachable' (retry later, not an open server)", async () => {
+  for (const status of [400, 413, 500, 503]) {
+    const access = createAccessRequestClient({
+      baseUrl: "http://x",
+      fetchImpl: async () => ({ ok: false, status }),
+    });
+    assert.strictEqual(
+      await access.request({ clientId: "u", description: "d" }),
+      "unreachable",
+    );
+  }
+});
+
+test("access request client: 2xx without href → 'unreachable' (broken reply, never open server)", async () => {
+  const access = createAccessRequestClient({
+    baseUrl: "http://x",
+    fetchImpl: async () => ({
+      ok: true,
+      status: 202,
+      json: async () => ({ state: "PENDING" }),
+    }),
+  });
+  assert.strictEqual(
+    await access.request({ clientId: "u", description: "d" }),
+    "unreachable",
+  );
+});
+
 test("access request client: transport failure → 'unreachable' (distinct from open server)", async () => {
   const access = createAccessRequestClient({
     baseUrl: "http://x",

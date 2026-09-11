@@ -320,6 +320,10 @@ const DEFAULT_CONFIG = {
     pollIntervalMs: 30000,
     tackDebounceS: 120,
     token: "",
+    // Base delay for logbook write retries (doubling per consecutive
+    // failure, capped at 32× = 16 min by default): a 5xx or unreachable
+    // server must be retried politely, never hammered.
+    retryBackoffMs: 30000,
   },
   training: {
     settleSustainS: null, // null → module default (10s)
@@ -615,6 +619,43 @@ module.exports = (app) => {
   /** @type {object|null} §7-access-request lifecycle (poll interval + state) */
   let accessPoll = null;
 
+  /**
+   * Current access-flow phase, for status + write-time re-request
+   * decisions: "granted" (token working), "pending" (request submitted,
+   * admin approval awaited), "open" (no auth needed — probe accepted),
+   * "denied" (admin said no), "rejected" (auth attempted and refused —
+   * config token bad, device access requests disallowed, or the
+   * tokenless probe hit an auth gate; admin/watchkeeper action needed,
+   * no in-process retry), "unreachable". @type {string|null}
+   */
+  let logbookPhase = null;
+
+  /**
+   * Provenance of the current logbook client's credentials — decides
+   * what a 401/403 rejection means: "granted" (server-issued via the
+   * access flow → token expired, re-request), "config" (pasted by the
+   * watchkeeper → wrong or revoked, only a human can fix it), "open"
+   * (tokenless probe → the server requires auth after all, nothing to
+   * retry). @type {string|null}
+   */
+  let logbookTokenSource = null;
+
+  /**
+   * True while an access request is in flight or its poll interval
+   * runs — initLogbook must never stack a second cycle on top
+   * (duplicate requests, doubled intervals). @type {boolean}
+   */
+  let accessCycleActive = false;
+
+  /** Scheduled backed-off retry (5xx/unreachable) — one at a time. */
+  let logbookRetryTimer = null;
+
+  /** Current backoff delay (0 = no failure outstanding). @type {number} */
+  let logbookBackoffMs = 0;
+
+  /** A flushLogbookPending pass is running (no concurrent flushes). */
+  let logbookFlushing = false;
+
   /** @type {number|null} timestamp (ms) of the last logged maneuver, §9.4 debounce */
   let lastTackLoggedMs = null;
 
@@ -679,6 +720,13 @@ module.exports = (app) => {
           title:
             "Access token (optional — when empty, obtained via the server's access-request flow on first write)",
           default: DEFAULT_CONFIG.logbook.token,
+        },
+        "logbook.retryBackoffMs": {
+          type: "integer",
+          title: "Logbook retry backoff (ms)",
+          description:
+            "Base delay before retrying a failed logbook write; doubles per consecutive failure (capped at 32×)",
+          default: DEFAULT_CONFIG.logbook.retryBackoffMs,
         },
         "weatherCurrent.enabled": {
           type: "boolean",
@@ -1044,6 +1092,13 @@ module.exports = (app) => {
         clearInterval(accessPoll);
         accessPoll = null;
       }
+      if (logbookRetryTimer) {
+        clearTimeout(logbookRetryTimer);
+        logbookRetryTimer = null;
+      }
+      accessCycleActive = false;
+      logbookTokenSource = null;
+      logbookBackoffMs = 0;
       logbook = null;
       logbookPhase = null;
       lastTackLoggedMs = null;
@@ -1881,23 +1936,95 @@ module.exports = (app) => {
   // --- Logbook write-through (SPEC §9.4, §9.5) ----------------------------
 
   /**
+   * Schedules a backed-off logbook retry: the delay doubles per
+   * consecutive failure (base → 32× cap) and resets on success, so a
+   * 5xx/unreachable server is retried politely — never hammered in a
+   * tight loop. One timer at a time; the write path may cancel it in
+   * favor of an immediate fresh attempt (writes are watchkeeper-paced
+   * events, not a loop).
+   *
+   * @returns {void}
+   */
+  function scheduleLogbookRetry() {
+    if (logbookRetryTimer || !db) return;
+    const base = config.logbook?.retryBackoffMs ?? 30000;
+    logbookBackoffMs =
+      logbookBackoffMs > 0 ? Math.min(logbookBackoffMs * 2, base * 32) : base;
+    const wait = logbookBackoffMs;
+    logbookRetryTimer = setTimeout(() => {
+      logbookRetryTimer = null;
+      if (logbook) flushLogbookPending();
+      else if (logbookPhase === "unreachable") initLogbook();
+    }, wait);
+  }
+
+  /**
+   * Clears any pending retry timer and resets the backoff ladder —
+   * called on every successful write/flush (and on token grant).
+   *
+   * @returns {void}
+   */
+  function resetLogbookRetry() {
+    logbookBackoffMs = 0;
+    if (logbookRetryTimer) {
+      clearTimeout(logbookRetryTimer);
+      logbookRetryTimer = null;
+    }
+  }
+
+  /**
+   * Shared 401/403 handler, deciding by token provenance what the
+   * rejection means and what may follow. The unconditional version of
+   * this (drop token → re-run the access flow → probe → 401 → …) was
+   * the 401-flood bug: with the server disallowing device access
+   * requests it looped ~10 POSTs/s indefinitely.
+   *
+   *  - "granted": the server-issued token expired or was revoked —
+   *    request a fresh one (bounded: one request, then approval poll).
+   *  - "config": the pasted token is wrong or revoked — only the
+   *    watchkeeper can fix it; parking beats resurrecting the same bad
+   *    token from config on every cycle.
+   *  - "open": the tokenless probe hit an auth gate — the server
+   *    requires authentication despite advertising no access-request
+   *    flow. Nothing to retry.
+   *
+   * The queue is kept in every branch; a plugin restart retries once.
+   *
+   * @returns {void}
+   */
+  function handleLogbookUnauthorized() {
+    const source = logbookTokenSource;
+    logbook = null;
+    logbookTokenSource = null;
+    deps.setState(db, "logbook_token", "");
+    if (source === "granted") {
+      deps.setState(db, "logbook_access_href", "");
+      logbookPhase = "pending";
+      initLogbook();
+    } else {
+      logbookPhase = "rejected";
+      setStatus(
+        source === "config"
+          ? "Logbook token rejected by the server — check the token in plugin settings. Queued entries wait"
+          : "Logbook writes need authentication this plugin cannot obtain — allow device access requests on the server or configure a token. Queued entries wait",
+      );
+    }
+  }
+
+  /**
    * Initializes the logbook client when enabled. Token acquisition via
    * the server's Access Requests flow: a config token short-circuits it;
    * otherwise a stable clientId (persisted) requests access, an admin
    * approves in the server UI, and a poll interval picks up the granted
-   * token. A DENIED verdict stops polling until the next start. Writes
-   * are simply skipped while no token is available.
+   * token — resuming a request persisted from a previous run instead of
+   * filing a duplicate. A DENIED verdict stops polling until the next
+   * start; a FORBIDDEN verdict (device access requests disallowed on
+   * the server) parks the flow — retrying cannot help and hammering is
+   * exactly the failure mode this code must avoid. Writes are queued
+   * (SQLite) while no token is available, so nothing is lost.
    *
    * @returns {void}
    */
-  /**
-   * Current access-flow phase, for status + write-time re-request
-   * decisions: "granted" (token working), "pending" (request submitted,
-   * admin approval awaited), "open" (no auth needed — writes verified
-   * live), "denied", "unreachable". @type {string|null}
-   */
-  let logbookPhase = null;
-
   function initLogbook() {
     if (!config.logbook?.enabled) return;
 
@@ -1918,6 +2045,7 @@ module.exports = (app) => {
         url: config.logbook.url,
         token: storedToken,
       });
+      logbookTokenSource = config.logbook.token ? "config" : "granted";
       logbookPhase = "granted";
       setStatus("Logbook write-through enabled");
       // Any entries queued before a restart land here.
@@ -1925,14 +2053,79 @@ module.exports = (app) => {
       return;
     }
 
-    // No usable token: submit an access request and poll for approval.
-    // Entries written while waiting are queued (SQLite) and flushed on
-    // grant — nothing is lost in the approval window.
+    // An access cycle is already running (request in flight or poll
+    // interval live): never stack a second one on top.
+    if (accessCycleActive) return;
+
     const access = deps.createAccessRequestClient({
       baseUrl: config.logbook.baseUrl,
     });
     logbookPhase = "pending";
     setStatus("Logbook access requested — approve in the server UI");
+
+    /**
+     * Polls the request until an admin decides. Bounded by design: a
+     * poll every pollIntervalMs, no writes attempted while pending.
+     */
+    const poll = (href) => {
+      if (accessPoll) clearInterval(accessPoll);
+      accessPoll = setInterval(async () => {
+        try {
+          const verdict = await access.poll(href);
+          if (verdict === "DENIED") {
+            clearInterval(accessPoll);
+            accessPoll = null;
+            accessCycleActive = false;
+            deps.setState(db, "logbook_access_href", "");
+            logbookPhase = "denied";
+            logbook = null;
+            setStatus("Logbook access denied — no logbook writes");
+            return;
+          }
+          if (verdict?.token) {
+            clearInterval(accessPoll);
+            accessPoll = null;
+            accessCycleActive = false;
+            deps.setState(db, "logbook_token", verdict.token);
+            // Normalize, don't accumulate: a null expiration on the
+            // new token must not leave the old token's expiry in place.
+            deps.setState(
+              db,
+              "logbook_token_expires",
+              verdict.expirationTime ?? "",
+            );
+            deps.setState(db, "logbook_access_href", "");
+            logbook = deps.createLogbookClient({
+              url: config.logbook.url,
+              token: verdict.token,
+            });
+            logbookTokenSource = "granted";
+            logbookPhase = "granted";
+            resetLogbookRetry();
+            setStatus("Logbook write-through enabled");
+            flushLogbookPending();
+          }
+        } catch {
+          // Poll failure: keep polling; the next interval retries.
+        }
+      }, config.logbook.pollIntervalMs);
+    };
+
+    // Resume a request filed by a previous run instead of submitting a
+    // duplicate (the server 400s those) — the href is persisted with
+    // the same care as the token, and an approval that landed while the
+    // plugin was down is picked up on the first poll.
+    const storedHref = deps.getState(db, "logbook_access_href");
+    if (storedHref) {
+      accessCycleActive = true;
+      poll(storedHref);
+      return;
+    }
+
+    // No usable token: submit an access request and poll for approval.
+    // Entries written while waiting are queued (SQLite) and flushed on
+    // grant — nothing is lost in the approval window.
+    accessCycleActive = true;
     access
       .request({
         clientId,
@@ -1947,117 +2140,106 @@ module.exports = (app) => {
       })
       .then((href) => {
         if (href === "unreachable") {
-          // Transport failure: don't pretend it's an open server, don't
-          // poll a bogus href. Writes queue; the next write re-runs
-          // initLogbook() to retry once the server is reachable again.
+          // Transport failure or an unaccepted request: don't pretend
+          // it's an open server, don't poll a bogus href. Writes queue;
+          // a backed-off retry re-runs the access flow.
+          accessCycleActive = false;
           logbookPhase = "unreachable";
           setStatus("Logbook unreachable — entries queued");
+          scheduleLogbookRetry();
+          return;
+        }
+        if (href === "forbidden") {
+          // Security is enabled but device access requests are
+          // disallowed (403, allowDeviceAccessRequests off): no token
+          // can ever be obtained this way, and probing or retrying can
+          // only hammer the server — the exact 401-flood failure mode.
+          // Park it; the status message names the two ways out.
+          accessCycleActive = false;
+          logbookPhase = "rejected";
+          setStatus(
+            "Logbook writes blocked: the server disallows device access requests — allow them in server security settings or configure a token here. Queued entries wait",
+          );
           return;
         }
         if (!href) {
-          // 501/404 = the server advertises no access-request flow
-          // (open server). Try an unauthenticated write; if it lands,
-          // we're in business. Anything else (incl. network refusal)
-          // stays queued and retries on the next write.
+          // 404/501 = the server advertises no access-request flow
+          // (open server). Probe an unauthenticated write; if it lands,
+          // we're in business. A 401/403 answer is terminal (see
+          // handleLogbookUnauthorized) — never retried in-process.
+          accessCycleActive = false;
           logbook = deps.createLogbookClient({
             url: config.logbook.url,
           });
+          logbookTokenSource = "open";
           logbookPhase = "open";
           flushLogbookPending();
           return;
         }
-        accessPoll = setInterval(async () => {
-          try {
-            const verdict = await access.poll(href);
-            if (verdict === "DENIED") {
-              clearInterval(accessPoll);
-              accessPoll = null;
-              logbookPhase = "denied";
-              logbook = null;
-              setStatus("Logbook access denied — no logbook writes");
-              return;
-            }
-            if (verdict?.token) {
-              clearInterval(accessPoll);
-              accessPoll = null;
-              deps.setState(db, "logbook_token", verdict.token);
-              if (verdict.expirationTime) {
-                deps.setState(
-                  db,
-                  "logbook_token_expires",
-                  verdict.expirationTime,
-                );
-              }
-              logbook = deps.createLogbookClient({
-                url: config.logbook.url,
-                token: verdict.token,
-              });
-              logbookPhase = "granted";
-              setStatus("Logbook write-through enabled");
-              flushLogbookPending();
-            }
-          } catch {
-            // Poll failure: keep polling; the next interval retries.
-          }
-        }, config.logbook.pollIntervalMs);
+        deps.setState(db, "logbook_access_href", href);
+        poll(href);
       })
       .catch(() => {
-        // Network refusal at request time: unreachable — writes queue.
+        // Network refusal at request time: unreachable — writes queue,
+        // backed-off retry.
+        accessCycleActive = false;
         logbookPhase = "unreachable";
         setStatus("Logbook unreachable — entries queued");
+        scheduleLogbookRetry();
       });
   }
 
   /**
-   * Writes a logbook entry, handling the unauthorized case by dropping the
-   * stored token and re-requesting access (the spec's 403 handling). Never
-   * throws — logbook failures never block the fix/matrix/polygon paths.
-   *
-   * @param {object} body - NewEntry-shaped
-   * @returns {Promise<string|null>} the entry ref on success
-   */
-  /**
    * Flushes queued logbook entries oldest-first once a client exists
-   * (token granted / open server verified live). Stops at the first
-   * failure so ordering is preserved and the queue stays intact.
+   * (token granted / open server). Stops at the first failure so
+   * ordering is preserved and the queue stays intact: unauthorized →
+   * provenance handling (re-request or park), transient → a backed-off
+   * retry. Never runs concurrently with itself.
    * @returns {Promise<void>}
    */
   async function flushLogbookPending() {
-    if (!logbook || !db) return;
-    for (const row of deps.listLogbookPending(db)) {
-      const ref = await logbook.createEntry(row.payload);
-      if (ref === "unauthorized" || ref == null) {
+    if (!logbook || !db || logbookFlushing) return;
+    logbookFlushing = true;
+    try {
+      for (const row of deps.listLogbookPending(db)) {
+        const ref = await logbook.createEntry(row.payload);
         if (ref === "unauthorized") {
-          // Token rejected mid-flush: re-request, keep the queue.
-          logbook = null;
-          deps.setState(db, "logbook_token", "");
-          logbookPhase = "pending";
-          initLogbook();
+          handleLogbookUnauthorized();
+          return; // queue kept; re-requested or parked above
         }
-        return; // transient failure — retry on next trigger
+        if (ref == null) {
+          // Transient failure (network, 5xx): retry the flush after a
+          // backoff — never in a tight loop.
+          scheduleLogbookRetry();
+          return;
+        }
+        deps.dequeueLogbookPending(db, row.pending_id);
+        // A delayed fix delivery: mark the `fixes` row now that the entry
+        // actually landed (the confirm route only marks on immediate writes).
+        if (row.fix_id != null && ref != null) {
+          deps.markFixLogged(db, row.fix_id, ref);
+        }
       }
-      deps.dequeueLogbookPending(db, row.pending_id);
-      // A delayed fix delivery: mark the `fixes` row now that the entry
-      // actually landed (the confirm route only marks on immediate writes).
-      if (row.fix_id != null && ref != null) {
-        deps.markFixLogged(db, row.fix_id, ref);
+      resetLogbookRetry();
+      const remaining = deps.listLogbookPending(db).length;
+      if (remaining === 0 && logbookPhase === "granted") {
+        setStatus("Logbook write-through enabled");
       }
-    }
-    const remaining = deps.listLogbookPending(db).length;
-    if (remaining === 0 && logbookPhase === "granted") {
-      setStatus("Logbook write-through enabled");
+    } finally {
+      logbookFlushing = false;
     }
   }
 
   /**
    * Writes a logbook entry. While no client is available (tokenless /
    * unreachable) the entry is queued (SQLite) and delivered when the
-   * access flow lands; on 401/403 the token is dropped and access
-   * re-requested — the entry re-queues, so expiry mid-passage loses
-   * nothing. Never throws — logbook failures never block the fix /
-   * matrix / polygon paths.
+   * access flow lands; on 401/403 the provenance handler decides
+   * between re-request (server-issued token expired) and parking
+   * (config token bad / server requires unobtainable auth) — the entry
+   * re-queues either way, so expiry mid-passage loses nothing. Never
+   * throws — logbook failures never block the fix / matrix / polygon
+   * paths.
    *
-   * @param {object} body - NewEntry-shaped
    * @param {object} body - NewEntry-shaped
    * @param {string} [kind="entry"] - 'fix' | 'tack' | 'bearing' | 'observation'
    * @param {number|null} [fixId=null] - links a fix entry to its `fixes` row
@@ -2068,30 +2250,49 @@ module.exports = (app) => {
     if (!db) return null;
     if (!logbook) {
       // Tokenless: queue for the approval window. Also re-kick the
-      // access flow — covers expiry/loss after start() already ran it.
+      // access flow — covers expiry/loss after start() already ran it —
+      // but never while a cycle runs, a backoff retry owns the next
+      // attempt, or the flow parked itself awaiting human action.
       deps.enqueueLogbookPending(db, kind, body, fixId);
-      if (logbookPhase !== "pending" && logbookPhase !== "denied") {
+      if (
+        logbookPhase !== "pending" &&
+        logbookPhase !== "denied" &&
+        logbookPhase !== "rejected"
+      ) {
+        // A write is a watchkeeper-paced event (fix confirmation,
+        // observation, maneuver), not a loop — a legitimate trigger
+        // for an immediate retry that outranks a pending backoff.
+        if (logbookRetryTimer) {
+          clearTimeout(logbookRetryTimer);
+          logbookRetryTimer = null;
+        }
         initLogbook();
       }
       return null;
     }
     const ref = await logbook.createEntry(body);
     if (ref === "unauthorized") {
-      // Token expired/revoked: queue this entry, drop the token,
-      // re-request. Delivery resumes when re-approved.
+      // Token rejected: queue this entry, then let the provenance
+      // handler decide between re-request and parking.
       deps.enqueueLogbookPending(db, kind, body, fixId);
-      logbook = null;
-      deps.setState(db, "logbook_token", "");
-      logbookPhase = "pending";
-      initLogbook();
+      handleLogbookUnauthorized();
       return null;
     }
     if (ref == null) {
       // Transient failure (network, 5xx): queue so a later success
-      // (or restart) delivers it. Bounded, ordered, source-of-truth
-      // stays the plugin DB.
+      // (or restart) delivers it. Bounded, ordered, backed-off,
+      // source-of-truth stays the plugin DB.
       deps.enqueueLogbookPending(db, kind, body, fixId);
       setStatus("Logbook write failed — entry queued");
+      scheduleLogbookRetry();
+    } else {
+      // Delivered — but if older entries still sit queued, flush them
+      // now instead of waiting on the backoff timer.
+      if (deps.listLogbookPending(db).length > 0) {
+        flushLogbookPending();
+      } else {
+        resetLogbookRetry();
+      }
     }
     return ref;
   }

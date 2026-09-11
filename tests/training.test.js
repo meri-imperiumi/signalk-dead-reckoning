@@ -77,6 +77,24 @@ test("detectFouling uses AWS as a moving corroboration when SOG is absent", () =
   );
 });
 
+test("detectFouling: a live SOG≈0 outranks wind — breeze on a moored mast is not fouling", () => {
+  // The at-anchor false positive (work doc #17's class): STW reads 0
+  // because the boat is tied up, GPS agrees it isn't going anywhere,
+  // but the masthead breeze blows. Wind only corroborates fouling when
+  // GPS is silent; a live SOG reading is authoritative either way.
+  assert.strictEqual(
+    detectFouling({ stwKn: 0, sogKn: 0.2, awsKn: 15, heelDeg: 5 }),
+    false,
+  );
+});
+
+test("detectFouling: quiet wind with no SOG is not fouling either", () => {
+  assert.strictEqual(
+    detectFouling({ stwKn: 0.1, sogKn: null, awsKn: 2, heelDeg: 0 }),
+    false,
+  );
+});
+
 test("isGpsReliable is false without a fix", () => {
   const st = new TrainingState();
   assert.strictEqual(isGpsReliable(st, null), false);

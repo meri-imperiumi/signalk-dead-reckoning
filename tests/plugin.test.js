@@ -1693,8 +1693,28 @@ test("fouling alert is debounced: threshold-hovering STW doesn't flap, sustained
     "fouling alert flapped during threshold hover",
   );
 
-  // A real fault — STW pinned at 0 while wind says 12 kn — must still
-  // surface after the sustain window.
+  // A real fault — STW pinned at 0 while the boat verifiably makes
+  // way: GPS steps north at ~6 kn. (Breeze alone no longer raises: a
+  // live SOG near zero is an outright "not making way" verdict —
+  // wind-on-a-moored-mast was the false positive.) Must still surface
+  // after the sustain window.
+  let lat = 60;
+  const move = setInterval(() => {
+    lat += 0.0000028;
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: lat, longitude: 24 },
+            },
+          ],
+        },
+      ],
+    });
+  }, 100);
   app.emitDelta({
     context: "vessels.self",
     updates: [
@@ -1704,6 +1724,7 @@ test("fouling alert is debounced: threshold-hovering STW doesn't flap, sustained
     ],
   });
   await new Promise((r) => setTimeout(r, 1600));
+  clearInterval(move);
   const alerts = healthAlerts();
   assert.strictEqual(alerts.length, 1, "sustained fouling did not raise");
   assert.ok(/fouled/.test(alerts[0].value.message));
@@ -2089,6 +2110,118 @@ test("logbook: tokenless start queues the fix entry, access approval flushes it"
   await rm(dir, { recursive: true, force: true });
 });
 
+test("logbook: restart resumes the pending access request instead of filing a duplicate", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-resume-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const accessRequests = [];
+  const polls = [];
+  const logPosts = [];
+  const realFetch = globalThis.fetch;
+  let approved = false;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      accessRequests.push(opts?.body);
+      return {
+        ok: true,
+        status: 202,
+        json: async () => ({
+          state: "PENDING",
+          href: "/signalk/v1/requests/abc",
+        }),
+      };
+    }
+    if (u.includes("/signalk/v1/requests/abc")) {
+      polls.push(u);
+      return {
+        ok: true,
+        status: 200,
+        json: async () =>
+          approved
+            ? {
+                state: "COMPLETED",
+                accessRequest: {
+                  permission: "APPROVED",
+                  token: "granted-tok",
+                  expirationTime: null,
+                },
+              }
+            : { state: "PENDING" },
+      };
+    }
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      logPosts.push(u);
+      return { ok: true, status: 201 };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(accessRequests.length, 1);
+    // Server restarts mid-approval-window: the pending request must be
+    // polled, never re-submitted (the server 400s duplicates).
+    plugin.stop();
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    plugin.registerWithRouter(router);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(
+      accessRequests.length,
+      1,
+      "restart resumed the stored request, no duplicate filed",
+    );
+    assert.ok(polls.length > 0, "polling resumed");
+    // Approval lands while running — the queued entry flushes.
+    approved = true;
+    await new Promise((r) => setTimeout(r, 150));
+    assert.strictEqual(logPosts.length, 1, "queued entry delivered");
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("logbook: unreachable server queues writes and retries on next write", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-lb-unreach-"));
   const app = new FakeSignalKApp();
@@ -2190,6 +2323,342 @@ test("logbook: unreachable server queues writes and retries on next write", asyn
     });
     pending = db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c;
     assert.strictEqual(pending, 0, "queue drained after recovery");
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: 401-flood regression — device access requests disallowed parks the flow", async () => {
+  // The lille-oe-pi failure: security enabled, allowDeviceAccessRequests
+  // off — every POST /signalk/v1/access/requests answers 403, which the
+  // client used to read as "no access-request flow" → tokenless probe →
+  // 401 on the admin-gated route → re-run the access flow → … ~10
+  // requests/s indefinitely. The 403 must park the flow instead.
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-403-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const accessRequests = [];
+  const logPosts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      accessRequests.push(opts?.body);
+      return {
+        ok: false,
+        status: 403,
+        json: async () => ({ state: "COMPLETED", statusCode: 403 }),
+      };
+    }
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      logPosts.push(u);
+      return { ok: false, status: 401, json: async () => ({}) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.strictEqual(accessRequests.length, 1, "one access request");
+    assert.strictEqual(logPosts.length, 0, "no probe while forbidden");
+
+    // A queued write must not re-kick the parked flow either.
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.strictEqual(
+      accessRequests.length,
+      1,
+      "no re-request after 403 (was the flood)",
+    );
+    assert.strictEqual(logPosts.length, 0, "no logbook writes attempted");
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c,
+      1,
+      "entry stays queued for when auth becomes obtainable",
+    );
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: 401-flood regression — tokenless probe on an auth-gated server is terminal", async () => {
+  // No access-request flow advertised (404), but the server still gates
+  // the plugin route (401): the open-server probe fails once and must
+  // stop — retrying the probe in a loop was the other flood shape.
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-open401-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const accessRequests = [];
+  const logPosts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      accessRequests.push(u);
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({ message: "not available" }),
+      };
+    }
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      logPosts.push(u);
+      return { ok: false, status: 401, json: async () => ({}) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    // The probe: exactly one write attempt, rejected.
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(logPosts.length, 1, "probe attempted exactly once");
+    assert.strictEqual(accessRequests.length, 1, "one access request");
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c,
+      1,
+      "rejected probe keeps the queue",
+    );
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: rejected config token parks instead of resurrecting the bad token", async () => {
+  // A token pasted into config that the server refuses (wrong server,
+  // revoked, insufficient permission) must not be reloaded into a fresh
+  // client on every retry — clearing the *stored* token doesn't touch
+  // the config one, so the old code looped fetch → 401 → reload → fetch.
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-cfgtok-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const logPosts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      logPosts.push(u);
+      return { ok: false, status: 401, json: async () => ({}) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        token: "stale-token",
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.strictEqual(logPosts.length, 1, "one write with the bad token");
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c,
+      1,
+      "entry queued behind the rejected config token",
+    );
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: 5xx failures retry with exponential backoff, never a tight loop", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-backoff-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const logPosts = [];
+  const realFetch = globalThis.fetch;
+  let failing = true;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("/plugins/signalk-logbook/logs")) {
+      logPosts.push({ t: Date.now() });
+      return failing
+        ? { ok: false, status: 500, json: async () => ({}) }
+        : { ok: true, status: 201, json: async () => ({}) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        token: "tok",
+        retryBackoffMs: 20,
+        url: "http://x/plugins/signalk-logbook/logs",
+        baseUrl: "http://x",
+      },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    // Backoff ladder with retryBackoffMs=20: retries at ~20, 60, 140,
+    // 300 ms… — a handful of attempts in the first quarter second, then
+    // visibly slowing. A tight loop would be into the dozens.
+    await new Promise((r) => setTimeout(r, 250));
+    const first = logPosts.length;
+    assert.ok(first >= 2 && first <= 6, `attempts in 250ms: ${first}`);
+    await new Promise((r) => setTimeout(r, 350));
+    const growth = logPosts.length - first;
+    assert.ok(
+      growth >= 0 && growth <= 2,
+      `retries slowed (grew by ${growth} in 350ms)`,
+    );
+    const { DatabaseSync } = require("node:sqlite");
+    let db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c,
+      1,
+      "failed entry stays queued",
+    );
+    db.close();
+    // The server recovers — the next backed-off retry drains the queue
+    // and resets the ladder.
+    failing = false;
+    await new Promise((r) => setTimeout(r, 400));
+    db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c,
+      0,
+      "queue drained after recovery",
+    );
     db.close();
     plugin.stop();
   } finally {
@@ -3175,6 +3644,7 @@ test("inertial-polar: fouled paddlewheel switches DR onto polar speed", async ()
     saveIntervalMs: 60000,
     sensorHealth: { sustainS: 0.1, clearS: 0.1 },
   });
+  let move = null;
   try {
     app.emitDelta({
       context: "vessels.self",
@@ -3187,18 +3657,37 @@ test("inertial-polar: fouled paddlewheel switches DR onto polar speed", async ()
             },
             { path: "navigation.speedThroughWater", value: 0 },
             { path: "navigation.headingTrue", value: 90 },
-            // Wind corroborates making-way (§6.3's AWS path) — constant,
-            // unlike a GPS-derived SOG whose EMA drains once fixes stop
-            // changing, which would clear the fouling verdict mid-test.
             { path: "environment.wind.speedApparent", value: 12 },
           ],
         },
       ],
     });
     // Fouled STW reads 0 (a number) — the underway branch would
-    // integrate near-zero speed without the polar fallback. Feed the
-    // polar stream until the debounced fouling verdict lands and the
-    // source switches.
+    // integrate near-zero speed without the polar fallback. The fouling
+    // verdict needs the boat verifiably making way, so GPS steps north
+    // at ~6 kn for the duration: a live SOG is authoritative (breeze
+    // alone no longer counts), and a GPS that stops moving would drain
+    // the SOG EMA and clear the verdict mid-test. Wind stays in the
+    // fixture as background, not as the trigger.
+    let lat = 60;
+    move = setInterval(() => {
+      lat += 0.0000028;
+      app.emitDelta({
+        context: "vessels.self",
+        updates: [
+          {
+            values: [
+              {
+                path: "navigation.position",
+                value: { latitude: lat, longitude: 24 },
+              },
+            ],
+          },
+        ],
+      });
+    }, 100);
+    // Feed the polar stream until the debounced fouling verdict lands
+    // and the source switches.
     await emitPolarSpeed(app, Array(20).fill(polarMs(5)));
     await new Promise((r) => setTimeout(r, 300));
 
@@ -3227,6 +3716,7 @@ test("inertial-polar: fouled paddlewheel switches DR onto polar speed", async ()
       `no fouled+switch alert: ${JSON.stringify(alerts)}`,
     );
   } finally {
+    if (move) clearInterval(move);
     plugin.stop();
   }
   await rm(dir, { recursive: true, force: true });

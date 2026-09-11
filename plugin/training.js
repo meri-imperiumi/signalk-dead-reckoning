@@ -224,8 +224,18 @@ function isGpsReliable(st, fix) {
 
 /**
  * Paddlewheel fouling detector (SPEC §6.3). STW reads ~0 while the boat
- * is clearly moving (SOG well above zero, or AWS + heel corroborate).
- * Distinguishes fouling from "boat genuinely stopped" (SOG≈0 too).
+ * is clearly moving (SOG well above zero, or — only when there is no
+ * SOG at all — AWS corroborates). Distinguishes fouling from "boat
+ * genuinely stopped" (SOG≈0 too).
+ *
+ * A live SOG reading below the moving threshold is an outright "not
+ * making way" verdict: breeze on a moored or docked mast must not read
+ * as a fouled paddlewheel (the §7 moored/anchored gate covers installs
+ * that publish navigation.state; this keeps the same honesty for the
+ * gap before that delta lands, and for installs without an autostate
+ * source). Wind corroborates fouling only when GPS is silent — with a
+ * dead GPS, AWS above the threshold is the sole "should be moving"
+ * signal left.
  *
  * Pure function of the current sensor snapshot.
  *
@@ -236,9 +246,8 @@ function detectFouling(s) {
   const stw = s.stwKn ?? 0;
   if (stw > STW_STOP_KN) return false; // paddlewheel is reading motion
   // STW≈0. Is the boat actually moving?
-  const movingByGps = s.sogKn != null && s.sogKn > SOG_MOVING_KN;
-  const movingByWind = s.awsKn != null && s.awsKn > AWS_MOVING_KN;
-  return movingByGps || movingByWind;
+  if (s.sogKn != null) return s.sogKn > SOG_MOVING_KN;
+  return s.awsKn != null && s.awsKn > AWS_MOVING_KN;
 }
 
 /**

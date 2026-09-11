@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Logbook write-through no longer floods the server when
+  authentication cannot be obtained** (reported 2026-09-11 on
+  lille-oe-pi: a continuous ~10 req/s stream of
+  `POST /plugins/signalk-logbook/logs` 401s at anchor; the 91-byte
+  bodies identified the server's plugin-route admin gate answering a
+  tokenless "open server" probe). The access-request client read
+  *any* non-OK response (403 disallowed device requests, 429 rate
+  limit, 400 duplicate, 503, …) as "no access-request flow", built a
+  tokenless client, ate the admin gate's 401, and re-ran the whole
+  cycle forever. The client now distinguishes: 403 → "forbidden"
+  (park; the plugin status names the two ways out — allow device
+  access requests on the server, or paste a token); 404/501 → a
+  single tokenless probe, terminal on rejection; everything else →
+  "unreachable", retried on an exponential backoff (30 s doubling to
+  a 16 min cap, configurable via `logbook.retryBackoffMs`) — never an
+  open-server assumption, never a loop. A rejected config token or
+  tokenless probe parks instead of resurrecting the same credentials
+  in a loop. A pending access request is persisted and resumed across
+  restarts instead of re-filed (the server rejects duplicates), and an
+  approval granted while the plugin was down is picked up on the
+  first poll. Queued entries are never dropped by any of this.
+- **The "paddlewheel appears fouled" alert no longer fires on breeze
+  over a moored boat** while `navigation.state` hasn't landed in the
+  delta cache yet (or on installs without an autostate source): a live
+  SOG reading below the moving threshold is now an outright "not
+  making way" verdict, and wind only corroborates fouling when GPS is
+  silent.
+
 ### Added
 - **Polar speed fallback now also works without
   signalk-polar-performance-plugin**: when its `performance.polarSpeed`

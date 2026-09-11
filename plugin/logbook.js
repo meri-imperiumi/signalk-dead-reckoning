@@ -459,13 +459,20 @@ function createAccessRequestClient(opts) {
      * logbook writes need 'admin'. The requested level is surfaced to the
      * approving administrator and granted verbatim on approval.
      *
-     * Resolves the poll href, null when the server doesn't implement
-     * access requests (501/404 — open server, writes need no token), or
-     * 'unreachable' on transport failure (distinguished so the caller
-     * retries instead of falsely claiming an open server).
+     * Resolves the poll href on acceptance (202). null when the server
+     * has no access-request flow (404 security-not-enabled / 501 not
+     * implemented — an open server accepts tokenless writes).
+     * 'forbidden' when the flow exists but device access requests are
+     * disallowed (403 — verified in signalk-server: requestAccess
+     * completes with statusCode 403 while allowDeviceAccessRequests is
+     * off; no token can be obtained without an admin changing server
+     * settings, so retrying is pointless). 'unreachable' on transport
+     * failure or an unaccepted request (400 duplicate/invalid, 413, 5xx —
+     * distinguished so the caller retries with backoff instead of
+     * falsely claiming an open server).
      *
      * @param {{clientId: string, description: string, permissions?: string}} req
-     * @returns {Promise<string|null|"unreachable">}
+     * @returns {Promise<string|null|"forbidden"|"unreachable">}
      */
     async request(req) {
       try {
@@ -478,9 +485,12 @@ function createAccessRequestClient(opts) {
           },
         );
         if (res.status === 501 || res.status === 404) return null;
-        if (!res.ok) return null;
+        if (res.status === 403) return "forbidden";
+        if (!res.ok) return "unreachable";
         const body = await res.json();
-        return body?.href ?? null;
+        // A 2xx without an href is a broken reply — retry later, never
+        // treat it as evidence of an open server.
+        return body?.href ?? "unreachable";
       } catch {
         return "unreachable";
       }
