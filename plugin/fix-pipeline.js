@@ -256,6 +256,28 @@ function advanceToLatest(observations, advance) {
   return { observations: out, advancements };
 }
 
+/**
+ * Gross-displacement sanity cap for fix confirmation (sea trial
+ * 2026-08-31): a candidate a whole ocean away from the DR origin is a
+ * bad sight or bad input, not navigation — 69°S implied ~140 kn. But
+ * legitimate DR drift accumulates ~0.5–1 nm/h (sea trials measured
+ * 47 nm in 4.5 days with a current tier, 85 nm cold), so the cap must
+ * grow with the hours since the origin was set — a flat cap trains
+ * crews to force-confirm, defeating the guard for the teleport case
+ * it exists for.
+ *
+ * @param {number} maxDisplacementNm - configured flat cap (nm)
+ * @param {number} elapsedSinceOriginS - seconds since the origin was
+ *        set (integration time)
+ * @returns {number} cap in nm
+ */
+function fixSanityCapNm(maxDisplacementNm, elapsedSinceOriginS) {
+  const hours = Number.isFinite(elapsedSinceOriginS)
+    ? Math.max(0, elapsedSinceOriginS) / 3600
+    : 0;
+  return Math.max(maxDisplacementNm, 1.5 * hours);
+}
+
 function resolveCandidateFix(input) {
   const sourceType = input.source_type;
   const lopIds = input.observationIds?.lopIds ?? [];
@@ -542,6 +564,7 @@ module.exports = {
   advanceToLatest,
   defaultOriginErrorNm,
   evaluateObservationPlausibility,
+  fixSanityCapNm,
   MAX_IMPLIED_SPEED_KN,
   MIN_GATE_DISPLACEMENT_NM,
 };

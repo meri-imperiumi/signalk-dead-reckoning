@@ -50,6 +50,11 @@ const { TrainingState, tick: trainingTick } = require("../plugin/training.js");
 const { MatrixStore } = require("../plugin/matrix.js");
 const { openDatabase } = require("../plugin/db.js");
 const {
+  createDerivedCurrentState,
+  updateDerivedCurrent,
+  derivedCurrentSnapshot,
+} = require("../plugin/derived-current.js");
+const {
   distanceNm,
   bearingDeg,
   radToDeg,
@@ -72,6 +77,39 @@ const PATH_SPECS = [
 
 /** Tier-5 current: none resolved (SPEC §6.2). */
 const ZERO_CURRENT = { setTrue: 0, drift: 0, tier: 5 };
+
+/**
+ * Computes the causal derived-current series (SPEC §6.2 tier 2) over
+ * filled rows: exactly what the live plugin's `derived-current` state
+ * would hold, snapshotted per row. Training is gated on a resolved
+ * current, so the learning variants use this — "training with zero
+ * current" is no longer a reachable live configuration.
+ *
+ * @param {object[]} rows - filled rows
+ * @returns {{tMs: number, setTrue: number, drift: number}[]}
+ */
+function derivedCurrentSeries(rows) {
+  const st = createDerivedCurrentState();
+  const out = [];
+  for (const row of rows) {
+    updateDerivedCurrent(st, {
+      tMs: row.tMs,
+      gps: row.position,
+      stwKn: typeof row.stwMs === "number" ? msToKnots(row.stwMs) : null,
+      headingTrueDeg:
+        typeof row.headingTrueRad === "number"
+          ? normalizeDeg360(radToDeg(row.headingTrueRad))
+          : null,
+    });
+    const snap = derivedCurrentSnapshot(st, row.tMs);
+    out.push({
+      tMs: row.tMs,
+      setTrue: snap?.setTrue ?? 0,
+      drift: snap?.drift ?? 0,
+    });
+  }
+  return out;
+}
 
 /** SOG (kn) above which a sample counts as underway, for summaries. */
 const UNDERWAY_SOG_KN = 1.0;
@@ -478,9 +516,37 @@ function runReplay(rows, opts = {}) {
           ? currentAt(scud, tMs, position.latitude, position.longitude)
           : null
     : null;
+  const derived = derivedCurrentSeries(rows);
+  const derivedProvider = (_position, tMs) => {
+    // Nearest causal sample (series is time-sorted).
+    let lo = 0;
+    let hi = derived.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (derived[mid].tMs < tMs) lo = mid + 1;
+      else hi = mid;
+    }
+    const s = derived[lo];
+    if (!s || Math.abs(s.tMs - tMs) > 120000) return null;
+    return { setTrue: s.setTrue, drift: s.drift };
+  };
 
   const variants = [makeVariant({ key: "cold", train: false })];
-  if (wantTrain) variants.push(makeVariant({ key: "learn", train: true }));
+  variants.push(
+    makeVariant({
+      key: "derived",
+      train: false,
+      currentProvider: derivedProvider,
+    }),
+  );
+  if (wantTrain)
+    variants.push(
+      makeVariant({
+        key: "learn",
+        train: true,
+        currentProvider: derivedProvider,
+      }),
+    );
   if (scud) {
     variants.push(
       makeVariant({ key: "scud", train: false, currentProvider: scudProvider }),
@@ -571,7 +637,14 @@ function runReplay(rows, opts = {}) {
  */
 const VARIANT_STYLE = {
   cold: { label: "DR cold (no training, zero current)", color: "#fb923c" },
-  learn: { label: "DR learning (training on, zero current)", color: "#4ade80" },
+  derived: {
+    label: "DR cold + derived current (tier 2 EWMA)",
+    color: "#38bdf8",
+  },
+  learn: {
+    label: "DR learning (derived current, training)",
+    color: "#4ade80",
+  },
   scud: { label: "DR cold + SCUD current", color: "#c084fc" },
   scudLearn: { label: "DR learning + SCUD current", color: "#facc15" },
 };
@@ -1078,6 +1151,7 @@ module.exports = {
   toGeoJSON,
   toHtmlReport,
   variantKeys,
+  derivedCurrentSeries,
   VARIANT_STYLE,
   PATH_SPECS,
 };

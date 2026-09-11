@@ -555,7 +555,10 @@ function computeObservation(inputs) {
  * @param {number|null} s.awsKn - apparent wind speed (kn)
  * @param {number|null} s.heelDeg
  * @param {string} s.propulsionState - 'started' | 'stopped' | other
- * @param {{setTrue:number, drift:number, tier:number}} s.current - resolved current
+ * @param {{setTrue:number, drift:number, tier:number}} s.current - resolved current;
+ *   tier 5 (zero vector — current unknown) suspends training entirely
+ *   (SPEC §6.2 gate): the unmodeled current would be learned as fake
+ *   leeway and clamped speed gain
  * @param {number|null} [s.seaState] - Douglas sea state 0–9 (scales §6.4
  *   stabilize tolerances; null/unknown → flat-water base)
  * @param {number} s.lookupLeewayDeg
@@ -613,9 +616,17 @@ function tick(st, s) {
 
   // --- Eligibility (SPEC §6.1) ------------------------------------------
   const motoring = s.propulsionState === "started";
+  // §6.2: training needs a resolved current (tier < 5). With the zero
+  // vector the unmodeled current is baked into the leeway/speed bins
+  // and over-applied later — the Huahine→Aitutaki backtest (72 vs 65 nm
+  // cold) and the Aitutaki→Niue sea trial both showed it. A missing
+  // current input counts as unresolved.
+  const currentResolved =
+    s.current != null && Number.isFinite(s.current.tier) && s.current.tier < 5;
   const eligible =
     gpsReliable &&
     !motoring &&
+    currentResolved &&
     !st.fouled &&
     !st.transient &&
     st.sogKn != null &&

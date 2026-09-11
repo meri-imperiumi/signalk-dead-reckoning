@@ -883,3 +883,21 @@ test("defaultOriginErrorNm: GNSS metre-scale, human observations ~5 nm", () => {
   assert.strictEqual(defaultOriginErrorNm("manual"), 5);
   assert.strictEqual(defaultOriginErrorNm("bearing"), 5);
 });
+
+test("fixSanityCapNm: flat cap when fresh, grows with DR time-since-origin", () => {
+  const { fixSanityCapNm } = require("../plugin/fix-pipeline.js");
+  // Fresh origin: the configured flat cap applies.
+  assert.strictEqual(fixSanityCapNm(100, 0), 100);
+  assert.strictEqual(fixSanityCapNm(100, 3600), 100); // 1.5 kn·h = 1.5 < 100
+  // Three days GPS-less (sea trial rate: 47 nm in 4.5 days with a
+  // current tier, 85 nm cold): a legitimate fix 150–200 nm from the
+  // origin must pass — 1.5 kn × 72 h = 108.
+  assert.strictEqual(fixSanityCapNm(100, 72 * 3600), 108);
+  // A week: 252 nm allowance; the Antarctica teleport (3052 nm) still
+  // fails by an order of magnitude.
+  assert.strictEqual(fixSanityCapNm(100, 168 * 3600), 252);
+  assert.ok(3052 > fixSanityCapNm(100, 168 * 3600));
+  // Degenerate elapsed never shrinks the cap.
+  assert.strictEqual(fixSanityCapNm(100, -5), 100);
+  assert.strictEqual(fixSanityCapNm(100, Number.NaN), 100);
+});

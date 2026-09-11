@@ -42,7 +42,9 @@ function snap(overrides = {}) {
     awsKn: 10,
     heelDeg: 10,
     propulsionState: "stopped",
-    current: { setTrue: 0, drift: 0, tier: 5 },
+    // Resolved current (SPEC §6.2 tier 2 derived) — training requires
+    // a non-zero-vector current; the tier-5 gate has its own test.
+    current: { setTrue: 0, drift: 0, tier: 2 },
     lookupLeewayDeg: 0,
     lookupSpeedLoss: 0,
     ...overrides,
@@ -149,6 +151,28 @@ test("tick becomes eligible once SOG/COG are derived from two fixes", () => {
   assert.ok(r.observation);
   assert.ok(Math.abs(r.observation.leeway_angle) < 1.0);
   assert.ok(Math.abs(r.observation.speed_loss) < 0.05);
+});
+
+test("tick suspends training while the current is unresolved (tier 5 / missing)", () => {
+  const st = new TrainingState();
+  tick(st, snap({ timestampS: 0, gps: { latitude: 60, longitude: 24 } }));
+  // Tier 5 (zero vector — current unknown): eligible is false even
+  // though every other gate would pass, and no observation is produced
+  // (the unmodeled current must not be baked into the bins —
+  // Huahine→Aitutaki backtest, 72 vs 65 nm cold).
+  for (const current of [{ setTrue: 0, drift: 0, tier: 5 }, undefined]) {
+    const r = tick(
+      st,
+      snap({
+        timestampS: 3600,
+        stwKn: 1,
+        gps: { latitude: 60 + 1 / 60, longitude: 24 },
+        current,
+      }),
+    );
+    assert.strictEqual(r.eligible, false, `tier ${current?.tier}`);
+    assert.strictEqual(r.observation, null, `tier ${current?.tier}`);
+  }
 });
 
 test("tick excludes motoring intervals (propulsion.main.state = started)", () => {

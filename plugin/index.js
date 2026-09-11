@@ -58,6 +58,11 @@ const {
   MS_TO_KN,
 } = require("./current.js");
 const {
+  createDerivedCurrentState,
+  updateDerivedCurrent,
+  derivedCurrentSnapshot,
+} = require("./derived-current.js");
+const {
   createPolarSpeedState,
   polarSpeedSample,
   polarSpeedAverage,
@@ -82,6 +87,7 @@ const {
   resolveCandidateFix,
   confirmFix,
   evaluateObservationPlausibility,
+  fixSanityCapNm,
 } = require("./fix-pipeline.js");
 const { reduceSight, reduceNoonSight } = require("./celestial.js");
 const starAlmanac = require("./star-almanac.js");
@@ -342,7 +348,6 @@ const DEFAULT_CONFIG = {
   },
   weatherCurrent: {
     enabled: true,
-    baseUrl: "", // empty → http://localhost:<server port>
     intervalMs: 1800000,
   },
   /**
@@ -376,6 +381,7 @@ const deps = {
   resolveCandidateFix,
   confirmFix,
   evaluateObservationPlausibility,
+  fixSanityCapNm,
   computeRadius,
   createDivergenceState,
   divergenceTick,
@@ -413,6 +419,9 @@ const deps = {
   TrainingState,
   resolveCurrent,
   WeatherCurrentClient,
+  createDerivedCurrentState,
+  updateDerivedCurrent,
+  derivedCurrentSnapshot,
   trainingTick,
   detectManeuver,
   createPolarSpeedState,
@@ -550,6 +559,7 @@ module.exports = (app) => {
 
   /** @type {TrainingState|null} */
   let training = null;
+  let derivedCurrent = null;
 
   /** @type {number|null} monotonic seconds counter for the training loop */
   let clockS = 0;
@@ -855,12 +865,13 @@ module.exports = (app) => {
       // current at the vessel position (typically a GRIB another process
       // downloaded). Off the 1 Hz hot path: slow interval, cached read.
       if (config.weatherCurrent.enabled) {
-        // Mirror signalk-energy-predictor's base-URL resolution.
-        const port = app.config?.port ?? 3000;
-        const baseUrl =
-          config.weatherCurrent.baseUrl || `http://localhost:${port}`;
+        // In-process Weather API (mirrors signalk-energy-predictor):
+        // `app.weatherApi` is the same instance the REST routes wrap,
+        // so GRIB providers registered by other plugins answer without
+        // HTTP, auth or port guessing (the old localhost:3000 loopback
+        // hit Grafana on this install and 404ed forever).
         weatherClient = new deps.WeatherCurrentClient({
-          baseUrl,
+          weatherApi: app.weatherApi,
           intervalMs: config.weatherCurrent.intervalMs,
           getPosition: () => {
             const gps = unwrapPosition(deltaState.get("navigation.position"));
@@ -875,6 +886,7 @@ module.exports = (app) => {
         settleSustainS: config.training.settleSustainS,
         rotWindowS: config.training.rotWindowS,
       });
+      derivedCurrent = deps.createDerivedCurrentState();
       divergence = deps.createDivergenceState();
       fouledFlag = deps.createFlagState();
       movingFlag = deps.createFlagState();
@@ -1051,6 +1063,7 @@ module.exports = (app) => {
       weatherClient?.stop();
       weatherClient = null;
       training = null;
+      derivedCurrent = null;
       plotterExtTeardown?.();
       plotterExtTeardown = null;
       statusTileExamplesTeardown?.();
@@ -1571,14 +1584,32 @@ module.exports = (app) => {
     const effectiveStwKn = onPolar ? polar.averageKn : stwKn;
     engine.method = onPolar ? "inertial-polar" : "inertial-paddlewheel";
 
-    // Resolve the best available current vector (SPEC §6.2). v1 ships
-    // tier 5 (zero); the resolver has a hook for tier 4 pilot charts.
+    // Derived current (SPEC §6.2 tier 2): sample the GPS-vs-water
+    // residual every tick while GPS is trusted and the water track is
+    // usable. Runs regardless of Training Mode — it is an observation,
+    // not a learned correction, and updates under power too (the
+    // residual is the current either way). Self-gating inside
+    // (interval, STW floor, outlier bounds), so anchored/lagoon hours
+    // sample nothing.
+    if (derivedCurrent) {
+      deps.updateDerivedCurrent(derivedCurrent, {
+        tMs: Date.now(),
+        gps,
+        stwKn,
+        headingTrueDeg,
+      });
+    }
+
     // Resolve the best available current vector (SPEC §6.2): tier 1
-    // manual override → tier 3 (Weather API GRIB via the poller cache)
-    // → tier 4 pilot charts (reserved) → tier 5 zero. Synchronous
-    // cache read, no network on the tick path.
+    // manual override → tier 2 derived residual (boat's own EWMA) →
+    // tier 3 (Weather API GRIB via the poller cache) → tier 4 pilot
+    // charts (reserved) → tier 5 zero. Synchronous cache read, no
+    // network on the tick path.
     const current = deps.resolveCurrent({
       manual: manualCurrent,
+      derived: derivedCurrent
+        ? deps.derivedCurrentSnapshot(derivedCurrent, Date.now())
+        : null,
       weather: weatherClient?.currentAt(Date.now()),
       nowMs: Date.now(),
     });
@@ -2928,12 +2959,35 @@ module.exports = (app) => {
       // Speed-plausibility gate (sea trial 2026-09-06): a reduction that
       // puts the vessel somewhere unreachable since the last fix is a
       // bad sight or bad input — reject at entry, in the form.
-      const assumedForGate = b.assumed_position ?? engine.origin;
-      const gateDisplacementNm = assumedForGate
-        ? b.noon
-          ? Math.abs(result.assumed_lat - assumedForGate.latitude) * 60
-          : Math.abs(result.intercept_nm)
-        : null;
+      // The displacement is measured against the DR ORIGIN (like the
+      // /fix/lop gate), not against the reduction's assumed position: a
+      // small intercept at a wrong assumed position still draws the LOP
+      // an ocean away, and |intercept| alone would never see it.
+      // - noon sight: the reduction's latitude vs the origin's latitude.
+      // - full sight: perpendicular distance from the origin to the LOP
+      //   (the LOP passes through the assumed position along azimuth as
+      //   its normal), floored by the intercept magnitude.
+      const lopPoint = {
+        latitude: result.assumed_lat,
+        longitude: result.assumed_lon,
+      };
+      let gateDisplacementNm = null;
+      if (engine.origin) {
+        if (b.noon) {
+          gateDisplacementNm =
+            Math.abs(result.assumed_lat - engine.origin.latitude) * 60;
+        } else {
+          const d = deps.distanceNm(lopPoint, engine.origin);
+          const brg = deps.bearingDeg(lopPoint, engine.origin);
+          const perp = Math.abs(
+            d * Math.cos(((brg - result.azimuth_true) * Math.PI) / 180),
+          );
+          gateDisplacementNm = Math.max(
+            perp,
+            Math.abs(result.intercept_nm ?? 0),
+          );
+        }
+      }
       const gateMsg = implausibleObservationMsg(gateDisplacementNm, b.epoch_ms);
       if (gateMsg) {
         res.status(400).json({ message: gateMsg });
@@ -3078,12 +3132,14 @@ module.exports = (app) => {
       const displacementNm = engine.origin
         ? deps.distanceNm(engine.origin, candidate)
         : null;
+      const resolveCapNm = deps.fixSanityCapNm(
+        config.fixes.maxDisplacementNm,
+        engine.elapsedSinceOriginS,
+      );
       res.json({
         candidate,
         displacement_nm: displacementNm,
-        gross:
-          displacementNm != null &&
-          displacementNm > config.fixes.maxDisplacementNm,
+        gross: displacementNm != null && displacementNm > resolveCapNm,
       });
     });
 
@@ -3196,13 +3252,21 @@ module.exports = (app) => {
 
       // Gross-displacement guard (sea trial 2026-08-31): a candidate a
       // whole ocean away from the DR origin is a bad sight or bad input,
-      // not navigation. Reject on confirm unless explicitly forced;
-      // fixes that don't reset the origin (logbook-only backfills) pass.
+      // not navigation. The cap grows with time since the origin was
+      // set (legitimate DR drift accumulates ~0.5–1 nm/h — a correct
+      // fix after days GPS-less sits far from the origin); it exists to
+      // catch teleports (3052 NM), not drift. Reject on confirm unless
+      // explicitly forced; fixes that don't reset the origin
+      // (logbook-only backfills) pass.
+      const fixCapNm = deps.fixSanityCapNm(
+        config.fixes.maxDisplacementNm,
+        engine.elapsedSinceOriginS,
+      );
       if (resets && engine.origin) {
         const displacementNm = deps.distanceNm(engine.origin, candidate);
-        if (displacementNm > config.fixes.maxDisplacementNm && !b.force) {
+        if (displacementNm > fixCapNm && !b.force) {
           res.status(422).json({
-            message: `Fix is ${displacementNm.toFixed(1)} NM from the current DR position — beyond the ${config.fixes.maxDisplacementNm} NM sanity cap. Check the sight/coordinates, or re-confirm with force if this is really right`,
+            message: `Fix is ${displacementNm.toFixed(1)} NM from the current DR position — beyond the ${fixCapNm.toFixed(0)} NM sanity cap. Check the sight/coordinates, or re-confirm with force if this is really right`,
             displacement_nm: displacementNm,
           });
           return;

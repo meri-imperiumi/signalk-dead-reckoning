@@ -94,6 +94,44 @@ test("resolveCurrent: valid weather cache wins as tier 3", () => {
   assert.strictEqual(c.drift, 1.2);
 });
 
+test("resolveCurrent: derived residual wins over weather as tier 2", () => {
+  const c = resolveCurrent({
+    derived: { setTrue: 270, drift: 0.7, validUntilMs: NOW + 1000 },
+    weather: { setTrue: 90, drift: 1.2, validUntilMs: NOW + 1000 },
+    nowMs: NOW,
+  });
+  assert.strictEqual(c.tier, 2);
+  assert.strictEqual(c.source, "derived");
+  assert.strictEqual(c.setTrue, 270);
+  assert.strictEqual(c.drift, 0.7);
+});
+
+test("resolveCurrent: manual override still outranks derived", () => {
+  const c = resolveCurrent({
+    manual: { setTrue: 180, drift: 0.5, validUntilMs: NOW + 1000 },
+    derived: { setTrue: 270, drift: 0.7, validUntilMs: NOW + 1000 },
+    nowMs: NOW,
+  });
+  assert.strictEqual(c.tier, 1);
+  assert.strictEqual(c.source, "manual");
+});
+
+test("resolveCurrent: expired derived residual falls through to weather", () => {
+  const c = resolveCurrent({
+    derived: { setTrue: 270, drift: 0.7, validUntilMs: NOW - 1 },
+    weather: { setTrue: 90, drift: 1.2, validUntilMs: NOW + 1000 },
+    nowMs: NOW,
+  });
+  assert.strictEqual(c.tier, 3);
+  assert.strictEqual(c.source, "weather-api");
+  // GPS gone for a day: derived TTL lapsed, the model tier takes over.
+  const none = resolveCurrent({
+    derived: { setTrue: 270, drift: 0.7, validUntilMs: NOW - 1 },
+    nowMs: NOW,
+  });
+  assert.strictEqual(none.tier, 5);
+});
+
 test("resolveCurrent: expired weather cache falls through to zero", () => {
   const c = resolveCurrent({
     weather: { setTrue: 90, drift: 1.2, validUntilMs: NOW - 1 },
@@ -141,19 +179,34 @@ test("resolveCurrent: genuine zero-drift weather data is valid tier 3", () => {
 
 // ------------------------------------------------------- poller + cache
 
-function fakeFetchOk(points) {
-  return async () => ({
-    ok: true,
-    status: 200,
-    json: async () => points,
-  });
+/**
+ * Builds a fake in-process `app.weatherApi` (the same shape
+ * signalk-energy-predictor calls): `getForecasts(position, "point",
+ * {maxCount})` → WeatherDataModel array.
+ *
+ * @param {object[]} points - forecast entries
+ * @param {object} [opts] - { fail: Error } to make the call throw
+ * @returns {{getForecasts: Function}}
+ */
+function fakeWeatherApi(points, opts = {}) {
+  let call = 0;
+  return {
+    async getForecasts(position, kind, query) {
+      fakeWeatherApi.lastCall = { position, kind, query, call: call++ };
+      if (opts.fail) throw opts.fail;
+      return points;
+    },
+  };
 }
+
+// The constructor must survive servers without the Weather API.
+const NO_WEATHER_API = { notAWeatherApi: true };
 
 test("WeatherCurrentClient: fetch caches the interpolated vector with TTL", async () => {
   let t = NOW;
   const client = new WeatherCurrentClient({
     getPosition: () => ({ latitude: 60, longitude: 24 }),
-    fetchFn: fakeFetchOk([entry(-30, Math.PI / 2, 1)]),
+    weatherApi: fakeWeatherApi([entry(-30, Math.PI / 2, 1)]),
     now: () => t,
     intervalMs: 1000,
     validityFactor: 4,
@@ -170,12 +223,15 @@ test("WeatherCurrentClient: fetch caches the interpolated vector with TTL", asyn
 test("WeatherCurrentClient: failed fetch keeps the previous cache until TTL", async () => {
   let t = NOW;
   let fail = false;
+  const api = {
+    async getForecasts() {
+      if (fail) throw new Error("weather API returned 503");
+      return [entry(-30, 0, 1)];
+    },
+  };
   const client = new WeatherCurrentClient({
     getPosition: () => ({ latitude: 60, longitude: 24 }),
-    fetchFn: async () => {
-      if (fail) return { ok: false, status: 503 };
-      return { ok: true, status: 200, json: async () => [entry(-30, 0, 1)] };
-    },
+    weatherApi: api,
     now: () => t,
     intervalMs: 1000,
     validityFactor: 4,
@@ -195,8 +251,10 @@ test("WeatherCurrentClient: failed fetch keeps the previous cache until TTL", as
 test("WeatherCurrentClient: no position → no fetch, no error", async () => {
   const client = new WeatherCurrentClient({
     getPosition: () => null,
-    fetchFn: () => {
-      throw new Error("should not be called");
+    weatherApi: {
+      getForecasts: () => {
+        throw new Error("should not be called");
+      },
     },
     now: () => NOW,
   });
@@ -204,32 +262,43 @@ test("WeatherCurrentClient: no position → no fetch, no error", async () => {
   assert.strictEqual(client.currentAt(), null);
 });
 
-test("WeatherCurrentClient: requests lat/lon/count at the forecast endpoint", async () => {
-  let seenUrl = null;
+test("WeatherCurrentClient: calls getForecasts in-process with position and count", async () => {
+  const api = fakeWeatherApi([entry(-30, 0, 1)]);
   const client = new WeatherCurrentClient({
-    baseUrl: "http://localhost:3000/",
     getPosition: () => ({ latitude: 60.1, longitude: 24.9 }),
-    fetchFn: async (url) => {
-      seenUrl = url;
-      return fakeFetchOk([entry(-30, 0, 1)])();
-    },
+    weatherApi: api,
     now: () => NOW,
     count: 7,
   });
   await client.poll();
-  const u = new URL(seenUrl);
-  assert.strictEqual(u.pathname, "/signalk/v2/api/weather/forecasts/point");
-  assert.strictEqual(u.searchParams.get("lat"), "60.1");
-  assert.strictEqual(u.searchParams.get("lon"), "24.9");
-  assert.strictEqual(u.searchParams.get("count"), "7");
+  const { position, kind, query } = fakeWeatherApi.lastCall;
+  assert.deepStrictEqual(position, { latitude: 60.1, longitude: 24.9 });
+  assert.strictEqual(kind, "point");
+  assert.strictEqual(query.maxCount, 7);
+});
+
+test("WeatherCurrentClient: a server without the Weather API never resolves tier 3", async () => {
+  const client = new WeatherCurrentClient({
+    getPosition: () => ({ latitude: 60, longitude: 24 }),
+    weatherApi: NO_WEATHER_API,
+    now: () => NOW,
+  });
+  await client.poll();
+  assert.strictEqual(client.currentAt(), null);
+  // Also without any weatherApi at all.
+  const bare = new WeatherCurrentClient({
+    getPosition: () => ({ latitude: 60, longitude: 24 }),
+    now: () => NOW,
+  });
+  await bare.poll();
+  assert.strictEqual(bare.currentAt(), null);
 });
 
 test("WeatherCurrentClient: start schedules an immediate poll + interval", async () => {
   let t = NOW;
-  const polls = 0;
   const client = new WeatherCurrentClient({
     getPosition: () => ({ latitude: 0, longitude: 0 }),
-    fetchFn: fakeFetchOk([entry(-30, 0, 1)]),
+    weatherApi: fakeWeatherApi([entry(-30, 0, 1)]),
     now: () => t,
     intervalMs: 5,
   });

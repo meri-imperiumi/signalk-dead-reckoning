@@ -392,8 +392,19 @@ test("training writes a matrix bin once GPS ground truth is available", async ()
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
   // Fast tick so the test doesn't wait a full second per step.
   plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  // Training is gated on a resolved current (SPEC §6.2) — set the
+  // manual tier-1 override so the trainer is eligible (the zero
+  // vector means "current unknown" and suspends training).
+  const cur = router.invoke("put", "/current/manual", {
+    setTrue: 90,
+    drift: 0.5,
+    ttlMinutes: 60,
+  });
+  assert.strictEqual(cur.status, 200);
   // First GPS fix seeds the origin; second provides SOG/COG for training.
   // Boat heading 0 (N), STW 5, but GPS drifts slightly E of N (leeward)
   // → observed leeway should be positive and a bin should be written.
@@ -427,6 +438,54 @@ test("training writes a matrix bin once GPS ground truth is available", async ()
   const n = db.prepare("SELECT COUNT(*) AS n FROM dr_matrix_bins").get().n;
   assert.ok(n > 0, `expected at least one trained bin, got ${n}`);
   db.close();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /fix rejects a teleport-fix beyond the sanity cap unless forced", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-cap-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 20, saveIntervalMs: 60000 });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 1 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  // Let a few ticks run so elapsed-since-origin is positive but tiny:
+  // the cap stays at the flat 100 NM.
+  await new Promise((r) => setTimeout(r, 100));
+  // A fix 150 NM away, seconds after the origin was set: implied
+  // speed is absurd — must 422 (sea trial 2026-08-31: a garbage sight
+  // teleported the DR origin 3052 NM to 69°S).
+  const reject = router.invoke("post", "/fix", {
+    latitude: 62.5,
+    longitude: 24,
+    source_type: "Celestial",
+  });
+  assert.strictEqual(reject.status, 422);
+  assert.ok(reject.body.message.includes("sanity cap"));
+  // Forced confirm passes — the human explicitly overrides.
+  const forced = router.invoke("post", "/fix", {
+    latitude: 62.5,
+    longitude: 24,
+    source_type: "Celestial",
+    force: true,
+  });
+  assert.strictEqual(forced.status, 200);
+  plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1012,6 +1071,64 @@ test("POST /celestial/sight rejects a missing required field", async () => {
   });
   assert.strictEqual(status, 400);
   assert.ok(/body, hs_deg, epoch_ms required/.test(body.message));
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("POST /celestial/sight gate rejects a far assumed position despite a small intercept", async () => {
+  // Sea-trial root-cause follow-up: the plausibility gate used the
+  // intercept (distance from the ASSUMED position to the LOP), so a
+  // small intercept at an assumed position an ocean away passed the
+  // gate and the LOP drew the fix 3000+ nm off. The gate now measures
+  // the DR-origin-to-LOP distance (mirroring /fix/lop).
+  const dir = await mkdtemp(join(tmpdir(), "dr-cel-gate-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({ tickIntervalMs: 100 });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: -18.5, longitude: -161.5 },
+          },
+          { path: "navigation.speedThroughWater", value: 1 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  // Let at least one tick run so elapsedSinceOriginS > 0 (the gate
+  // skips observations that predate the origin).
+  await new Promise((r) => setTimeout(r, 250));
+  // Fresh observation (the gate only judges observations newer than the
+  // origin), with the assumed position placed deterministically on the
+  // Sun's day side: 40° north of the subsolar point (altitude ≈ 50°,
+  // safely above the 5° cutoff) but thousands of nm from the DR origin
+  // near Aitutaki. Whatever the intercept comes out as, the LOP itself
+  // is unreachable — must 400.
+  const t = Date.now();
+  const gp = celestial.sunGeographicPosition(t);
+  // Subsolar point: longitude = −GHA normalized to (−180, 180].
+  let gpLon = -gp.gha_deg;
+  while (gpLon <= -180) gpLon += 360;
+  while (gpLon > 180) gpLon -= 360;
+  const assumedLat = Math.min(80, gp.declination_deg + 40);
+  const { status, body } = router.invoke("post", "/celestial/sight", {
+    body: "Sun",
+    hs_deg: 45,
+    eye_height_m: 3,
+    epoch_ms: t,
+    limb: "lower",
+    assumed_position: { latitude: assumedLat, longitude: gpLon },
+  });
+  assert.strictEqual(status, 400);
+  assert.match(body.message, /physically impossible/);
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -3269,19 +3386,17 @@ test("tick integrates the Weather API current into the DR solution (tier 3)", as
   const dir = await mkdtemp(join(tmpdir(), "dr-weather-"));
   const app = new FakeSignalKApp();
   app.dataPath = dir;
-  const plugin = makePlugin(app);
-  const realFetch = globalThis.fetch;
-  // Point forecast: 1 m/s due east → set 90° true, drift ≈ 1.944 kn.
-  globalThis.fetch = async () => ({
-    ok: true,
-    status: 200,
-    json: async () => [
+  // In-process Weather API (the same object signalk-energy-predictor
+  // calls): 1 m/s due east → set 90° true, drift ≈ 1.944 kn.
+  app.weatherApi = {
+    getForecasts: async () => [
       {
         date: new Date().toISOString(),
         current: { set: Math.PI / 2, drift: 1 },
       },
     ],
-  });
+  };
+  const plugin = makePlugin(app);
   try {
     plugin.start({
       tickIntervalMs: 20,
@@ -3329,7 +3444,6 @@ test("tick integrates the Weather API current into the DR solution (tier 3)", as
       `drift ${last("environment.current.drift")}`,
     );
   } finally {
-    globalThis.fetch = realFetch;
     plugin.stop();
   }
   await rm(dir, { recursive: true, force: true });

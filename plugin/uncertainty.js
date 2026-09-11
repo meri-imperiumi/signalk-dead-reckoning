@@ -73,6 +73,9 @@ const MAX_ROW_RATE_KN = 2.0;
  *
  * - tier 1 (manual): the watchstander set it from a recent observation;
  *   small residual.
+ * - tier 2 (derived residual): the boat's own EWMA — tracks the real
+ *   current closely but lags shifts; sea trial held DR to ~11 nm over
+ *   622 nm (~0.1 kn effective), 0.2 leaves room for shift lag.
  * - tier 3 (weather/GRIB): mesoscale model error, ~0.3 kn.
  * - tier 4 (pilot charts): monthly climatology, ~0.3 kn.
  * - tier 5 (zero vector): no current knowledge at all — the sea trial
@@ -80,6 +83,7 @@ const MAX_ROW_RATE_KN = 2.0;
  */
 const CURRENT_RESIDUAL_KN = Object.freeze({
   1: 0.25,
+  2: 0.2,
   3: 0.3,
   4: 0.3,
   5: 1.0,

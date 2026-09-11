@@ -269,7 +269,7 @@ Worker Thread (DR Physics)
 
 ### 6.1 Training Mode vs. Inference Mode
 
-**Training Mode** — active when `isGpsReliable = true` AND `propulsion.main.state = stopped` AND paddlewheel not fouled (§6.3):
+**Training Mode** — active when `isGpsReliable = true` AND `propulsion.main.state = stopped` AND paddlewheel not fouled (§6.3) AND the resolved current is not the zero vector (§6.2 tier < 5 — training with an unknown current bakes it into the leeway/speed bins as fake corrections):
 - Computes error vectors: GPS SOG/COG vs. sensor STW/heading, minus the resolved current vector (§6.2), updated into matching `dr_matrix_bins` via EMA, learning rate modulated by effective `hit_count`.
 
 **Inference Mode** — active when `isGpsReliable = false` OR OVERRIDE is manually engaged:
@@ -286,8 +286,8 @@ The paddlewheel-failure fallback is a distinct branch from the "GPS unreliable" 
 ### 6.2 Current Hierarchy of Truth
 
 1. Manual Override — watchstander input with valid TTL (`environment.current`).
-2. Live High-Res — Starlink-cached coastal NetCDF vectors.
-3. Sparse Forecast — bilinear/temporal-interpolated radio GRIB vectors.
+2. Derived Residual — exponentially-weighted mean of the boat's own GPS-vs-water-track residual (`derived-current.js`), sampled while GPS is trusted and the water track is usable; carried forward with exponential decay when GPS degrades, TTL-bounded. The boat's own observation outranks model products (sea trial 2026-08-30→09-05, Aitutaki→Niue: ~11 nm DR error over 622 nm vs 47 nm for tier 3, 85 nm for tier 5).
+3. Sparse Forecast — bilinear/temporal-interpolated radio GRIB vectors (Signal K Weather API).
 4. Offline Pilot Charts — static SQLite monthly historical averages (`offline_pilot_currents`).
 5. Zero Vector — pure inertial water track (U: 0, V: 0).
 

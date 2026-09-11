@@ -7,7 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Derived-current tier (SPEC §6.2 tier 2)**: an exponentially-weighted
+  mean of the boat's own GPS-vs-water-track residual, sampled every
+  tick while GPS is trusted and the water track is usable (STW floor,
+  interval, glitch/outlier bounds), carried forward with exponential
+  decay when GPS degrades and TTL-bounded (24 h) so the resolver falls
+  through to the model tiers after. Zero-configuration: it outranks
+  the Weather API and pilot charts as soon as ~10 samples exist (the
+  first minutes of a passage), `environment.current` and `/status`
+  surface it as source `derived`, and the uncertainty cone uses a
+  tighter per-tier residual (0.2 kn). Sea-trial replay
+  (Aitutaki→Niue 2026-08-30→09-05): final DR error 10.9 nm over 622 nm
+  vs 47.3 nm for the live tier-3 configuration and 85.2 nm for the
+  zero vector — landfall-visible DR on a trade-wind passage.
+
 ### Fixed
+- **The weather-current client calls the Weather API in-process**
+  (`app.weatherApi.getForecasts()`, the same instance the REST routes
+  wrap — mirrors signalk-energy-predictor) instead of an HTTP loopback
+  that defaulted to `localhost:3000` — a port Grafana answers on this
+  install, so every poll 404ed and tier 3 never resolved
+  ("Weather current fetch failed: weather API returned 404 — using
+  zero current"). No base URL, ports or auth tokens involved; the
+  `weatherCurrent.baseUrl` config option is gone.
+- **The celestial sight plausibility gate measures the distance from
+  the DR origin, not from the sight's assumed position** (sea trial
+  2026-08-31 root-cause follow-up): a small intercept at a wrong
+  assumed position drew the LOP an ocean away and the gate never saw
+  it. Non-noon sights now gate on the perpendicular distance from the
+  DR origin to the LOP (floored by the intercept magnitude), mirroring
+  the `/fix/lop` bearing gate; noon sights gate on the origin-vs-
+  reduction latitude difference.
+- **The fix-confirm sanity cap now grows with DR time-since-origin**
+  instead of being a flat 100 NM: legitimate fixes after days GPS-less
+  (DR drifts ~0.5–1 NM/h; the trials measured 47 NM in 4.5 days with a
+  current tier, 85 NM cold) were being rejected, training crews to
+  habitually force-confirm — defeating the guard for the teleport
+  case it exists for. The cap is now `max(100 NM, 1.5 kn × hours since
+  origin)`, mirrored in `/fix/resolve`'s `gross` preview flag.
+- **Training Mode is suspended while the resolved current is tier 5
+  (zero vector — current unknown)** (SPEC §6.1/§6.2): training with an
+  unknown current bakes it into the leeway/speed bins as fake
+  corrections and over-applies them later (Huahine→Aitutaki backtest:
+  72 vs 65 nm cold; both trials' regressions). With the new tier-2
+  derived current self-bootstrapping in the first minutes of a
+  passage, a current-resolved matrix train no longer requires a
+  weather provider. The replay tool's learning variants accordingly
+  run with the derived current ("training with zero current" is no
+  longer a reachable live configuration), and a new `derived` variant
+  (cold + tier 2, no training) isolates the tier's contribution in
+  backtests.
 - **Logbook write-through no longer floods the server when
   authentication cannot be obtained** (reported 2026-09-11 on
   lille-oe-pi: a continuous ~10 req/s stream of

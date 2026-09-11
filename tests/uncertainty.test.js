@@ -192,6 +192,20 @@ test("computeRadius: manual-current tier residual is 0.25 kn", () => {
   assert.ok(Math.abs(out.radius_nm - 0.25) < 1e-9);
 });
 
+test("computeRadius: derived-current tier residual is 0.2 kn", () => {
+  // Tier 2 (boat's own EWMA): tighter than the model tiers — the
+  // sea trial held DR to ~11 nm over 110 h ≈ 0.1 kn effective.
+  const out = u.computeRadius({
+    elapsedDistanceNm: 0,
+    elapsedS: 3600,
+    currentTier: 2,
+    effectiveHitCount: 0,
+    deviationRows: [],
+    stwKn: 5,
+  });
+  assert.ok(Math.abs(out.radius_nm - 0.2) < 1e-9);
+});
+
 test("computeRadius: run and current terms combine root-sum-square", () => {
   // 10 nm run at fallback (≈0.0699) → 0.699; tier 5 over 10 h → 10 NM;
   // hypot(0.699, 10) ≈ 10.024.

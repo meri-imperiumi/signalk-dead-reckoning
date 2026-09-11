@@ -7,7 +7,11 @@
  *  1. **Manual override** — watchstander input with a valid TTL
  *     (`environment.current`). Not yet wired to an input path; the
  *     resolver accepts it so the precedence is explicit and testable.
- *  2. Live high-res NetCDF (Starlink-cached coastal) — future.
+ *  2. **Derived residual** — EWMA of the boat's own GPS-vs-water-track
+ *     residual (`derived-current.js`), learned while GPS is trusted and
+ *     carried forward with decay when GPS degrades. The boat's own
+ *     observation outranks model products (sea trial 2026-08-30→09-05:
+ *     ~11 nm DR error over 622 nm vs 47 nm for tier 3).
  *  3. **Signal K Weather API** (`/signalk/v2/api/weather/forecasts/point`)
  *     — a provider (e.g. a GRIB another process already downloaded)
  *     serves point forecasts carrying `current: {set (rad), drift (m/s)}`.
@@ -102,13 +106,17 @@ function parseWeatherCurrent(points, nowMs) {
  * @param {object} [input]
  * @param {{setTrue: number, drift: number, validUntilMs: number}|null} [input.manual]
  *   tier 1: watchstander override, honored while its TTL lasts
+ * @param {{setTrue: number, drift: number, validUntilMs: number}|null} [input.derived]
+ *   tier 2: EWMA of the boat's own GPS-vs-water-track residual
+ *   (`derived-current.js`), TTL-bounded and decayed while GPS is
+ *   degraded — the boat's own observation outranks model products
  * @param {{setTrue: number, drift: number, validUntilMs: number}|null} [input.weather]
  *   tier 3: Weather API cache entry from `WeatherCurrentClient.currentAt`
  * @param {((ctx: object) => ({setTrue: number, drift: number}|null))|null} [input.pilotLookup]
  *   tier 4: (month,lat,lon)→vector lookup into `offline_pilot_currents`
  * @param {object} [input.pilotCtx] - context for the pilot lookup
  * @param {number} [input.nowMs] - epoch ms; defaults to Date.now()
- * @returns {{setTrue: number, drift: number, tier: 1|3|4|5, source: string}}
+ * @returns {{setTrue: number, drift: number, tier: 1|2|3|4|5, source: string}}
  *   drift in knots, setTrue in deg true (direction the current flows toward)
  */
 function resolveCurrent(input = {}) {
@@ -123,6 +131,15 @@ function resolveCurrent(input = {}) {
       drift: input.manual.drift,
       tier: 1,
       source: "manual",
+    };
+  }
+  // Tier 2: derived residual — the boat's own GPS-vs-water-track EWMA.
+  if (valid(input.derived)) {
+    return {
+      setTrue: normalizeDeg360(input.derived.setTrue ?? 0),
+      drift: input.derived.drift,
+      tier: 2,
+      source: "derived",
     };
   }
   // Tier 3: Weather API (sparse forecast GRIB via a weather provider).
@@ -157,34 +174,40 @@ function resolveCurrent(input = {}) {
  * 30 min) with a hard timeout, failures keep the previous cache until
  * its TTL lapses, and `currentAt` is a synchronous cache read.
  *
+ * The call is **in-process** (mirrors signalk-energy-predictor): the
+ * plugin always talks to the Signal K server it runs inside —
+ * `app.weatherApi.getForecasts()` is the same WeatherApi instance the
+ * `/signalk/v2/api/weather` REST routes wrap — so weather providers
+ * (e.g. a GRIB provider) registered by other plugins answer without
+ * HTTP, auth tokens or port guessing. The old HTTP loopback defaulted
+ * to `localhost:3000`, which on this install is Grafana and 404s every
+ * `/signalk/...` path. On servers without the Weather API the client
+ * stays idle and the §6.2 resolver never sees tier 3.
+ *
  * The response is a WeatherDataModel array; `current.set` is radians
  * and `current.drift` m/s (converted here to deg/kn).
  */
 class WeatherCurrentClient {
   /**
    * @param {object} [opts]
-   * @param {string} [opts.baseUrl] - server base URL (no trailing slash)
+   * @param {object} [opts.weatherApi] - the server's `app.weatherApi`
+   *   (needs a `getForecasts` function)
    * @param {number} [opts.intervalMs=1800000] - poll interval
    * @param {number} [opts.count=6] - forecast entries to request
-   * @param {number} [opts.timeoutMs=10000] - per-fetch abort timeout
+   * @param {number} [opts.timeoutMs=10000] - per-fetch timeout
    * @param {number} [opts.validityFactor=4] - cache TTL = interval × this
    * @param {() => ({latitude: number, longitude: number}|null)} [opts.getPosition]
    * @param {(message: string) => void} [opts.onStatus]
-   * @param {typeof fetch} [opts.fetchFn=globalThis.fetch]
    * @param {() => number} [opts.now=Date.now]
    */
   constructor(opts = {}) {
-    this.baseUrl = (opts.baseUrl ?? "http://localhost:3000").replace(
-      /\/+$/,
-      "",
-    );
+    this.weatherApi = opts.weatherApi ?? null;
     this.intervalMs = opts.intervalMs ?? 30 * 60 * 1000;
     this.count = opts.count ?? 6;
     this.timeoutMs = opts.timeoutMs ?? 10000;
     this.validityFactor = opts.validityFactor ?? 4;
     this.getPosition = opts.getPosition ?? (() => null);
     this.onStatus = opts.onStatus ?? null;
-    this.fetchFn = opts.fetchFn ?? globalThis.fetch?.bind(globalThis);
     this.now = opts.now ?? (() => Date.now());
     /** @type {{setTrue: number, drift: number, fetchedAt: number, validUntilMs: number}|null} */
     this.cache = null;
@@ -226,48 +249,51 @@ class WeatherCurrentClient {
    * @returns {Promise<void>}
    */
   async poll() {
-    if (this.fetching || !this.fetchFn) return;
+    if (this.fetching) return;
+    if (
+      !this.weatherApi ||
+      typeof this.weatherApi.getForecasts !== "function"
+    ) {
+      return; // server has no Weather API — tier 3 simply never resolves
+    }
     const pos = this.getPosition();
     if (!pos) return; // no position yet — retry on the next interval
     this.fetching = true;
     try {
-      const url = new URL(
-        `${this.baseUrl}/signalk/v2/api/weather/forecasts/point`,
-      );
-      url.searchParams.set("lat", String(pos.latitude));
-      url.searchParams.set("lon", String(pos.longitude));
-      url.searchParams.set("count", String(this.count));
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
-      try {
-        const res = await this.fetchFn(url.toString(), {
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          throw new Error(`weather API returned ${res.status}`);
-        }
-        const data = await res.json();
-        if (!Array.isArray(data)) {
-          throw new Error("weather API response is not an array");
-        }
-        const parsed = parseWeatherCurrent(data, this.now());
-        if (!parsed) {
-          throw new Error("forecast carries no current data");
-        }
-        const now = this.now();
-        this.cache = {
-          setTrue: parsed.setTrue,
-          drift: parsed.drift,
-          fetchedAt: now,
-          validUntilMs: now + this.intervalMs * this.validityFactor,
-        };
-        this.onStatus?.(
-          `Weather current: set ${parsed.setTrue.toFixed(0)}° true, drift ${parsed.drift.toFixed(2)} kn`,
-        );
-      } finally {
-        clearTimeout(timeoutId);
+      // In-process (same object the REST routes wrap): providers
+      // registered by other plugins answer directly. The timeout guards
+      // a provider doing its own network fetch under the hood.
+      let timeoutId;
+      const data = await Promise.race([
+        this.weatherApi.getForecasts(
+          { latitude: pos.latitude, longitude: pos.longitude },
+          "point",
+          { maxCount: this.count },
+        ),
+        new Promise((_resolve, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error("weather API timed out")),
+            this.timeoutMs,
+          );
+        }),
+      ]).finally(() => clearTimeout(timeoutId));
+      if (!Array.isArray(data)) {
+        throw new Error("weather API response is not an array");
       }
+      const parsed = parseWeatherCurrent(data, this.now());
+      if (!parsed) {
+        throw new Error("forecast carries no current data");
+      }
+      const now = this.now();
+      this.cache = {
+        setTrue: parsed.setTrue,
+        drift: parsed.drift,
+        fetchedAt: now,
+        validUntilMs: now + this.intervalMs * this.validityFactor,
+      };
+      this.onStatus?.(
+        `Weather current: set ${parsed.setTrue.toFixed(0)}° true, drift ${parsed.drift.toFixed(2)} kn`,
+      );
     } catch (err) {
       // Keep any previous cache; the TTL decides when it stops being
       // trusted. Surface the failure once per poll cycle.
