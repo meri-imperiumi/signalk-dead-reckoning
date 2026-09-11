@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-10
+
 ### Added
 - **Derived-current tier (SPEC §6.2 tier 2)**: an exponentially-weighted
   mean of the boat's own GPS-vs-water-track residual, sampled every
