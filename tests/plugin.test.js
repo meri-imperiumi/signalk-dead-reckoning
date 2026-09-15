@@ -1268,7 +1268,9 @@ test("uncertainty polygon radius grows monotonically with distance run", async (
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
-  plugin.start({});
+  // These samples assert per-tick publish cadence (radius growing
+  // between reads 1.2 s apart) — opt out of the publish throttle.
+  plugin.start({ publish: { everyTicks: 1 } });
   app.emitDelta({
     context: "vessels.self",
     updates: [
@@ -1405,7 +1407,9 @@ test("uncertainty polygon radius drops after a snap-to-fix resets the excursion"
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   const plugin = makePlugin(app);
-  plugin.start({});
+  // `before` and `after` straddle a snap-to-fix; the reads are 1.2 s
+  // apart — assert on per-tick publishing, opt out of the throttle.
+  plugin.start({ publish: { everyTicks: 1 } });
   const router = new FakeRouter();
   plugin.registerWithRouter(router);
 
@@ -1644,6 +1648,62 @@ test("uncertainty cone does not grow while anchored or moored", async () => {
     sailPlugin.stop();
   } finally {
     await rm(sailDir, { recursive: true, force: true });
+  }
+});
+
+test("published deltas are throttled to every Nth tick; notable changes flush within a tick", async () => {
+  // The tick integrates every 100 ms, but the bus output is batched
+  // (publish.everyTicks=8 → one own-vessel delta per ~800 ms). Steady
+  // state: only the immediate first flush appears inside a quiet
+  // window. A notable change (state flipping idle→underway when a
+  // heading arrives) must publish within a tick, not at the interval.
+  const dir = await mkdtemp(join(tmpdir(), "dr-pub-throttle-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const stateDeltas = () =>
+    app.handledMessages
+      .filter((m) => m.source === "signalk-dead-reckoning")
+      .flatMap((m) => m.message?.updates ?? [])
+      .flatMap((u) => u.values ?? [])
+      .filter((v) => v.path === "navigation.deadReckoning.state");
+  try {
+    plugin.start({ tickIntervalMs: 100, publish: { everyTicks: 8 } });
+    // A GPS fix seeds the origin; STW without a heading ticks idle.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+          ],
+        },
+      ],
+    });
+    // 600 ms = 6 ticks < everyTicks: only the first flush may appear.
+    await new Promise((r) => setTimeout(r, 600));
+    assert.strictEqual(
+      stateDeltas().length,
+      1,
+      "quiet window holds a single (first) flush",
+    );
+
+    // Notable change mid-window: a heading arrives → idle→underway.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [{ values: [{ path: "navigation.headingTrue", value: 0 }] }],
+    });
+    await new Promise((r) => setTimeout(r, 350));
+    const states = stateDeltas();
+    assert.strictEqual(states.length, 2, "notable change flushed immediately");
+    assert.strictEqual(states[1].value.status, "underway");
+    plugin.stop();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
 

@@ -97,6 +97,7 @@ const {
   createShadowVesselPublisher,
   resolveVelocity: resolveShadowVelocity,
 } = require("./shadow-vessel.js");
+const { createPublishGate } = require("./publish-gate.js");
 const { computeRadius } = require("./uncertainty.js");
 const {
   DEFAULT_FACTOR,
@@ -224,6 +225,15 @@ const PATHS = {
   sensorHealth: "notifications.navigation.deadReckoning.status",
 };
 
+// Paths whose value changes publish immediately instead of waiting out
+// the publish interval (publish-gate.js): discrete transitions — DR
+// activating, the steering method changing, the state object flipping
+// (idle/underway/warm, tack transient, fouling verdict, speed source) —
+// are exactly what a consumer must not learn an interval late. The
+// continuous figures (position drift, growing log/uncertainty) ride the
+// interval batch.
+const NOTABLE_PATHS = [PATHS.active, PATHS.method, PATHS.state];
+
 /**
  * Paths subscribed to (SPEC §3.2). `navigation.position` is the GPS baseline
  * for training and anomaly detection; the water-track/wind/attitude paths
@@ -274,6 +284,20 @@ const SUBSCRIPTION_PATHS = [
 const DEFAULT_CONFIG = {
   tickIntervalMs: 1000,
   saveIntervalMs: 60000,
+  /**
+   * Bus output cadence: the tick integrates every tickIntervalMs, but
+   * the published delta set is batched — every publish.everyTicks-th
+   * tick (default 2 → one delta every 2 s at the default 1 s tick).
+   * Every published delta costs the server fanout to each websocket
+   * client and logging plugin subscribed to the context, and most of
+   * the DR output (log, current vector, uncertainty radius) is
+   * slow-moving — 1 Hz publishing taxes the whole server for no
+   * consumer's benefit. Notable transitions still publish within the
+   * tick that observed them (see publish-gate.js).
+   */
+  publish: {
+    everyTicks: 2,
+  },
   /**
    * Ground-track (running-fix advancement) window in hours. Sized for
    * traditional single-sight-per-day sun-run-sun: consecutive sights
@@ -429,6 +453,7 @@ const deps = {
   loadActivePolarModel,
   createShadowVesselPublisher,
   resolveShadowVelocity,
+  createPublishGate,
   distanceNm,
   bearingDeg,
 };
@@ -486,6 +511,17 @@ module.exports = (app) => {
    * @type {string|null}
    */
   let shadowContext = null;
+
+  /**
+   * Publish throttle for the tick's own-vessel delta set (see
+   * publish-gate.js) — batches the output to every Nth tick while
+   * letting notable transitions through immediately.
+   * @type {{shouldFlush: Function}|null}
+   */
+  let publishGate = null;
+
+  /** Same cadence for the shadow vessel's context. */
+  let shadowGate = null;
 
   /**
    * Manual set-and-drift override (§6.2 tier 1): watchstander input,
@@ -699,6 +735,15 @@ module.exports = (app) => {
           title: "State Save Interval (ms)",
           default: DEFAULT_CONFIG.saveIntervalMs,
         },
+        "publish.everyTicks": {
+          type: "integer",
+          title: "Publish every N integration ticks",
+          description:
+            "The DR output (position, log, current, uncertainty) is published every Nth integration tick instead of every tick — each published delta is fanned out to every Signal K client and logger, and most of it is slow-moving. Notable transitions (method, state, values appearing or being nulled) still publish immediately. 1 disables throttling.",
+          minimum: 1,
+          maximum: 60,
+          default: DEFAULT_CONFIG.publish.everyTicks,
+        },
         groundTrackHours: {
           type: "integer",
           title: "Running-fix advancement window (hours)",
@@ -823,6 +868,10 @@ module.exports = (app) => {
         ...DEFAULT_CONFIG.shadowVessel,
         ...(opts.shadowVessel ?? {}),
       };
+      config.publish = {
+        ...DEFAULT_CONFIG.publish,
+        ...(opts.publish ?? {}),
+      };
 
       dbPath = join(app.getDataDirPath(), "dead-reckoning.sqlite");
       db = deps.openDatabase(dbPath);
@@ -889,6 +938,12 @@ module.exports = (app) => {
       divergence = deps.createDivergenceState();
       fouledFlag = deps.createFlagState();
       movingFlag = deps.createFlagState();
+      publishGate = deps.createPublishGate({
+        everyTicks: config.publish.everyTicks,
+      });
+      shadowGate = deps.createPublishGate({
+        everyTicks: config.publish.everyTicks,
+      });
       polarState = deps.createPolarSpeedState();
       polarModel = null;
       polarLoadedId = null;
@@ -1077,6 +1132,8 @@ module.exports = (app) => {
       shadow?.stop();
       shadow = null;
       shadowContext = null;
+      publishGate = null;
+      shadowGate = null;
       // Hygiene: clear a live advisory so it doesn't linger after the
       // plugin stops monitoring.
       if (divergence?.active) {
@@ -1542,7 +1599,7 @@ module.exports = (app) => {
       );
 
       engine.method = "fallback-zero";
-      publish({
+      const values = {
         [PATHS.state]: { status: "idle", reason, moving },
         [PATHS.method]: engine.method,
         ...(uncertaintyValue
@@ -1557,13 +1614,20 @@ module.exports = (app) => {
           : { [PATHS.uncertaintyRadius]: null }),
         [PATHS.elapsedSinceFix]: engine.elapsedSinceOriginS,
         [PATHS.divergenceDistance]: null,
-      });
+      };
+      if (publishGate.shouldFlush(values, NOTABLE_PATHS)) {
+        publish(values);
+      }
       // Shadow vessel (work doc #21): keep the shadow on the chart at the
       // last position so it doesn't vanish or go stale while DR is idle.
       // SOG=0 clears any previously-drawn COG line so it doesn't linger
       // stale; heading/COG are omitted (the plotter retains the last
       // values, which is honest — the shadow isn't moving).
-      if (shadow && engine.origin) {
+      if (
+        shadow &&
+        engine.origin &&
+        shadowGate.shouldFlush({ position: engine.origin, sogMs: 0 })
+      ) {
         shadow.publish({ position: engine.origin, sogMs: 0 });
       }
       return;
@@ -1823,7 +1887,7 @@ module.exports = (app) => {
         });
       }
 
-      publish({
+      const values = {
         [PATHS.position]: pos,
         [PATHS.active]: engine.active,
         [PATHS.method]: engine.method,
@@ -1881,7 +1945,10 @@ module.exports = (app) => {
         [PATHS.divergenceDistance]: dvg
           ? dvg.distance_nm * METRES_PER_NM
           : null,
-      });
+      };
+      if (publishGate.shouldFlush(values, NOTABLE_PATHS)) {
+        publish(values);
+      }
 
       // Shadow vessel (work doc #21): emit the DR position + a derived
       // COG/SOG so the plotter draws the shadow with a projected COG
@@ -1897,13 +1964,16 @@ module.exports = (app) => {
           speedLoss: corrections.speed_loss,
           current,
         });
-        shadow.publish({
+        const shadowValues = {
           position: pos,
           headingTrueRad:
             headingTrueDeg != null ? degToRad(headingTrueDeg) : null,
           cogRad: vel ? degToRad(vel.cogDeg) : null,
           sogMs: vel ? knotsToMs(vel.sogKn) : null,
-        });
+        };
+        if (shadowGate.shouldFlush(shadowValues)) {
+          shadow.publish(shadowValues);
+        }
       }
     }
   }

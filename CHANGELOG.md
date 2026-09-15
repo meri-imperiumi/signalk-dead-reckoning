@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The DR output is no longer published to the bus on every
+  integration tick.** Each published delta costs the Signal K server
+  fanout — delta-cache routing plus serialization to every websocket
+  client and logging plugin subscribed to the context — and most of
+  the DR output (log, trip log, current vector, uncertainty radius,
+  elapsed-since-fix) is slow-moving data nobody needs at 1 Hz. The
+  tick still integrates every `tickIntervalMs`; the published set is
+  batched to every `publish.everyTicks`-th tick (new setting, default
+  2 → one delta every 2 s at the default 1 s tick; 1 restores
+  per-tick publishing). Notable transitions publish immediately,
+  within the tick that observed them: method/state/active flips, paths
+  appearing or disappearing (e.g. the STW echo dropping when the
+  polar fallback takes over), and values crossing to/from null (e.g.
+  the divergence readout clearing at anchor). The shadow vessel's
+  synthetic target follows the same cadence.
+
 ### Fixed
 - **The logbook access-request flow now targets the logbook URL's own
   host and port.** It previously used a separate `logbook.baseUrl`
