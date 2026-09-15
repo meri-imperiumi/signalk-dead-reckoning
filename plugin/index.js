@@ -322,7 +322,6 @@ const DEFAULT_CONFIG = {
   logbook: {
     enabled: false,
     url: "http://localhost:3000/plugins/signalk-logbook/logs",
-    baseUrl: "http://localhost:3000",
     pollIntervalMs: 30000,
     tackDebounceS: 120,
     token: "",
@@ -924,6 +923,13 @@ module.exports = (app) => {
       if (elapsedSinceOriginS != null) {
         engine.elapsedSinceOriginS = Number(elapsedSinceOriginS) || 0;
       }
+      const underwaySinceOriginS = deps.getState(
+        db,
+        "dr_underway_since_origin_s",
+      );
+      if (underwaySinceOriginS != null) {
+        engine.underwaySinceOriginS = Number(underwaySinceOriginS) || 0;
+      }
       const originErrorNm = deps.getState(db, "dr_origin_error_nm");
       if (originErrorNm != null) {
         engine.originErrorNm = Number(originErrorNm) || 0;
@@ -1258,7 +1264,10 @@ module.exports = (app) => {
   function snapToFix(fix, sourceType, opts = {}) {
     if (!engine || !db) return;
     const priorOrigin = engine.origin;
-    const elapsed = engine.elapsedSinceOriginS;
+    // Under-way seconds, not wall-clock: the learned deviation rate is
+    // deviation per time under way — anchor time between fixes would
+    // deflate it (and over-tighten the cone once sailed again).
+    const elapsed = engine.underwaySinceOriginS;
     const sailState = resolveSailState();
     const seaState = resolveSeaState();
     const ts = new Date().toISOString();
@@ -1622,6 +1631,7 @@ module.exports = (app) => {
         leewayDeg: corrections.leeway_angle,
         speedLoss: corrections.speed_loss,
         current,
+        underway,
       },
       config.tickIntervalMs / 1000,
     );
@@ -1759,7 +1769,10 @@ module.exports = (app) => {
       });
       const u = deps.computeRadius({
         elapsedDistanceNm: engine.logNmSinceOrigin,
-        elapsedS: engine.elapsedSinceOriginS,
+        // Under-way time, not wall-clock (§8): the current-knowledge
+        // term must not grow while anchored/moored — the ground holds
+        // the boat, unknown current cannot accumulate DR error.
+        elapsedS: engine.underwaySinceOriginS,
         currentTier: current.tier,
         originErrorNm: engine.originErrorNm,
         effectiveHitCount: corrections.hit_count,
@@ -2088,8 +2101,26 @@ module.exports = (app) => {
     // interval live): never stack a second one on top.
     if (accessCycleActive) return;
 
+    // The access-request flow must target the same server the writes go
+    // to: derive its origin from the configured logbook URL. (A separate
+    // base-URL setting defaulting to localhost:3000 sent access requests
+    // to whatever else listens there — Grafana on this install — whose
+    // 404 read as "open server", so the tokenless probe walked straight
+    // into the auth gate and parked with an unobtainable-auth message.)
+    let accessOrigin;
+    try {
+      accessOrigin = new URL(config.logbook.url).origin;
+    } catch {
+      // Unparseable URL: the write client can't work either — park with
+      // a message naming the fix instead of crashing the write path.
+      logbookPhase = "rejected";
+      setStatus(
+        "Logbook URL unparseable — check it in plugin settings. Queued entries wait",
+      );
+      return;
+    }
     const access = deps.createAccessRequestClient({
-      baseUrl: config.logbook.baseUrl,
+      baseUrl: accessOrigin,
     });
     logbookPhase = "pending";
     setStatus("Logbook access requested — approve in the server UI");
@@ -2563,10 +2594,17 @@ module.exports = (app) => {
     // Sea trial 2026-09-06: elapsed time drives the current-knowledge
     // term of the uncertainty cone — a restart must not zero it, or the
     // cone collapses mid-excursion and "since last fix" under-reports.
+    // Both clocks are persisted: wall-clock ("since last fix") and
+    // under-way (the cone's growth axis — anchored time doesn't count).
     deps.setState(
       db,
       "dr_elapsed_since_origin_s",
       String(Math.round(engine.elapsedSinceOriginS)),
+    );
+    deps.setState(
+      db,
+      "dr_underway_since_origin_s",
+      String(Math.round(engine.underwaySinceOriginS)),
     );
     deps.setState(db, "dr_origin_error_nm", String(engine.originErrorNm));
   }
@@ -2594,6 +2632,7 @@ module.exports = (app) => {
         logNm: engine.logNm,
         tripLogNm: engine.tripLogNm,
         elapsedSinceOriginS: engine.elapsedSinceOriginS,
+        underwaySinceOriginS: engine.underwaySinceOriginS,
         binCount: matrix.count(),
         // §6.2: the resolved current vector + any manual override, so
         // the UI's header readout can bootstrap without a delta.
@@ -3134,7 +3173,7 @@ module.exports = (app) => {
         : null;
       const resolveCapNm = deps.fixSanityCapNm(
         config.fixes.maxDisplacementNm,
-        engine.elapsedSinceOriginS,
+        engine.underwaySinceOriginS,
       );
       res.json({
         candidate,
@@ -3260,7 +3299,7 @@ module.exports = (app) => {
       // (logbook-only backfills) pass.
       const fixCapNm = deps.fixSanityCapNm(
         config.fixes.maxDisplacementNm,
-        engine.elapsedSinceOriginS,
+        engine.underwaySinceOriginS,
       );
       if (resets && engine.origin) {
         const displacementNm = deps.distanceNm(engine.origin, candidate);

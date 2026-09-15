@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The logbook access-request flow now targets the logbook URL's own
+  host and port.** It previously used a separate `logbook.baseUrl`
+  setting that wasn't even exposed in the plugin settings UI and
+  defaulted to `http://localhost:3000` — on installs where that port
+  isn't the Signal K server (Grafana there), its 404 read as "open
+  server", the tokenless probe then hit the real server's auth gate,
+  and logbook writes parked with "Logbook writes need authentication
+  this plugin cannot obtain" even though the server's access-request
+  flow was fully available. The `logbook.baseUrl` config option is
+  gone: the origin is derived from the configured `logbook.url`. An
+  unparseable URL parks the flow with a message naming the fix instead
+  of crashing the write path.
+- **The uncertainty cone no longer grows while anchored or moored.**
+  The current-knowledge term scaled with wall-clock time since the
+  last fix, so a week on the hook painted a 100+ NM circle around a
+  boat the ground was holding perfectly still. The engine now tracks
+  a separate under-way clock (`underwaySinceOriginS`, gated by
+  `navigation.state` anchored/moored, persisted across restarts) and
+  the cone grows only on that axis; wall-clock `since last fix` still
+  counts anchor time (published unchanged). The same axis now also
+  drives the fix sanity cap (the boat can't have traveled while
+  anchored — a far fix is more suspect, not less) and the learned
+  `dr_corrections` deviation rate (anchor time between fixes no
+  longer deflates it).
+
 ## [0.9.0] - 2026-09-10
 
 ### Added

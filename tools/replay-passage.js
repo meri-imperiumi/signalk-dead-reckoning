@@ -479,6 +479,7 @@ function makeVariant(cfg) {
           leewayDeg: this.corrections.leeway_angle,
           speedLoss: this.corrections.speed_loss,
           current,
+          underway: row.navState !== "anchored" && row.navState !== "moored",
         },
         dtS,
       );

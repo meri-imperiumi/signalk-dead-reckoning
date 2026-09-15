@@ -18,6 +18,25 @@ test("snapToFix seeds the origin and resets elapsed time", () => {
   e.snapToFix({ latitude: 60, longitude: 24 });
   assert.deepStrictEqual(e.origin, { latitude: 60, longitude: 24 });
   assert.strictEqual(e.elapsedSinceOriginS, 0);
+  assert.strictEqual(e.underwaySinceOriginS, 0);
+});
+
+test("under-way clock only advances while under way", () => {
+  const e = new DeadReckoningEngine();
+  e.snapToFix({ latitude: 60, longitude: 24 });
+  // Under way for an hour: both clocks advance.
+  e.tick({ stwKn: 5, headingTrueDeg: 0, underway: true }, 3600);
+  assert.strictEqual(e.elapsedSinceOriginS, 3600);
+  assert.strictEqual(e.underwaySinceOriginS, 3600);
+  // Anchored for a day: wall-clock keeps counting ("since last fix"),
+  // the under-way clock — the uncertainty cone's growth axis — freezes.
+  e.tick({ stwKn: 0, headingTrueDeg: 0, underway: false }, 24 * 3600);
+  assert.strictEqual(e.elapsedSinceOriginS, 25 * 3600);
+  assert.strictEqual(e.underwaySinceOriginS, 3600);
+  // A fix resets both.
+  e.snapToFix({ latitude: 61, longitude: 24 });
+  assert.strictEqual(e.elapsedSinceOriginS, 0);
+  assert.strictEqual(e.underwaySinceOriginS, 0);
 });
 
 test("tick advances north along a meridian at the given STW", () => {

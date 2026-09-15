@@ -1561,6 +1561,92 @@ test("divergence advisory clears after a confirmed fix snaps DR back to GPS", as
   await rm(dir, { recursive: true, force: true });
 });
 
+test("uncertainty cone does not grow while anchored or moored", async () => {
+  // The current-knowledge term scales with time — but only time under
+  // way. A week on the hook must not paint a 100+ NM circle around the
+  // boat: the ground holds it, unknown current cannot accumulate DR
+  // error. Wall-clock "since last fix" keeps counting (72 h below).
+  // The persisted clocks are pre-seeded before start (restart-survival
+  // path) because the 0.05 nm floor hides growth at test timescales.
+  const { openDatabase, setState } = require("../plugin/db.js");
+  const seed = async (elapsed, underway) => {
+    const dir = await mkdtemp(join(tmpdir(), "dr-cone-anchor-"));
+    const db = openDatabase(join(dir, "dead-reckoning.sqlite"));
+    // An origin (persisted as last_known_good_fix, the restart path) so
+    // no GPS-seed snap runs and resets the clocks; instruments alive at
+    // anchor keep the shadow ticking in "warm" mode.
+    setState(
+      db,
+      "last_known_good_fix",
+      JSON.stringify({ latitude: 60, longitude: 24 }),
+    );
+    setState(db, "dr_elapsed_since_origin_s", String(elapsed));
+    setState(db, "dr_underway_since_origin_s", String(underway));
+    db.close();
+    return dir;
+  };
+  const radii = (app) =>
+    app.handledMessages
+      .flatMap((m) => m.message?.updates ?? [])
+      .flatMap((u) => u.values ?? [])
+      .filter((v) => v.path === "navigation.deadReckoning.uncertainty")
+      .map((v) => v.value?.radius_m);
+  const emitAnchored = (app) =>
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            // No navigation.position: a GPS seed would snap the origin
+            // (both clocks to 0); the restored persisted clocks are the
+            // test's subject.
+            { path: "navigation.speedThroughWater", value: 0 },
+            { path: "navigation.headingTrue", value: 0 },
+            { path: "navigation.state", value: "anchored" },
+          ],
+        },
+      ],
+    });
+
+  // Anchored after 72 h on the hook (0 h under way): the cone sits at
+  // the floor — with the old wall-clock axis it would be ~72 nm.
+  const anchorDir = await seed(72 * 3600, 0);
+  const anchorApp = new FakeSignalKApp();
+  anchorApp.dataPath = anchorDir;
+  const anchorPlugin = makePlugin(anchorApp);
+  try {
+    anchorPlugin.start({ tickIntervalMs: 100 });
+    emitAnchored(anchorApp);
+    await new Promise((r) => setTimeout(r, 600));
+    const atAnchor = radii(anchorApp);
+    assert.ok(atAnchor.length > 0, "cone published while anchored (warm)");
+    const r = atAnchor[atAnchor.length - 1];
+    assert.ok(r < 93, `cone at the floor at anchor, got ${r} m`);
+    anchorPlugin.stop();
+  } finally {
+    await rm(anchorDir, { recursive: true, force: true });
+  }
+
+  // Same 72 h, but all of it under way: the current term grows the cone
+  // to ~72 nm (tier-5 zero current = 1 kn residual) — the axis still
+  // works, it just counts making-way time.
+  const sailDir = await seed(72 * 3600, 72 * 3600);
+  const sailApp = new FakeSignalKApp();
+  sailApp.dataPath = sailDir;
+  const sailPlugin = makePlugin(sailApp);
+  try {
+    sailPlugin.start({ tickIntervalMs: 100 });
+    emitAnchored(sailApp);
+    await new Promise((r) => setTimeout(r, 600));
+    const underWay = radii(sailApp);
+    const r2 = underWay[underWay.length - 1];
+    assert.ok(r2 > 100_000, `cone grows after 72 h under way, got ${r2} m`);
+    sailPlugin.stop();
+  } finally {
+    await rm(sailDir, { recursive: true, force: true });
+  }
+});
+
 test("divergence monitor is suppressed at anchor", async () => {
   const dir = await mkdtemp(join(tmpdir(), "dr-dvg-anchor-"));
   const app = new FakeSignalKApp();
@@ -2159,7 +2245,6 @@ test("logbook: tokenless start queues the fix entry, access approval flushes it"
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2280,7 +2365,6 @@ test("logbook: restart resumes the pending access request instead of filing a du
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2317,7 +2401,6 @@ test("logbook: restart resumes the pending access request instead of filing a du
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     plugin.registerWithRouter(router);
@@ -2386,7 +2469,6 @@ test("logbook: unreachable server queues writes and retries on next write", asyn
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2483,7 +2565,6 @@ test("logbook: 401-flood regression — device access requests disallowed parks 
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2571,7 +2652,6 @@ test("logbook: 401-flood regression — tokenless probe on an auth-gated server 
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2619,6 +2699,122 @@ test("logbook: 401-flood regression — tokenless probe on an auth-gated server 
   await rm(dir, { recursive: true, force: true });
 });
 
+test("logbook: access requests target the logbook URL's own host and port", async () => {
+  // Regression: the access flow once used a separate baseUrl defaulting
+  // to localhost:3000 — on installs where that port isn't the Signal K
+  // server (Grafana there), its 404 read as "open server" and the
+  // tokenless probe parked with an unobtainable-auth message. The flow
+  // must derive its origin from the configured logbook URL instead.
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-origin-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const fetched = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    fetched.push(u);
+    if (u.endsWith("/signalk/v1/access/requests")) {
+      return {
+        ok: true,
+        status: 202,
+        json: async () => ({
+          state: "PENDING",
+          href: "/signalk/v1/requests/abc",
+        }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => ({ state: "PENDING" }) };
+  };
+  try {
+    plugin.start({
+      logbook: {
+        enabled: true,
+        pollIntervalMs: 20,
+        url: "http://sk.local:3443/plugins/signalk-logbook/logs",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(
+      fetched[0],
+      "http://sk.local:3443/signalk/v1/access/requests",
+      "access request targets the logbook URL's origin",
+    );
+    assert.ok(fetched.length > 1, "approval polling started");
+    assert.ok(
+      fetched.every((u) => u.startsWith("http://sk.local:3443/")),
+      "no request leaks to any other host (localhost default)",
+    );
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: unparseable URL parks the flow without crashing the write path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-badurl-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  const realFetch = globalThis.fetch;
+  let fetches = 0;
+  globalThis.fetch = async () => {
+    fetches += 1;
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    plugin.start({
+      logbook: { enabled: true, pollIntervalMs: 20, url: "not a url" },
+    });
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.speedThroughWater", value: 5 },
+            { path: "navigation.headingTrue", value: 0 },
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const { status } = router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+    });
+    assert.strictEqual(status, 200, "fix confirm still works");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.strictEqual(fetches, 0, "nothing fetched with an unparseable URL");
+    assert.ok(
+      app.statusMessages.some((m) => m.includes("unparseable")),
+      "status names the problem",
+    );
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(join(dir, "dead-reckoning.sqlite"), {
+      readOnly: true,
+    });
+    assert.strictEqual(
+      db.prepare("SELECT COUNT(*) c FROM logbook_pending").get().c,
+      1,
+      "entry queued, not lost",
+    );
+    db.close();
+    plugin.stop();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("logbook: rejected config token parks instead of resurrecting the bad token", async () => {
   // A token pasted into config that the server refuses (wrong server,
   // revoked, insufficient permission) must not be reloaded into a fresh
@@ -2644,7 +2840,6 @@ test("logbook: rejected config token parks instead of resurrecting the bad token
         enabled: true,
         token: "stale-token",
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2715,7 +2910,6 @@ test("logbook: 5xx failures retry with exponential backoff, never a tight loop",
         token: "tok",
         retryBackoffMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();
@@ -2827,7 +3021,6 @@ test("logbook: denied access — writes dropped, no re-request spam", async () =
         enabled: true,
         pollIntervalMs: 20,
         url: "http://x/plugins/signalk-logbook/logs",
-        baseUrl: "http://x",
       },
     });
     const router = new FakeRouter();

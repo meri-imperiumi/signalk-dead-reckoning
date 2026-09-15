@@ -65,6 +65,12 @@ class DeadReckoningEngine {
     this.tripLogNm = opts.tripLogNm ?? 0;
     /** @type {number|null} seconds since the DR origin was last reset */
     this.elapsedSinceOriginS = 0;
+    /** @type {number} seconds spent under way since the DR origin was last
+     * reset — the uncertainty cone's current-knowledge term grows only
+     * while the vessel is making way: at anchor/moored the ground holds
+     * the boat, so unknown current cannot accumulate DR error (a week on
+     * the hook must not paint a 100+ NM circle around the boat). */
+    this.underwaySinceOriginS = 0;
     /** @type {number} water-track log accumulated since the last snap-to-fix (nm)
      * — SPEC §8 uses elapsed *distance* run, not clock time, as the
      * uncertainty-polygon growth axis (DR error compounds with distance
@@ -91,6 +97,7 @@ class DeadReckoningEngine {
   snapToFix(fix, originErrorNm = 0) {
     this.origin = { latitude: fix.latitude, longitude: fix.longitude };
     this.elapsedSinceOriginS = 0;
+    this.underwaySinceOriginS = 0;
     this.logNmSinceOrigin = 0;
     this.originErrorNm = Math.max(0, originErrorNm);
   }
@@ -121,6 +128,9 @@ class DeadReckoningEngine {
    * @param {number} inputs.leewayDeg - learned leeway angle (degrees, + to leeward)
    * @param {number} inputs.speedLoss - learned speed-loss fraction [0,1]
    * @param {{setTrue: number, drift: number}} [inputs.current] - resolved current (deg true, kn)
+   * @param {boolean} [inputs.underway=true] - whether the vessel is under
+   *   way this tick (from `navigation.state`); gates the under-way clock
+   *   the uncertainty cone grows on, not the wall-clock one
    * @param {number} [inputs.dtS=1] - tick interval in seconds
    * @returns {{latitude: number, longitude: number}|null} new position, or null if no origin
    */
@@ -150,6 +160,7 @@ class DeadReckoningEngine {
     this.logNm += effectiveStw * hours;
     this.tripLogNm += effectiveStw * hours;
     this.elapsedSinceOriginS += dtS;
+    if (inputs.underway ?? true) this.underwaySinceOriginS += dtS;
     this.logNmSinceOrigin += effectiveStw * hours;
     return pos;
   }

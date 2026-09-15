@@ -65,9 +65,11 @@ function fakeEngine(origin, elapsed = 0) {
   return {
     origin,
     elapsedSinceOriginS: elapsed,
+    underwaySinceOriginS: elapsed,
     snapToFix(fix) {
       this.origin = { latitude: fix.latitude, longitude: fix.longitude };
       this.elapsedSinceOriginS = 0;
+      this.underwaySinceOriginS = 0;
       snaps.push(fix);
     },
     snaps,
@@ -884,7 +886,7 @@ test("defaultOriginErrorNm: GNSS metre-scale, human observations ~5 nm", () => {
   assert.strictEqual(defaultOriginErrorNm("bearing"), 5);
 });
 
-test("fixSanityCapNm: flat cap when fresh, grows with DR time-since-origin", () => {
+test("fixSanityCapNm: flat cap when fresh, grows with under-way time", () => {
   const { fixSanityCapNm } = require("../plugin/fix-pipeline.js");
   // Fresh origin: the configured flat cap applies.
   assert.strictEqual(fixSanityCapNm(100, 0), 100);
