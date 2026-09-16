@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-17
+
 ### Fixed
 - **The derived-current EWMA can now sample on a healthy GPS feed — and
   only ever pairs fixes from one receiver.** The sampler refreshed its
