@@ -563,6 +563,17 @@ module.exports = (app) => {
   let gpsMotion = { lastGps: null, speedKn: null };
 
   /**
+   * The latest navigation.position delta with its own provenance — the
+   * fix's bus timestamp and `$source`. The derived-current sampler needs
+   * both: differentials must span real fix times (not the tick clock,
+   * which keeps running when the feed pauses) and must pair fixes from
+   * the same receiver (multi-GPS installs flit between antennas metres
+   * apart at 1 Hz each).
+   * @type {{tMs: number, source: string|null}|null}
+   */
+  let latestGpsFixMeta = null;
+
+  /**
    * Distance (nm) the vessel made over ground while DR was idle — grown
    * into the uncertainty polygon's effective "distance run" so the
    * polygon keeps growing when the water track freezes. Reset when a
@@ -1125,6 +1136,7 @@ module.exports = (app) => {
       weatherClient = null;
       training = null;
       derivedCurrent = null;
+      latestGpsFixMeta = null;
       plotterExtTeardown?.();
       plotterExtTeardown = null;
       statusTileExamplesTeardown?.();
@@ -1213,6 +1225,15 @@ module.exports = (app) => {
         deltaState.set(v.path, v.value);
         // Seed the engine origin from the first GPS fix if we have none yet.
         if (v.path === "navigation.position") {
+          latestGpsFixMeta = {
+            tMs: Number.isFinite(Date.parse(update.timestamp))
+              ? Date.parse(update.timestamp)
+              : Date.now(),
+            source:
+              typeof update.$source === "string"
+                ? update.$source
+                : (update.source?.label ?? null),
+          };
           if (!engine?.origin) {
             const pos = unwrapPosition(v.value);
             if (pos)
@@ -1417,7 +1438,22 @@ module.exports = (app) => {
     );
     const awsKn = conv(awsMs, msToKnots);
     const heel = unwrapHeel(deltaState.get("navigation.attitude"));
-    const gps = unwrapPosition(deltaState.get("navigation.position"));
+    // GPS baseline: prefer the server's merged tree value over the raw
+    // delta stream. The tree is priority-filtered (source priorities +
+    // timeouts); the raw stream is last-writer-wins across *every*
+    // provider of the path — on this install that is the ZG100, the Orca
+    // Core, the WIDELINK AIS, the YDNR router, the Cerbo's GPS and the
+    // RUTX11 router's indoor GNSS, several of which sit 100 m+ from the
+    // truth. The 2026-09-11…14 trial's phantom 1.1 kn @ 131° "current"
+    // was exactly that: the derived-current sampler (and training's
+    // ground-truth SOG/COG) pairing fixes across receivers. The tree
+    // object carries its own timestamp and $source, so the sampler gets
+    // both for free; fall back to the raw capture when there is no tree
+    // value yet (first fix after start).
+    const treePos = readTreePosition();
+    const gps = unwrapPosition(
+      treePos?.value ?? deltaState.get("navigation.position"),
+    );
     // One underway verdict for the whole tick (§7.1–2: moored/anchored is
     // a different regime — divergence advisories, fouling suspicion and
     // training are all suppressed there). Unknown state is treated as
@@ -1668,6 +1704,8 @@ module.exports = (app) => {
       deps.updateDerivedCurrent(derivedCurrent, {
         tMs: Date.now(),
         gps,
+        fixTimeMs: treePos?.fixTimeMs ?? latestGpsFixMeta?.tMs,
+        source: treePos?.source ?? latestGpsFixMeta?.source,
         stwKn,
         headingTrueDeg,
       });
@@ -2427,6 +2465,33 @@ module.exports = (app) => {
       }
     }
     return ref;
+  }
+
+  /**
+   * The server's merged (priority-filtered) position, with its own
+   * provenance — the object the tree holds for `navigation.position`,
+   * shaped into `{value, fixTimeMs, source}` for the tick path. Null
+   * when the tree has no position yet (or the server exposes no
+   * getSelfPath).
+   *
+   * @returns {{value: unknown, fixTimeMs: number|null, source: string|null}|null}
+   */
+  function readTreePosition() {
+    const p = app.getSelfPath?.("navigation.position");
+    if (!p || typeof p !== "object") return null;
+    const parsed =
+      typeof p.timestamp === "string" ? Date.parse(p.timestamp) : null;
+    const source =
+      typeof p.$source === "string"
+        ? p.$source
+        : typeof p.source?.label === "string"
+          ? p.source.label
+          : null;
+    return {
+      value: p.value,
+      fixTimeMs: Number.isFinite(parsed) ? parsed : null,
+      source,
+    };
   }
 
   /**
@@ -3213,24 +3278,30 @@ module.exports = (app) => {
         });
         return;
       }
-      const candidate = deps.resolveCandidateFix({
-        source_type: b.source_type || "manual",
-        point:
-          typeof b.latitude === "number" && typeof b.longitude === "number"
-            ? { latitude: b.latitude, longitude: b.longitude }
-            : null,
-        observations: Array.isArray(b.observations) ? b.observations : [],
-        observationIds: { lopIds, cplIds },
-        previous_fix: previousFix ?? undefined,
-        drPosition: engine.origin ?? undefined,
-        engine,
-        db,
-        helpers: {
-          getLineOfPosition: deps.getLineOfPosition,
-          getCircularPositionLine: deps.getCircularPositionLine,
-        },
-        advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
-      });
+      let candidate = null;
+      try {
+        candidate = deps.resolveCandidateFix({
+          source_type: b.source_type || "manual",
+          point:
+            typeof b.latitude === "number" && typeof b.longitude === "number"
+              ? { latitude: b.latitude, longitude: b.longitude }
+              : null,
+          observations: Array.isArray(b.observations) ? b.observations : [],
+          observationIds: { lopIds, cplIds },
+          previous_fix: previousFix ?? undefined,
+          drPosition: engine.origin ?? undefined,
+          engine,
+          db,
+          helpers: {
+            getLineOfPosition: deps.getLineOfPosition,
+            getCircularPositionLine: deps.getCircularPositionLine,
+          },
+          advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
+        });
+      } catch (err) {
+        res.status(400).json({ message: err.message });
+        return;
+      }
       if (!candidate) {
         res.status(400).json({ message: "observations not resolvable" });
         return;
@@ -3310,49 +3381,56 @@ module.exports = (app) => {
       // Build the candidate: either a passed-back pre-resolved candidate,
       // a point fix, or a fresh LOP/CPL resolution.
       let candidate;
-      if (b.candidate?.source_type) {
-        candidate = b.candidate;
-      } else if (
-        typeof b.latitude === "number" &&
-        typeof b.longitude === "number"
-      ) {
-        candidate = deps.resolveCandidateFix({
-          source_type: b.source_type || "manual",
-          point: { latitude: b.latitude, longitude: b.longitude },
-          observationIds: {
-            lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
-            cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
-          },
-          engine,
-          db,
-          helpers: {
-            getLineOfPosition: deps.getLineOfPosition,
-            getCircularPositionLine: deps.getCircularPositionLine,
-          },
-          advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
-        });
-      } else {
-        const lopIds = Array.isArray(b.lop_ids) ? b.lop_ids : [];
-        const cplIds = Array.isArray(b.cpl_ids) ? b.cpl_ids : [];
-        const runningFixEligible =
-          !(Array.isArray(b.observations) && b.observations.length > 0) &&
-          lopIds.length + cplIds.length === 1;
-        candidate = deps.resolveCandidateFix({
-          source_type: b.source_type || "manual",
-          observations: Array.isArray(b.observations) ? b.observations : [],
-          observationIds: { lopIds, cplIds },
-          previous_fix: runningFixEligible
-            ? (latestFixAsPreviousFix() ?? undefined)
-            : undefined,
-          drPosition: engine.origin ?? undefined,
-          engine,
-          db,
-          helpers: {
-            getLineOfPosition: deps.getLineOfPosition,
-            getCircularPositionLine: deps.getCircularPositionLine,
-          },
-          advance: (t0, t1) => groundTrack?.displacementBetween(t0, t1) ?? null,
-        });
+      try {
+        if (b.candidate?.source_type) {
+          candidate = b.candidate;
+        } else if (
+          typeof b.latitude === "number" &&
+          typeof b.longitude === "number"
+        ) {
+          candidate = deps.resolveCandidateFix({
+            source_type: b.source_type || "manual",
+            point: { latitude: b.latitude, longitude: b.longitude },
+            observationIds: {
+              lopIds: Array.isArray(b.lop_ids) ? b.lop_ids : [],
+              cplIds: Array.isArray(b.cpl_ids) ? b.cpl_ids : [],
+            },
+            engine,
+            db,
+            helpers: {
+              getLineOfPosition: deps.getLineOfPosition,
+              getCircularPositionLine: deps.getCircularPositionLine,
+            },
+            advance: (t0, t1) =>
+              groundTrack?.displacementBetween(t0, t1) ?? null,
+          });
+        } else {
+          const lopIds = Array.isArray(b.lop_ids) ? b.lop_ids : [];
+          const cplIds = Array.isArray(b.cpl_ids) ? b.cpl_ids : [];
+          const runningFixEligible =
+            !(Array.isArray(b.observations) && b.observations.length > 0) &&
+            lopIds.length + cplIds.length === 1;
+          candidate = deps.resolveCandidateFix({
+            source_type: b.source_type || "manual",
+            observations: Array.isArray(b.observations) ? b.observations : [],
+            observationIds: { lopIds, cplIds },
+            previous_fix: runningFixEligible
+              ? (latestFixAsPreviousFix() ?? undefined)
+              : undefined,
+            drPosition: engine.origin ?? undefined,
+            engine,
+            db,
+            helpers: {
+              getLineOfPosition: deps.getLineOfPosition,
+              getCircularPositionLine: deps.getCircularPositionLine,
+            },
+            advance: (t0, t1) =>
+              groundTrack?.displacementBetween(t0, t1) ?? null,
+          });
+        }
+      } catch (err) {
+        res.status(400).json({ message: err.message });
+        return;
       }
       if (!candidate) {
         res.status(400).json({ message: "observations not resolvable" });

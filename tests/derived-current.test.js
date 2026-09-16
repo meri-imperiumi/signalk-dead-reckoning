@@ -259,3 +259,131 @@ test("derived current: first sample is adopted wholesale (no zero prior)", () =>
   assert.equal(r.sampled, true);
   assert.ok(Math.abs(st.uKn - 0.7) < 0.05, `u ≈ 0.7, got ${st.uKn}`);
 });
+
+test("derived current: 1 Hz fix stream still samples (cadence gate holds the baseline)", () => {
+  // Sea trial 2026-09-11…14 regression: refreshing the baseline on every
+  // cadence-rejected tick meant a healthy 1 Hz GPS feed never produced a
+  // ≥5 s differential and the EWMA never sampled at all — the resolver
+  // fell through to the Weather API GRIB current for the whole passage.
+  const st = createDerivedCurrentState();
+  const rad = Math.PI / 180;
+  const stwKn = 5;
+  const setKn = 1; // true current: 1 kn east
+  const sogKn = Math.hypot(setKn, stwKn);
+  const cogDeg = (Math.atan2(setKn, stwKn) * 180) / Math.PI;
+  let tMs = Date.UTC(2026, 8, 11, 17, 0, 0);
+  let lat = -19.05;
+  let lon = 190;
+  let sampled = 0;
+  for (let i = 0; i < 60; i++) {
+    lat += (sogKn * Math.cos(cogDeg * rad)) / 3600 / 60;
+    lon += (sogKn * Math.sin(cogDeg * rad)) / 3600 / 60 / Math.cos(lat * rad);
+    tMs += 1000;
+    const r = updateDerivedCurrent(st, {
+      tMs,
+      gps: { latitude: lat, longitude: lon },
+      stwKn,
+      headingTrueDeg: 0,
+    });
+    if (r.sampled) sampled++;
+  }
+  // One seed tick + samples whenever the accumulated same-baseline gap
+  // reaches 5 s: 60 ticks at 1 s → ~11 samples, not 0.
+  assert.ok(sampled >= 10, `expected ≥10 samples, got ${sampled}`);
+  assert.ok(Math.abs(st.uKn - setKn) < 0.3, `u ≈ 1, got ${st.uKn}`);
+  assert.ok(Math.abs(st.vKn) < 0.3, `v ≈ 0, got ${st.vKn}`);
+});
+
+test("derived current: multi-source antenna flapping never pairs fixes across receivers", () => {
+  // Two GPS receivers 0.01 nm apart alternate on the bus at 1 Hz each.
+  // A cross-source differential would read antenna separation as speed;
+  // the sampler must only pair fixes from the same $source.
+  const st = createDerivedCurrentState();
+  const stwKn = 5;
+  const setKn = 1;
+  const rad = Math.PI / 180;
+  const sogKn = Math.hypot(setKn, stwKn);
+  const cogDeg = (Math.atan2(setKn, stwKn) * 180) / Math.PI;
+  let tMs = Date.UTC(2026, 8, 12, 0, 0, 0);
+  let lat = -18.8;
+  let lon = 190;
+  let sampled = 0;
+  for (let i = 0; i < 120; i++) {
+    lat += (sogKn * Math.cos(cogDeg * rad)) / 3600 / 60;
+    lon += (sogKn * Math.sin(cogDeg * rad)) / 3600 / 60 / Math.cos(lat * rad);
+    tMs += 1000;
+    const source = i % 2 === 0 ? "can0.1" : "can0.31";
+    // The B receiver sits 0.01 nm east of A: its fixes are offset.
+    const jitter = source === "can0.31" ? 0.01 / (60 * Math.cos(lat * rad)) : 0;
+    const r = updateDerivedCurrent(st, {
+      tMs,
+      gps: { latitude: lat, longitude: lon + jitter },
+      source,
+      stwKn,
+      headingTrueDeg: 0,
+    });
+    if (r.sampled) sampled++;
+    if (r.sampled) {
+      // Every sample must pair equal sources.
+      assert.equal(st.lastGps.source, source);
+    }
+  }
+  // The A-source baseline still accumulates ≥5 s gaps across the B
+  // interlopers → samples happen (can0.1 every second fix → 5 s of A
+  // time = 10 ticks → ~11 samples).
+  assert.ok(sampled >= 10, `expected ≥10 samples, got ${sampled}`);
+  assert.ok(Math.abs(st.uKn - setKn) < 0.3, `u ≈ 1, got ${st.uKn}`);
+});
+
+test("derived current: a silent source's baseline is adopted over by a live one", () => {
+  const st = createDerivedCurrentState();
+  const t0 = Date.UTC(2026, 8, 12, 6, 0, 0);
+  updateDerivedCurrent(st, {
+    tMs: t0,
+    gps: { latitude: -18.8, longitude: 190 },
+    source: "can0.1",
+    stwKn: 5,
+    headingTrueDeg: 0,
+  });
+  // can0.1 goes silent; 90 s later only can0.31 streams. The stale
+  // baseline (≥ MAX_BASELINE_STALE_MS) is adopted: the cross-source
+  // differential spans ≥ 90 s, so the antenna separation contributes
+  // ≈ 0.03 kn of error — bounded, and the only way to ever sample again.
+  // The boat made 5 kn north in the meantime → the sample is clean.
+  const r1 = updateDerivedCurrent(st, {
+    tMs: t0 + 90_000,
+    gps: { latitude: -18.8 + 0.125 / 60, longitude: 190 },
+    source: "can0.31",
+    stwKn: 5,
+    headingTrueDeg: 0,
+  });
+  assert.equal(r1.sampled, true);
+  assert.equal(st.lastGps.source, "can0.31");
+  assert.ok(Math.abs(st.vKn) < 0.2, `v ≈ 0, got ${st.vKn}`);
+});
+
+test("derived current: a paused feed (same fix, same timestamp) never samples", () => {
+  // If the position stream stalls, every tick re-offers the same fix.
+  // With fix-time-based differentials this must not fabricate a
+  // zero-ground "sample" (the old tick-clock baseline refresh did).
+  const st = createDerivedCurrentState();
+  const fixTMs = Date.UTC(2026, 8, 12, 12, 0, 0);
+  updateDerivedCurrent(st, {
+    tMs: fixTMs,
+    fixTimeMs: fixTMs,
+    gps: { latitude: -18.8, longitude: 190 },
+    stwKn: 5,
+    headingTrueDeg: 0,
+  });
+  for (let i = 1; i <= 30; i++) {
+    const r = updateDerivedCurrent(st, {
+      tMs: fixTMs + i * 1000, // tick clock advances…
+      fixTimeMs: fixTMs, // …but the fix is 30 s stale
+      gps: { latitude: -18.8, longitude: 190 },
+      stwKn: 5,
+      headingTrueDeg: 0,
+    });
+    assert.equal(r.reason, "interval");
+  }
+  assert.equal(st.sampleCount, 0);
+});

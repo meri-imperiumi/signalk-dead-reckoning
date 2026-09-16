@@ -521,3 +521,158 @@ test("resolveFix: point with ≥2 lines/circles is not a defined combination →
     null,
   );
 });
+
+// --- Bearing ray constraint (sea trial 2026-09-13, AIS vessel MATILDA) --
+// A bearing to a known object constrains the observer to the ray on the
+// reciprocal side of the object; the resolver must not return a point
+// past the object even when the perpendicular foot lands there.
+const { onObserverRay } = require("../plugin/fixes.js");
+
+test("onObserverRay: celestial LOPs are unconstrained (any side valid)", () => {
+  const obs = {
+    kind: "lop",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 205.5,
+  };
+  const p = projectToLocal(CENTER, { latitude: 59.9, longitude: 23.9 });
+  assert.equal(onObserverRay(obs, CENTER, p), true);
+});
+
+test("onObserverRay: bearing ray keeps the observer side, rejects past the object", () => {
+  // Object west of the observer (bearing 270 → azimuth 0): observer side
+  // is east of the object.
+  const obs = {
+    kind: "lop",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+  };
+  const east = projectToLocal(CENTER, { latitude: 60, longitude: 24.02 });
+  const west = projectToLocal(CENTER, { latitude: 60, longitude: 23.98 });
+  assert.equal(onObserverRay(obs, CENTER, east), true);
+  assert.equal(onObserverRay(obs, CENTER, west), false);
+});
+
+test("running fix: bearing projection landing past the object is rejected (MATILDA 2026-09-13)", () => {
+  // Real geometry from the Niue→Vava'u trial: bearing 115.5° true to
+  // AIS vessel MATILDA 4.1 nm away (stored azimuth = bearing + 90 =
+  // 205.5). The previous fix advanced along the (current-poisoned) DR
+  // track projected 2.7 nm *past* the vessel on the far ray, producing
+  // a "fix" from which MATILDA bore the reciprocal of the sighted
+  // bearing. The resolver must refuse, not mirror.
+  const matilda = { latitude: -18.6426944444444, longitude: -171.926583333333 };
+  const advancedFix = {
+    latitude: -18.6274536216598,
+    longitude: -171.866514566357,
+  };
+  const lop = {
+    kind: "lop",
+    lop_type: "bearing",
+    assumed_lat: matilda.latitude,
+    assumed_lon: matilda.longitude,
+    azimuth_true: 205.5,
+  };
+  assert.throws(
+    () =>
+      resolveFix(
+        [{ kind: "point", ...advancedFix }, lop],
+        matilda,
+        advancedFix,
+      ),
+    /past the bearing's object/,
+  );
+});
+
+test("running fix: bearing projection on the observer side resolves normally", () => {
+  // Same sight, but the advanced fix sits where the boat actually was:
+  // the foot lands on the observer's ray ~4 nm from MATILDA.
+  const matilda = { latitude: -18.6426944444444, longitude: -171.926583333333 };
+  const gps = { latitude: -18.6134, longitude: -171.992 };
+  const lop = {
+    kind: "lop",
+    lop_type: "bearing",
+    assumed_lat: matilda.latitude,
+    assumed_lon: matilda.longitude,
+    azimuth_true: 205.5,
+  };
+  const r = resolveFix([{ kind: "point", ...gps }, lop], matilda, gps);
+  assert.ok(r);
+  // The fix must sit on the observer side of MATILDA: the bearing from
+  // the fix to the object ≈ the sighted 115.5°, not its reciprocal.
+  const toObject = bearingApprox(r, matilda);
+  const off = Math.abs(((toObject - 115.5 + 540) % 360) - 180);
+  assert.ok(off < 10, `fix on wrong ray? bearing to object ${toObject}`);
+  assert.ok(r.residual_nm < 1, `residual ${r.residual_nm}`);
+});
+
+test("resolveFix: two-LOP intersection past a bearing object is rejected", () => {
+  // Bearing LOP: object west of the observer (azimuth 0, observer east).
+  // A celestial north-south line 1 nm WEST of the object crosses the
+  // bearing line past the object — the honest throw, not a mirrored fix.
+  const nmEast = 1 / (60 * Math.cos((60 * Math.PI) / 180));
+  const bearing = {
+    kind: "lop",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0,
+  };
+  const crosser = {
+    kind: "lop",
+    assumed_lat: 60,
+    assumed_lon: 24 - nmEast,
+    azimuth_true: 90,
+  };
+  assert.throws(
+    () => resolveFix([bearing, crosser], CENTER, DR),
+    /past a bearing's object/,
+  );
+  // The same crossing 1 nm EAST of the object is on the observer's ray
+  // and resolves.
+  const crosserEast = {
+    kind: "lop",
+    assumed_lat: 60,
+    assumed_lon: 24 + nmEast,
+    azimuth_true: 90,
+  };
+  const r = resolveFix([bearing, crosserEast], CENTER, DR);
+  assert.ok(r);
+  assert.ok(Math.abs(r.longitude - (24 + nmEast)) < 0.01);
+  assert.ok(Math.abs(r.latitude - 60) < 0.01);
+});
+
+/** Approximate bearing from a to b, deg true. Test helper. */
+function bearingApprox(a, b) {
+  const latAvg = ((a.latitude + b.latitude) / 2) * (Math.PI / 180);
+  const dN = (b.latitude - a.latitude) * 60;
+  const dE = (b.longitude - a.longitude) * 60 * Math.cos(latAvg);
+  return (Math.atan2(dE, dN) * 180) / Math.PI;
+}
+
+test("onObserverRay: marginal past-object feet within tolerance resolve, beyond reject", () => {
+  // A close-range bearing with ordinary compass/run slop can project a
+  // few tens of metres past the object — that must not hard-reject
+  // (RAY_TOLERANCE_M). A mirrored-position foot (nm past) must.
+  const obs = {
+    kind: "lop",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 0, // object west of observer → observer side = east
+  };
+  const nmEast = 1 / (60 * Math.cos((60 * Math.PI) / 180));
+  // 50 m past the object (west): within the ~100 m tolerance.
+  const past50m = projectToLocal(CENTER, {
+    latitude: 60,
+    longitude: 24 - (50 / 1852) * nmEast,
+  });
+  assert.equal(onObserverRay(obs, CENTER, past50m), true);
+  // 500 m past: rejected.
+  const past500m = projectToLocal(CENTER, {
+    latitude: 60,
+    longitude: 24 - (500 / 1852) * nmEast,
+  });
+  assert.equal(onObserverRay(obs, CENTER, past500m), false);
+});

@@ -175,6 +175,28 @@ test("tick suspends training while the current is unresolved (tier 5 / missing)"
   }
 });
 
+test("tick suspends training on model currents (tier 3/4) — only observed currents train", () => {
+  // Sea trial 2026-09-11…14 regression: a wrong Weather API GRIB current
+  // (1.6 kn off reality for 55 h) was compensated by the trainer as
+  // 15–18° of physically impossible leeway on broad reaches, poisoning
+  // the bins for every later passage. Model tiers must not train.
+  const st = new TrainingState();
+  tick(st, snap({ timestampS: 0, gps: { latitude: 60, longitude: 24 } }));
+  for (const tier of [3, 4]) {
+    const r = tick(
+      st,
+      snap({
+        timestampS: 3600,
+        stwKn: 1,
+        gps: { latitude: 60 + 1 / 60, longitude: 24 },
+        current: { setTrue: 131, drift: 1.1, tier },
+      }),
+    );
+    assert.strictEqual(r.eligible, false, `tier ${tier}`);
+    assert.strictEqual(r.observation, null, `tier ${tier}`);
+  }
+});
+
 test("tick excludes motoring intervals (propulsion.main.state = started)", () => {
   const st = new TrainingState();
   tick(st, snap({ timestampS: 0, gps: { latitude: 60, longitude: 24 } }));
@@ -718,4 +740,27 @@ test("a window whose heel/AWA steadied but heading drifts past tolerance does no
   at(403, 330, t++); // |403−394| > 5° from the frozen reference
   assert.strictEqual(st.stabilizedS, 0, "settle clock reset by heading drift");
   assert.strictEqual(st.transient, true);
+});
+
+test("computeObservation rejects implausible leeway (> 15 deg) instead of training on it", () => {
+  // Sea trials 2026-08/09 regression: wrong-current residuals were
+  // absorbed as 15–32° "leeway". Physically impossible for this hull —
+  // the observation must be dropped, not merged.
+  const st = new TrainingState();
+  tick(st, snap({ timestampS: 0, gps: { latitude: 60, longitude: 24 } }));
+  // Ground track 045° at ~1.4 kn while the water track is due north at
+  // 1 kn → water-made-good ~45° off the heading → far past the bound.
+  const r = tick(
+    st,
+    snap({
+      timestampS: 3600,
+      stwKn: 1,
+      gps: {
+        latitude: 60 + (1 / 60) * Math.SQRT1_2,
+        longitude: 24 + (1 / 60) * Math.SQRT1_2,
+      },
+    }),
+  );
+  assert.strictEqual(r.eligible, true);
+  assert.strictEqual(r.observation, null);
 });

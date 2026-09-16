@@ -20,7 +20,7 @@ const { mkdirSync } = require("node:fs");
 /** Schema version, bumped when a migration is needed. Persisted in dr_state_store.
  * v2: `fixes.derived_from_fix_id` — provenance for single-observation
  * running fixes advanced from a previous confirmed fix. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * DDL for every table in SPEC §4. Statements run in order; all are
@@ -202,6 +202,7 @@ function openDatabase(dbPath) {
     db.exec(stmt);
   }
   migrate(db);
+  migrateData(db);
   // Record schema version so future migrations can branch on it.
   setState(db, "schema_version", String(SCHEMA_VERSION));
   return db;
@@ -280,6 +281,47 @@ function migrate(db) {
     const columns = db.prepare(`PRAGMA table_info(${step.table})`).all();
     const exists = columns.some((c) => c.name === step.column);
     if (!exists) db.exec(step.ddl);
+  }
+}
+
+/**
+ * One-time, version-gated *data* migrations. Unlike the column steps
+ * above (idempotent by construction, safe on every open), these are
+ * gated on the stored `schema_version` so each runs exactly once per
+ * database. Bumping SCHEMA_VERSION and adding an entry here upgrades
+ * an existing install on its first open.
+ *
+ * v3 — poisoned-leeway cleanup (sea trials 2026-08-30…09-05 and
+ * 2026-09-11…14): both trials trained while the resolved current was
+ * wrong (zero vector, then the phantom cross-receiver tier-2 vector),
+ * and the trainer absorbed the current error as leeway — bins carrying
+ * 10–32° of leeway on broad reaches, physically impossible for this
+ * hull (real leeway on a run is ≈0°, close-hauled in a gale ≈10–13°).
+ * Those bins mis-rotate the water track on every later passage until
+ * retrained, so they are removed outright: the EMA would blend them
+ * out only over many more hours than a clean restart. The current-tier
+ * training gate (§6.1) and the computeObservation plausibility bound
+ * prevent new poison of this shape.
+ */
+const DATA_MIGRATIONS = [
+  {
+    version: 3,
+    run: (db) => {
+      db.exec("DELETE FROM dr_matrix_bins WHERE ABS(leeway_angle) > 10");
+    },
+  },
+];
+
+/**
+ * Applies pending data migrations, gated on the stored schema version.
+ *
+ * @param {import("node:sqlite").DatabaseSync} db
+ * @returns {void}
+ */
+function migrateData(db) {
+  const stored = Number(getState(db, "schema_version") ?? 0);
+  for (const step of DATA_MIGRATIONS) {
+    if (stored < step.version) step.run(db);
   }
 }
 

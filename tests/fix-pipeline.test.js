@@ -194,6 +194,7 @@ test("loadObservationsById: shapes LOP + CPL rows into resolver inputs", () => {
   assert.strictEqual(obs.length, 2);
   assert.strictEqual(obs[0].kind, "lop");
   assert.strictEqual(obs[0].azimuth_true, 45);
+  assert.strictEqual(obs[0].lop_type, "bearing");
   assert.strictEqual(obs[1].kind, "cpl");
   assert.strictEqual(obs[1].radius_nm, 2);
   db.close();

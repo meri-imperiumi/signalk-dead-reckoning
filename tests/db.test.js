@@ -102,7 +102,7 @@ test("v1 → v2 migration adds fixes.derived_from_fix_id in place", () => {
   old.close();
 
   const db = openDatabase(path);
-  assert.strictEqual(getState(db, "schema_version"), "2");
+  assert.strictEqual(getState(db, "schema_version"), String(SCHEMA_VERSION));
   const cols = db
     .prepare("SELECT name FROM pragma_table_info('fixes')")
     .all()
@@ -605,4 +605,44 @@ test("track samples: record, incremental re-record (replace), prune, load", asyn
 
   db.close();
   await rm(dir, { recursive: true, force: true });
+});
+
+test("schema v3 migration removes poisoned-leeway bins once (sea trials 2026-08/09)", () => {
+  const path = join(tempDir, "v3-poisoned.sqlite");
+  // Build a pre-v3 database carrying both trials' poison plus healthy bins.
+  const db = openDatabase(path);
+  const insert = db.prepare(`INSERT OR REPLACE INTO dr_matrix_bins
+    (sail_state, sea_state, stw_bin, awa_bin, heel_bin, leeway_angle, speed_loss, upwash_correction, hit_count, live_hit_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  insert.run("sailing", "3", 4.5, -110, 8, 17.85, 0, 0, 3646, 730); // this trial
+  insert.run("sailing", "unknown", 4.0, 45, -12, 2.13, 0.012, 0, 3596, 720); // healthy
+  insert.run("sailing", "unknown", 3.5, 60, -6, -11.5, 0, 0, 800, 200); // previous trial
+  insert.run("sailing", "unknown", 3.0, 30, 4, 9.9, 0.001, 0, 500, 100); // extreme-but-plausible
+  // Pretend this database predates v3.
+  setState(db, "schema_version", "2");
+  db.close();
+
+  const reopened = openDatabase(path);
+  const remaining = reopened
+    .prepare(
+      "SELECT awa_bin, leeway_angle FROM dr_matrix_bins ORDER BY awa_bin",
+    )
+    .all();
+  assert.deepStrictEqual(
+    remaining.map((r) => r.leeway_angle),
+    [9.9, 2.13],
+  );
+  assert.strictEqual(
+    getState(reopened, "schema_version"),
+    String(SCHEMA_VERSION),
+  );
+  reopened.close();
+
+  // Reopening again must not re-run or corrupt anything (gate holds).
+  const again = openDatabase(path);
+  assert.strictEqual(
+    again.prepare("SELECT COUNT(*) c FROM dr_matrix_bins").get().c,
+    2,
+  );
+  again.close();
 });

@@ -5117,3 +5117,56 @@ test("bus headingTrue is used as-is — variation never applied twice", async ()
   assert.strictEqual(body.heading.mode, "true");
   plugin.stop();
 });
+
+test("tick prefers the priority-filtered tree position over raw deltas (phantom-current guard)", async () => {
+  // Sea trial 2026-09-11…14: the raw position stream flits between
+  // receivers 100 m+ apart (last-writer-wins), which is what poisoned
+  // the derived-current sampler. The tick path must read the server's
+  // merged tree value when one exists. Here the raw delta carries a
+  // position ~0.1 nm off the tree's: the divergence (DR origin vs GPS)
+  // must be measured against the TREE position, not the raw one.
+  const app = new FakeSignalKApp();
+  app.dataPath = mkdtempSync(join(tmpdir(), "dr-plugin-"));
+  // The tree's merged position, priority-filtered, with provenance.
+  const treeValue = { latitude: 60, longitude: 24 };
+  const treeTs = "2026-09-12T00:00:00.000Z";
+  app.getSelfPath = (p) =>
+    p === "navigation.position"
+      ? { value: treeValue, timestamp: treeTs, $source: "can0.1" }
+      : undefined;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  // Raw delta from a *different* receiver, ~0.1 nm north of the tree's.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        $source: "signalk-teltonika-rutx11.gnss",
+        timestamp: treeTs,
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60.0017, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 0 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 1100));
+  const div = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === "navigation.deadReckoning.divergence")
+    .map((v) => v.value)
+    .find((d) => d && d.distance_m != null);
+  assert.ok(div, "no divergence published");
+  // DR origin was seeded from the raw fix (0.1 nm north); divergence
+  // measured against the tree position must show that ~0.1 nm gap, not ~0.
+  assert.ok(
+    div.distance_m > 150,
+    `divergence should reflect the tree position, got ${div.distance_m} m`,
+  );
+  plugin.stop();
+});

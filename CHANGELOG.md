@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The derived-current EWMA can now sample on a healthy GPS feed — and
+  only ever pairs fixes from one receiver.** The sampler refreshed its
+  differential baseline on every tick, so with GPS fixes arriving faster
+  than the 5 s minimum interval the ≥5 s differential could only form
+  across `navigation.position` null gaps — and those gap-spanning samples
+  routinely paired fixes from *different* receivers. On the
+  2026-09-11…14 Niue→Vava'u trial that produced a phantom "current" of
+  1.1 kn @ ~131° for 55 h (a quasi-fixed ~140 m offset between two
+  position providers ÷ the multi-minute sampling gap — heading-
+  independent, which is why it didn't look like leeway), dragging DR to
+  34.7 nm of error at arrival while the real current was 0.6 kn @ 006°.
+  Replaying the same passage with the sampler working ends at 8.7 nm.
+  The baseline now holds across cadence-rejected ticks (samples form at
+  the 5 s minimum instead of only across null gaps), differentials use
+  the fix's own timestamp (a paused feed can no longer fabricate
+  zero-ground "currents" from a running tick clock), fixes carry their
+  `$source` so a differential never spans two receivers, and the tick
+  path feeds the sampler (and training's ground truth) the server's
+  priority-filtered tree position instead of the last-writer-wins raw
+  delta — on multi-GPS installs the raw subscription stream flits
+  between every provider of the path (this one: ZG100, Orca, WIDELINK
+  AIS, YDNR, Cerbo, the RUTX11's indoor GNSS, and the own-boat
+  meshtastic node's LoRa-recycled position), several of which sit
+  100 m+ from the truth. Verified by capturing the live subscription
+  stream: ranked-below sources still deliver; priorities only gate the
+  merged tree.
+- **A bearing to a known object is now a ray constraint in the fix
+  resolver, not an infinite line.** On the same trial a running fix
+  against a bearing to AIS vessel MATILDA (115.5° true, 4.1 nm)
+  projected the advanced fix onto the far side of the line: a "fix"
+  2.7 nm past the vessel from which the vessel bore the reciprocal of
+  the sighted bearing. The resolver now rejects points past the
+  object's anchor — in single-observation running fixes, bearing×
+  bearing intersections, bearing×range circle picks and the
+  parallel-bearings midline — with an error explaining that the run and
+  the bearing disagree (celestial intercept LOPs stay full lines; a
+  100 m along-ray slack keeps close-range sights with ordinary compass
+  slop from hard-rejecting). The
+  `lop_type` threads from the persisted row through running-fix
+  advancement into the resolver, and REST resolve/confirm surface the
+  rejection as the 400 message.
+
+### Changed
+- **Training Mode no longer runs on model currents (tier 3/4), only on
+  observed ones (manual tier 1, derived tier 2).** A wrong current —
+  model *or* phantom — gets compensated by the trainer as physically
+  impossible leeway: the Niue→Vava'u trial's phantom tier-2 current was
+  absorbed as 15–18° of leeway on broad reaches (thousands of live
+  hits), which then mis-rotate the water track whenever the current
+  resolves correctly. Same failure shape as the previous trial's tier-5
+  zero-current poisoning, now gated for the model tiers too. A write-time
+  plausibility bound rejects observations implying |leeway| > 15° (input
+  disagreement, not hydrodynamics), and schema v3 ships a one-time data
+  migration removing bins with |leeway| > 10° accumulated during the two
+  poisoned trials — no manual SQL on the boat.
+
 ### Changed
 - **The DR output is no longer published to the bus on every
   integration tick.** Each published delta costs the Signal K server

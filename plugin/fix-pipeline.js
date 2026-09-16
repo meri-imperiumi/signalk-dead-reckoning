@@ -134,6 +134,7 @@ function loadObservationsById(db, helpers, lopIds, cplIds) {
       assumed_lon: row.assumed_lon,
       azimuth_true: row.azimuth_true,
       intercept_nm: row.intercept_nm ?? 0,
+      lop_type: row.lop_type ?? null,
       timestamp_ms: Date.parse(row.timestamp),
     });
   }

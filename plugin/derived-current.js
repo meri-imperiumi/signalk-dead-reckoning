@@ -52,6 +52,14 @@ const MAX_AGE_MS = 24 * 3600 * 1000;
 const MIN_SAMPLES = 10;
 
 /**
+ * How long (ms) a source-mismatched fix is ignored before the sampler
+ * gives up on the baseline's source and adopts the new one (the old
+ * receiver went silent — better to restart the differential on the
+ * surviving antenna than to never sample again).
+ */
+const MAX_BASELINE_STALE_MS = 60 * 1000;
+
+/**
  * Creates the derived-current state.
  *
  * @returns {{lastGps: {latitude:number, longitude:number, tMs:number}|null,
@@ -68,16 +76,32 @@ function createDerivedCurrentState() {
 }
 
 /**
- * Feeds one tick's sensors into the EWMA. The ground vector comes from
+ * Feeds one GPS fix into the EWMA. The ground vector comes from
  * consecutive GPS fixes (position-differential SOG/COG — the ground
  * truth, per the calibration report §7); the water vector from STW and
  * true heading. Both must be present and sane for a sample; the stored
- * fix refreshes either way so the next differential starts here.
+ * fix refreshes only when a sample is actually taken (or the baseline
+ * is first adopted) so the ≥ MIN_GPS_INTERVAL_S differential can form
+ * across a healthy 1 Hz fix stream — refreshing the baseline on every
+ * cadence-rejected tick meant the EWMA could only sample across
+ * position-null gaps — and those paired fixes from different receivers,
+ * producing a phantom 1.1 kn @ ~131° "current" for 55 h on the
+ * 2026-09-11…14 Niue→Vava'u trial (see the sampler rules below).
+ *
+ * Fixes are attributed to their `$source` when the caller supplies one
+ * (multi-GPS installs flit between antennas metres apart at 1 Hz each —
+ * a cross-source differential is antenna separation, not current), and
+ * timestamps come from the fix itself (`fixTimeMs`) rather than the
+ * tick clock, so a paused feed never yields a zero-displacement
+ * "sample" against a refreshed clock.
  *
  * @param {object} st - state from {@link createDerivedCurrentState}
  * @param {object} s - per-tick snapshot
  * @param {number} s.tMs - epoch ms of this tick
  * @param {{latitude:number, longitude:number}|null} s.gps - latest GPS fix
+ * @param {number|null} [s.fixTimeMs] - epoch ms of the fix itself; falls
+ *   back to s.tMs when the caller has no fix timestamp
+ * @param {string|null} [s.source] - `$source` of the fix delta, when known
  * @param {number|null} s.stwKn - speed through water (kn)
  * @param {number|null} s.headingTrueDeg - true heading (deg [0,360))
  * @returns {{sampled: boolean, reason: string|null}} why no sample was
@@ -85,16 +109,44 @@ function createDerivedCurrentState() {
  */
 function updateDerivedCurrent(st, s) {
   if (!s.gps) return { sampled: false, reason: "no-gps" };
-  const dtS = (s.tMs - (st.lastGps?.tMs ?? 0)) / 1000;
+  const fixTMs = Number.isFinite(s.fixTimeMs) ? s.fixTimeMs : s.tMs;
+  const source = typeof s.source === "string" && s.source ? s.source : null;
+
+  // Antenna flapping: a differential between two different receivers is
+  // antenna separation measured as speed, not current. Hold the baseline
+  // (it belongs to the source that is still streaming) and ignore the
+  // interloper — unless the baseline's own source has gone quiet for so
+  // long that adopting the new source is the only way forward.
+  const baselineStaleMs = fixTMs - (st.lastGps?.tMs ?? 0);
+  if (
+    st.lastGps &&
+    source != null &&
+    st.lastGps.source != null &&
+    source !== st.lastGps.source &&
+    baselineStaleMs < MAX_BASELINE_STALE_MS
+  ) {
+    return { sampled: false, reason: "source" };
+  }
+
+  const dtS = (fixTMs - (st.lastGps?.tMs ?? 0)) / 1000;
+  if (!st.lastGps || dtS < MIN_GPS_INTERVAL_S) {
+    if (!st.lastGps) {
+      st.lastGps = {
+        latitude: s.gps.latitude,
+        longitude: s.gps.longitude,
+        tMs: fixTMs,
+        source,
+      };
+    }
+    return { sampled: false, reason: "interval" };
+  }
   const prev = st.lastGps;
   st.lastGps = {
     latitude: s.gps.latitude,
     longitude: s.gps.longitude,
-    tMs: s.tMs,
+    tMs: fixTMs,
+    source,
   };
-  if (!prev || dtS < MIN_GPS_INTERVAL_S) {
-    return { sampled: false, reason: "interval" };
-  }
   if (s.stwKn == null || s.stwKn < MIN_STW_KN) {
     return { sampled: false, reason: "stw" };
   }
@@ -134,7 +186,7 @@ function updateDerivedCurrent(st, s) {
     st.vKn += (v - st.vKn) * alpha;
   }
   st.sampleCount += 1;
-  st.lastSampleMs = s.tMs;
+  st.lastSampleMs = fixTMs;
   return { sampled: true, reason: null };
 }
 
@@ -152,8 +204,11 @@ function updateDerivedCurrent(st, s) {
  */
 function derivedCurrentSnapshot(st, nowMs) {
   if (st.sampleCount < MIN_SAMPLES) return null;
-  const ageMs = nowMs - st.lastSampleMs;
-  if (ageMs < 0 || ageMs > MAX_AGE_MS) return null;
+  // Fix timestamps can sit slightly ahead of the wall clock (GPS time
+  // vs Pi time): clamp rather than treat a small negative age as
+  // "impossible" — the carry decay must still flow.
+  const ageMs = Math.max(0, nowMs - st.lastSampleMs);
+  if (ageMs > MAX_AGE_MS) return null;
   const drift =
     Math.hypot(st.uKn, st.vKn) * Math.exp(-ageMs / (CARRY_TAU_S * 1000));
   if (!Number.isFinite(drift) || drift < 1e-6) {
@@ -177,4 +232,5 @@ module.exports = {
   CARRY_TAU_S,
   MAX_AGE_MS,
   MIN_SAMPLES,
+  MAX_BASELINE_STALE_MS,
 };

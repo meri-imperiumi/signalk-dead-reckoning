@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS dr_matrix_bins (
 - `stw_bin`/`awa_bin`/`heel_bin` must be populated via an explicit quantization function (round to nearest bin width) before insert/lookup — storing raw continuous values as the primary key would prevent `hit_count` from ever accumulating meaningfully.
 - `live_hit_count` and `historical_hit_count` are tracked separately so a season of live sailing can outweigh years of backfilled data in the effective confidence/learning-rate calculation — each live sample should count as several times a historical sample by default (tunable), and each historical sample's weight further depends on `historical_confidence_tier` (a bin trained against reanalysis current data is more trustworthy than one that only had climatological pilot-chart current available).
 - `sail_state = motoring` (or any interval where `propulsion.main.state = started`) is **excluded** from writes to this table entirely — the underlying physics (prop walk, wake, rudder-induced yaw) differs from sail-driven leeway and would corrupt the model if blended. A separate under-power calibration table is out of scope for v1 (see §12).
+- **Plausibility bound:** observations implying |leeway| > 15° are rejected at write time — real leeway for this hull is ≈0° on a run and ≈10–13° close-hauled in a gale; anything beyond is input disagreement (wrong current tier, flappy sensor sources), not hydrodynamics. Both 2026 sea trials poisoned bins this way (10–32° on broad reaches); schema v3 ships a one-time data migration removing bins with |leeway| > 10° accumulated before the bound existed.
 - Historical bins written during backfill should apply a mild recency-decay weight, and/or respect configured "epoch boundaries" (known re-rig / instrument-replacement dates) so pre- and post-change data isn't blended across a known discontinuity.
 
 ### 4.2 Persistent DR State & Checkpoints
@@ -173,6 +174,8 @@ CREATE TABLE IF NOT EXISTS circular_position_lines (
 - Line × Circle → single intersection on the plausible side (bearing + vertical-angle-to-same-object is the common instance — the UI should proactively offer "also take a bearing to this object" when a vertical angle is entered, since that's the natural pairing).
 - Circle × Circle → **two** candidate intersections; default to the one nearest current DR position, but surface both to the watchkeeper rather than silently discarding one.
 - A single, unresolved LOP or CPL may still be **advanced** along the DR track to combine with a later observation (classic running fix), reusing the DR engine's integrated track over the elapsed interval.
+
+**Bearing ray constraint:** a bearing to a *known object* (charted feature, AIS target) is a ray, not a full line — the bearing itself says which side of the object the observer is on (the reciprocal side). A resolved point past the object's anchor would place the vessel where the object bears the *opposite* of the sighted bearing — geometrically on the line, navigationally wrong (2026-09-13, AIS vessel MATILDA: the running-fix projection landed 2.7 nm beyond the target and "reversed" the bearing). The resolver enforces the observer's ray for `lop_type = 'bearing'` in the point-projection (running fix), Line × Line, Line × Circle and parallel-midline branches — a candidate past the object beyond a 100 m along-ray slack (close-range compass/run slop) is rejected with an explanatory error. Celestial intercept LOPs remain full lines: any point on the line is equally valid.
 
 **Non-intersecting / contradictory inputs (residual fallback):** measurement error means an exact geometric intersection is the exception rather than the rule — three or more LOPs/CPLs will almost never cross at a single point (the classical "cocked hat" case), and even a two-input combination can fail to intersect cleanly if one observation was mistimed or misread. The resolver must not fail silently or force a nearest-point snap when inputs disagree beyond expected measurement tolerance. Instead:
 - With ≥3 inputs, resolve via least-squares residual minimization (best-fit point minimizing summed distance to each line/circle constraint) rather than requiring exact intersection.
@@ -269,8 +272,9 @@ Worker Thread (DR Physics)
 
 ### 6.1 Training Mode vs. Inference Mode
 
-**Training Mode** — active when `isGpsReliable = true` AND `propulsion.main.state = stopped` AND paddlewheel not fouled (§6.3) AND the resolved current is not the zero vector (§6.2 tier < 5 — training with an unknown current bakes it into the leeway/speed bins as fake corrections):
+**Training Mode** — active when `isGpsReliable = true` AND `propulsion.main.state = stopped` AND paddlewheel not fouled (§6.3) AND the resolved current is an *observed* vector (§6.2 tier ≤ 2 — manual or derived; training with an unknown *or modelled* current bakes its error into the leeway/speed bins as fake corrections: the zero vector did this on the 2026-08-30→09-05 trial, a wrong tier-2 phantom on 2026-09-11…14):
 - Computes error vectors: GPS SOG/COG vs. sensor STW/heading, minus the resolved current vector (§6.2), updated into matching `dr_matrix_bins` via EMA, learning rate modulated by effective `hit_count`.
+- Observations implying |leeway| > 15° are rejected outright as input disagreement, not hydrodynamics (§4.1 plausibility bound).
 
 **Inference Mode** — active when `isGpsReliable = false` OR OVERRIDE is manually engaged:
 - Freezes matrix learning. Reads raw sensors, looks up matching bins, applies corrections, integrates the resolved current vector, publishes `navigation.deadReckoning.position` as authoritative (`navigation.deadReckoning.active = true`).
@@ -286,7 +290,7 @@ The paddlewheel-failure fallback is a distinct branch from the "GPS unreliable" 
 ### 6.2 Current Hierarchy of Truth
 
 1. Manual Override — watchstander input with valid TTL (`environment.current`).
-2. Derived Residual — exponentially-weighted mean of the boat's own GPS-vs-water-track residual (`derived-current.js`), sampled while GPS is trusted and the water track is usable; carried forward with exponential decay when GPS degrades, TTL-bounded. The boat's own observation outranks model products (sea trial 2026-08-30→09-05, Aitutaki→Niue: ~11 nm DR error over 622 nm vs 47 nm for tier 3, 85 nm for tier 5).
+2. Derived Residual — exponentially-weighted mean of the boat's own GPS-vs-water-track residual (`derived-current.js`), sampled while GPS is trusted and the water track is usable; carried forward with exponential decay when GPS degrades, TTL-bounded. The boat's own observation outranks model products (sea trial 2026-08-30→09-05, Aitutaki→Niue: ~11 nm DR error over 622 nm vs 47 nm for tier 3, 85 nm for tier 5). Sampling discipline (2026-09-11…14 trial): differentials pair only fixes from the same `$source` (multi-receiver buses flit between antennas at 1 Hz each — a cross-receiver differential is antenna separation measured as current), span the fixes' own timestamps at a ≥5 s minimum cadence, and the tick path reads the server's priority-filtered tree position rather than the raw last-writer-wins subscription stream.
 3. Sparse Forecast — bilinear/temporal-interpolated radio GRIB vectors (Signal K Weather API).
 4. Offline Pilot Charts — static SQLite monthly historical averages (`offline_pilot_currents`).
 5. Zero Vector — pure inertial water track (U: 0, V: 0).

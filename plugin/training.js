@@ -116,6 +116,13 @@ function stabilizeTolerances(seaState) {
 }
 
 /**
+ * Maximum |leeway| (deg) the trainer will accept as a physical
+ * observation and merge into a bin; larger values are input
+ * disagreement, not hydrodynamics (see computeObservation).
+ */
+const MAX_PLAUSIBLE_LEEWAY_DEG = 15;
+
+/**
  * Minimum elapsed seconds between two GPS fixes for a SOG/COG derivation
  * to be trusted (avoids divide-by-tiny-dt blowups at high report rates).
  */
@@ -521,6 +528,15 @@ function computeObservation(inputs) {
   // Observed leeway = water-made-good bearing minus heading.
   const leeway = angleDelta(wmgBearing, headingTrueDeg);
 
+  // Physical plausibility bound: real leeway for this hull is ≈0° on a
+  // run and ≈10–13° close-hauled in a gale. An "observed" leeway beyond
+  // 15° is not something to learn — it means the inputs disagree (wrong
+  // current tier, flappy heading/GPS sources, a transient the gates
+  // missed), and writing it would poison the bin for every later lookup.
+  // Both 2026 sea trials produced 10–32° garbage this way; the §6.2 tier
+  // gate stops the known causes, this bound stops the unknown ones.
+  if (Math.abs(leeway) > MAX_PLAUSIBLE_LEEWAY_DEG) return null;
+
   // Observed speed_loss: the bin currently holds `lookupSpeedLoss`; the
   // effective STW it assumed was stwKn*(1-lookupSpeedLoss). The residual
   // between water-made-good speed and that gives the correction to merge.
@@ -616,13 +632,20 @@ function tick(st, s) {
 
   // --- Eligibility (SPEC §6.1) ------------------------------------------
   const motoring = s.propulsionState === "started";
-  // §6.2: training needs a resolved current (tier < 5). With the zero
-  // vector the unmodeled current is baked into the leeway/speed bins
-  // and over-applied later — the Huahine→Aitutaki backtest (72 vs 65 nm
-  // cold) and the Aitutaki→Niue sea trial both showed it. A missing
-  // current input counts as unresolved.
+  // §6.2: training needs an *observed* current (tier ≤ 2 — manual or the
+  // boat's own GPS-vs-water-track residual). The unmodeled zero vector
+  // bakes the current into the leeway/speed bins and over-applies it
+  // later — the Huahine→Aitutaki backtest (72 vs 65 nm cold) and the
+  // Aitutaki→Niue sea trial both showed it — and a *model* current
+  // (tier 3/4, Weather API GRIB or pilot charts) does the same when the
+  // model is wrong. The 2026-09-11…14 Niue→Vava'u trial ran 55 h on a
+  // phantom tier-2 current (cross-receiver GPS differentials, see
+  // derived-current.js) and the trainer absorbed it as 15–18° of leeway
+  // on broad reaches — physically impossible, and poisoned bins that
+  // mis-rotate every later passage. A missing current input counts as
+  // unresolved.
   const currentResolved =
-    s.current != null && Number.isFinite(s.current.tier) && s.current.tier < 5;
+    s.current != null && Number.isFinite(s.current.tier) && s.current.tier <= 2;
   const eligible =
     gpsReliable &&
     !motoring &&
@@ -676,6 +699,7 @@ module.exports = {
   STABILIZE_AWA_DEG,
   STABILIZE_HEADING_DEG,
   stabilizeTolerances,
+  MAX_PLAUSIBLE_LEEWAY_DEG,
   GROSS_JUMP_NM,
   GROUND_TRUTH_ALPHA,
   TACK_AWA_MAX_DEG,

@@ -38,6 +38,7 @@ const {
   degToRad,
   radToDeg,
   normalizeDeg180,
+  normalizeDeg360,
   destinationPoint,
 } = require("./geo.js");
 
@@ -265,6 +266,9 @@ function distanceToCircle(center, radiusM, p) {
  * @property {number} assumed_lon
  * @property {number} azimuth_true
  * @property {number} [intercept_nm]
+ * @property {string} [lop_type] - 'bearing' marks a bearing to a known
+ *   object: the constraint is the observer-side ray, not the full line
+ *   (see {@link onObserverRay})
  *
  * @typedef {Object} CplInput
  * @property {'cpl'} kind
@@ -529,6 +533,50 @@ function gaussNewtonRefine(lops, circles, start) {
  * @param {{latitude: number, longitude: number}|null} [drPosition] - to pick the plausible side; defaults to projectionCenter
  * @returns {ResolveResult|null}
  */
+/**
+ * Along-ray slack for the bearing constraint: a foot landing this close
+ * to the object's anchor is ordinary bearing/run disagreement on a
+ * close-range sight (compass slop, DR-run error over a short interval),
+ * not the mirrored-position failure the guard exists for. The drawing
+ * keeps a 1 nm stub past the object for visibility; the resolver is
+ * stricter because a "fix" well past the object is navigationally wrong.
+ */
+const RAY_TOLERANCE_M = 100;
+
+/**
+ * Bearing-LOP ray constraint (sea trial 2026-09-13, bearing to AIS
+ * vessel MATILDA): a bearing to a *charted/known object* is a ray, not
+ * an infinite line — the observer is on the reciprocal side of the
+ * object, because the bearing itself says which side. The stored
+ * azimuth is the line's normal (= measured bearing + 90° in the UI's
+ * convention), so the observer-side direction from the anchor is
+ * `azimuth + 90°`. A resolved point on the away side would place the
+ * vessel *past* the object, from where the object would bear opposite
+ * the sighted bearing — geometrically on the line, navigationally
+ * wrong (the running fix landed 2.7 nm beyond MATILDA and "reversed"
+ * the bearing). Celestial intercept LOPs stay full lines: any point on
+ * the line is equally valid.
+ *
+ * @param {object} obs - resolver-shaped LOP observation (needs
+ *   `lop_type`, `assumed_lat/lon`, `azimuth_true`)
+ * @param {{latitude:number, longitude:number}} projectionCenter
+ * @param {{x:number, y:number}} p - candidate point, local plane
+ * @param {number} [toleranceM=RAY_TOLERANCE_M] along-ray slack
+ * @returns {boolean} true when the point is on the observer's ray (or
+ *   the observation is not a bearing — no constraint)
+ */
+function onObserverRay(obs, projectionCenter, p, toleranceM = RAY_TOLERANCE_M) {
+  if (obs.lop_type !== "bearing") return true;
+  const anchor = projectToLocal(projectionCenter, {
+    latitude: obs.assumed_lat,
+    longitude: obs.assumed_lon,
+  });
+  const obsSide = degToRad(normalizeDeg360(obs.azimuth_true + 90));
+  const dir = { x: Math.sin(obsSide), y: Math.cos(obsSide) };
+  const along = (p.x - anchor.x) * dir.x + (p.y - anchor.y) * dir.y;
+  return along >= -toleranceM;
+}
+
 function resolveFix(observations, projectionCenter, drPosition = null) {
   const dr = drPosition ?? projectionCenter;
   const drLocal = projectToLocal(projectionCenter, dr);
@@ -590,6 +638,20 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
       const lop = lops[0];
       const d = signedDistanceToLop(lop, q);
       const foot = { x: q.x - d * lop.n.x, y: q.y - d * lop.n.y };
+      // A bearing constrains to the observer's ray: a foot past the
+      // object means the run and the bearing disagree by more than the
+      // geometry can absorb — the honest failure, not a mirrored fix.
+      if (
+        !onObserverRay(
+          observations.find((o) => o.kind === "lop"),
+          projectionCenter,
+          foot,
+        )
+      ) {
+        throw new Error(
+          "running fix falls past the bearing's object — the advanced fix and the observed bearing disagree by more than 90°; check the run (DR track) or re-take the bearing",
+        );
+      }
       const ll = unprojectFromLocal(projectionCenter, foot);
       return {
         latitude: ll.latitude,
@@ -639,6 +701,7 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
 
   // Exactly two inputs.
   if (lops.length === 2 && cplCenters.length === 0) {
+    const lopObs = observations.filter((o) => o.kind === "lop");
     const pt = intersectLopLop(lops[0], lops[1]);
     if (!pt) {
       // Parallel LOPs: the loss is flat along the common line direction,
@@ -659,6 +722,13 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
         x: foot.x + tAlong * along.x,
         y: foot.y + tAlong * along.y,
       };
+      for (let i = 0; i < lopObs.length; i++) {
+        if (!onObserverRay(lopObs[i], projectionCenter, pt2)) {
+          throw new Error(
+            "parallel bearing fix falls past a bearing's object — the DR position and the observed bearings disagree",
+          );
+        }
+      }
       const ll = unprojectFromLocal(projectionCenter, pt2);
       const residual = residualSpreadNm(lops, circles, pt2);
       return {
@@ -667,6 +737,13 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
         residual_nm: residual.maxNm,
         alternate: null,
       };
+    }
+    for (let i = 0; i < lopObs.length; i++) {
+      if (!onObserverRay(lopObs[i], projectionCenter, pt)) {
+        throw new Error(
+          "bearing intersection falls past a bearing's object — the observed bearings disagree with each other (or one was taken to the wrong object)",
+        );
+      }
     }
     const ll = unprojectFromLocal(projectionCenter, pt);
     const residual = residualSpreadNm(lops, circles, pt);
@@ -680,6 +757,7 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
 
   if (lops.length === 1 && cplCenters.length === 1) {
     const pts = intersectLopCircle(lops[0], cplCenters[0], cplRadii[0]);
+    const lopObs = observations.find((o) => o.kind === "lop");
     if (pts.length === 0) {
       // Non-intersecting: least-squares closest approach.
       const { point, residual } = leastSquaresFit(lops, circles, drLocal);
@@ -691,9 +769,19 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
         alternate: null,
       };
     }
-    if (pts.length === 1) {
-      const ll = unprojectFromLocal(projectionCenter, pts[0]);
-      const residual = residualSpreadNm(lops, circles, pts[0]);
+    // A bearing LOP constrains both circle candidates to the observer's
+    // ray — drop the past-the-object one before picking nearest-DR.
+    const onRay = pts.map((p) => onObserverRay(lopObs, projectionCenter, p));
+    const valid = pts.filter((_, i) => onRay[i]);
+    if (valid.length === 0) {
+      throw new Error(
+        "bearing×range fix falls past the bearing's object — the bearing and the range disagree",
+      );
+    }
+    if (valid.length === 1 || pts.length === 1) {
+      const p = valid[0];
+      const ll = unprojectFromLocal(projectionCenter, p);
+      const residual = residualSpreadNm(lops, circles, p);
       return {
         latitude: ll.latitude,
         longitude: ll.longitude,
@@ -702,9 +790,10 @@ function resolveFix(observations, projectionCenter, drPosition = null) {
       };
     }
     // Two candidates: nearest DR is primary, the other is alternate.
-    const d0 = Math.hypot(pts[0].x - drLocal.x, pts[0].y - drLocal.y);
-    const d1 = Math.hypot(pts[1].x - drLocal.x, pts[1].y - drLocal.y);
-    const [primary, alt] = d0 <= d1 ? [pts[0], pts[1]] : [pts[1], pts[0]];
+    const d0 = Math.hypot(valid[0].x - drLocal.x, valid[0].y - drLocal.y);
+    const d1 = Math.hypot(valid[1].x - drLocal.x, valid[1].y - drLocal.y);
+    const [primary, alt] =
+      d0 <= d1 ? [valid[0], valid[1]] : [valid[1], valid[0]];
     const ll = unprojectFromLocal(projectionCenter, primary);
     const altLl = unprojectFromLocal(projectionCenter, alt);
     const residual = residualSpreadNm(lops, circles, primary);
@@ -815,6 +904,7 @@ function advanceObservation(obs, displacement) {
       assumed_lon: moved.longitude,
       azimuth_true: obs.azimuth_true,
       intercept_nm: obs.intercept_nm,
+      lop_type: obs.lop_type,
     };
   }
   // CPL: advance the circle's center; radius is unchanged (a circle of
@@ -850,4 +940,5 @@ module.exports = {
   leastSquaresFit,
   resolveFix,
   advanceObservation,
+  onObserverRay,
 };
