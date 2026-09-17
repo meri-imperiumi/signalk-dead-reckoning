@@ -26,6 +26,17 @@ export const STYLE = {
   ghostTrack: "#4b8b99",
   gpsTrack: "#6b9e78",
   drMarker: "#ffffff",
+  // Track line hierarchy (SPEC §14.1): the DR ghost track is the
+  // plugin's primary output, so it draws heavier than GPS over a dark
+  // casing — the cartographic casing trick keeps the teal legible on
+  // light raster charts and makes DR read as the dominant track on
+  // any tileset.
+  track: {
+    ghostWeight: 3.5,
+    gpsWeight: 2,
+    casingWidth: 2.5,
+    casingColor: "#080a0c",
+  },
   snapVector: "#888899",
   // AIS targets (work doc #23): violet for ordinary traffic (distinct
   // from every family above — plotters draw AIS in its own hue too),
@@ -239,6 +250,36 @@ export class TrackLog {
   }
 
   /**
+   * Course & speed of the log's most recent movement, for the
+   * traditional course-line label ("C 290° S 6.1"): measured from the
+   * newest point back to the oldest point inside a trailing window —
+   * a ~1 min baseline at 1 Hz cadence, smoothing single-tick jitter.
+   * Returns null when the log holds no meaningful movement (moored,
+   * single point): no course label then.
+   *
+   * @param {number} [windowMs=60000]
+   * @returns {{courseDeg: number, speedKn: number, atMs: number}|null}
+   */
+  recentMovement(windowMs = 60_000) {
+    const n = this._pts.length;
+    if (n < 2) return null;
+    const [lat2, lon2, t2] = this._pts[n - 1];
+    // Anchor: the oldest point still inside the trailing window.
+    let i = n - 2;
+    while (i > 0 && t2 - this._pts[i - 1][2] <= windowMs) i--;
+    const [lat1, lon1, t1] = this._pts[i];
+    const dtH = (t2 - t1) / 3_600_000;
+    if (dtH <= 0) return null;
+    const nm = distanceNm([lat1, lon1], [lat2, lon2]);
+    if (nm < 0.05) return null;
+    return {
+      courseDeg: bearingBetween([lat1, lon1], [lat2, lon2]),
+      speedKn: nm / dtH,
+      atMs: t2,
+    };
+  }
+
+  /**
    * @returns {Array<[number, number]>} Leaflet-style [lat, lon] pairs
    */
   points() {
@@ -316,6 +357,53 @@ export function extendLineSpec(spec, lengthNm = 60) {
 }
 
 /**
+ * Traditional chartwork arrowheads for position lines (SPEC §14.1):
+ *
+ * - **Bearing of a terrestrial object**: a single arrowhead at the
+ *   outer end — the ray's far end on the observer's side, away from
+ *   the object.
+ * - **Astronomical observation** (and any other symmetric line): a
+ *   single arrowhead at both ends.
+ * - **Transferred** (running-fix advanced line): a double arrowhead
+ *   at both ends.
+ *
+ * Arrowheads point outward along the line at each end.
+ *
+ * @param {Array<[number, number]>} line - extended LOP endpoints (≥2)
+ * @param {number} azimuthDeg - true bearing of the observed object
+ * @param {string} lopType - "bearing" | "celestial" | …
+ * @param {boolean} [transferred=false] - running-fix advanced line
+ * @returns {Array<{at: [number, number], rotationDeg: number, double: boolean}>}
+ */
+export function lopArrowheads(line, azimuthDeg, lopType, transferred = false) {
+  if (!Array.isArray(line) || line.length < 2) return [];
+  const first = line[0];
+  const last = line[line.length - 1];
+  const ends = [
+    { at: first, rotationDeg: bearingBetween(last, first) },
+    { at: last, rotationDeg: bearingBetween(first, last) },
+  ];
+  if (transferred) {
+    return ends.map((e) => ({ ...e, double: true }));
+  }
+  if (lopType === "bearing") {
+    // The outer end: the endpoint lying toward azimuth + 90° — for a
+    // bearing PL that is the far end of the ray away from the charted
+    // object (extendLineSpec draws it through destinationPoint at the
+    // same bearing, so the match is exact).
+    const mid = [(first[0] + last[0]) / 2, (first[1] + last[1]) / 2];
+    const target = (azimuthDeg + 90) % 360;
+    const off = (b) => Math.abs(((b - target + 540) % 360) - 180);
+    const pick =
+      off(bearingBetween(mid, first)) <= off(bearingBetween(mid, last))
+        ? ends[0]
+        : ends[1];
+    return [{ ...pick, double: false }];
+  }
+  return ends.map((e) => ({ ...e, double: false }));
+}
+
+/**
  * Circular position line render spec (SPEC §14.1 CPL primitive).
  *
  * @param {object} cpl - db row shape from GET /observations
@@ -326,6 +414,59 @@ export function cplCircleSpec(cpl) {
     center: [cpl.center_lat, cpl.center_lon],
     radiusNm: cpl.radius_nm,
     used: cpl.used_in_fix_id != null,
+  };
+}
+
+/**
+ * Traditional chartwork arc for a range CPL (SPEC §14.1): the circle
+ * of equal distance is drawn as an arc sweeping ±spanDeg/2 around the
+ * bearing from the observed object toward the navigator's position,
+ * carrying a single arrowhead at both arc ends — the same convention
+ * as an astronomical position line. Returns null when no toward-
+ * position is known; the caller then falls back to the full dashed
+ * circle.
+ *
+ * @param {object} cpl - db row shape from GET /observations
+ * @param {[number, number]|null|undefined} toward - position to aim
+ *   the arc at (usually the live DR position)
+ * @param {number} [spanDeg=90] - total arc sweep in degrees
+ * @returns {{points: Array<[number, number]>, arrowheads: Array<{at:
+ *   [number, number], rotationDeg: number, double: boolean}>}|null}
+ */
+export function cplArcSpec(cpl, toward, spanDeg = 90) {
+  if (!toward) return null;
+  const spec = cplCircleSpec(cpl);
+  const towardBearing = bearingBetween(spec.center, toward);
+  const start = towardBearing - spanDeg / 2;
+  const steps = Math.max(8, Math.round(spanDeg / 2));
+  const points = [];
+  for (let i = 0; i <= steps; i++) {
+    points.push(
+      destinationPoint(
+        spec.center,
+        start + (spanDeg * i) / steps,
+        spec.radiusNm,
+      ),
+    );
+  }
+  // Tangents pointing away from the arc at each end (the arc is
+  // drawn clockwise from start to end around the center).
+  const startBearing = ((start % 360) + 360) % 360;
+  const endBearing = (((start + spanDeg) % 360) + 360) % 360;
+  return {
+    points,
+    arrowheads: [
+      {
+        at: points[0],
+        rotationDeg: (startBearing - 90 + 360) % 360,
+        double: false,
+      },
+      {
+        at: points[points.length - 1],
+        rotationDeg: (endBearing + 90) % 360,
+        double: false,
+      },
+    ],
   };
 }
 
@@ -341,6 +482,71 @@ export function fixPointSpec(fix) {
     color: STYLE.fix[fix.source_type] ?? STYLE.fix.manual,
     label: `${fix.source_type} fix${fix.confirmed_by ? ` (${fix.confirmed_by})` : ""}`,
   };
+}
+
+/**
+ * Traditional chartwork symbol for a fix of the given source type
+ * (SPEC §14.1): an electronic (GPS) fix plots as an outlined triangle
+ * with a dot in the middle; fixes by observation or manual plotting
+ * (visual bearings, radar ranges, celestial, manual) as an outlined
+ * circle with a dot in the middle. The DR position itself is the
+ * navigator's X — not a fix, drawn separately by the map view.
+ *
+ * @param {string} sourceType - fix.source_type
+ * @returns {"triangle"|"circle"}
+ */
+export function fixSymbolType(sourceType) {
+  return sourceType === "gps" ? "triangle" : "circle";
+}
+
+/**
+ * Traditional chartwork clock text for labels — always Zulu (UTC),
+ * the navigator's time reference: "02:30".
+ *
+ * @param {number} ms
+ * @returns {string}
+ */
+export function clockTextZ(ms) {
+  const d = new Date(ms);
+  return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * Traditional chartwork fix label: "Fix 02:30Z" — the plotted fix
+ * carries its time. Invalid/missing timestamp → "".
+ *
+ * @param {string} iso - fix row timestamp
+ * @returns {string}
+ */
+export function fixTimeLabel(iso) {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? `Fix ${clockTextZ(t)}Z` : "";
+}
+
+/**
+ * DR position label: "DR 02:50Z".
+ *
+ * @param {number|null|undefined} ms - DR position timestamp
+ * @returns {string}
+ */
+export function drTimeLabel(ms) {
+  return Number.isFinite(ms) ? `DR ${clockTextZ(ms)}Z` : "";
+}
+
+/**
+ * Course line label: "C 290° S 6.1" — course true (°), speed kn.
+ *
+ * @param {{courseDeg: number, speedKn: number}|null} movement -
+ *   TrackLog.recentMovement result
+ * @returns {string}
+ */
+export function courseText(movement) {
+  if (!movement || !Number.isFinite(movement.courseDeg)) return "";
+  const c = String(Math.round(movement.courseDeg) % 360).padStart(3, "0");
+  const s = Number.isFinite(movement.speedKn)
+    ? movement.speedKn.toFixed(1)
+    : "—";
+  return `C ${c}° S ${s}`;
 }
 
 /**

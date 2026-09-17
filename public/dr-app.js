@@ -393,6 +393,8 @@ class DrApp extends HTMLElement {
       candidate: null,
       ghostTrack: [],
       gpsTrack: [],
+      drTimeMs: null,
+      drCourse: null,
       sparkStats: null,
       gnss: null,
       highlight: null,
@@ -655,6 +657,12 @@ class DrApp extends HTMLElement {
         if (value?.latitude != null) {
           this.snap.drPosition = [value.latitude, value.longitude];
           this.ghost.push(value.latitude, value.longitude);
+          // Traditional chartwork labels: the DR position carries its
+          // time ("DR 02:50Z"), the track its course ("C 290° S 6.1").
+          // Times are always Z — prefer the delta's own timestamp.
+          const t = Date.parse(value.timestamp);
+          this.snap.drTimeMs = Number.isFinite(t) ? t : Date.now();
+          this.snap.drCourse = this.ghost.recentMovement();
           this.updateGhostTrack();
           this.sight?.setDefaultPosition(value);
         }

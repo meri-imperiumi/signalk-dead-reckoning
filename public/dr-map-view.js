@@ -2,6 +2,11 @@
  * `<dr-map-view>` — dual/continuous track rendering of GPS vs. the always-on
  * inertial "Ghost Track" (SPEC §14.1), with uncertainty polygon, fixes,
  * LOP/CPL overlays, snap-to-fix vectors, and the live divergence readout.
+ * Position-line overlays follow traditional chartwork conventions: a
+ * bearing PL carries a single arrowhead at its outer end, an
+ * astronomical PL single arrowheads at both ends, a transferred
+ * (running-fix) PL a double arrowhead at both ends, and a range CPL
+ * draws as an arc with single arrowheads at both ends.
  *
  * Defaults to the first chart provider so the plot never opens blank:
  * the server's *configured* charts
@@ -161,6 +166,37 @@ class DrMapView extends HTMLElement {
       }
       .dr-ais-glyph {
         transition: transform 0.5s linear;
+      }
+      /* Chartwork arrowheads (traditional position-line marking): a
+         bare rotated chevron on a divIcon, same trick as the AIS
+         glyphs — Leaflet's default white box replaced by className. */
+      .dr-arrow,
+      .dr-fix {
+        background: transparent;
+        border: none;
+      }
+      /* Permanent chartwork labels: fix/DR times ride along as tiny
+         tooltips; the course-line label sits beside the track in the
+         DR teal with a dark halo for legibility over any tileset. */
+      .leaflet-tooltip.dr-plabel {
+        font-size: 10px;
+        padding: 0 4px;
+      }
+      .dr-course-label {
+        background: transparent;
+        border: none;
+        pointer-events: none;
+      }
+      .dr-course-label span {
+        display: inline-block;
+        transform: translate(10px, 8px);
+        color: var(--color-teal, #4b8b99);
+        font: italic 11px/1 ui-monospace, "Fira Code", monospace;
+        white-space: nowrap;
+        text-shadow:
+          0 0 3px var(--bg-base, #080a0c),
+          0 0 3px var(--bg-base, #080a0c),
+          0 0 3px var(--bg-base, #080a0c);
       }
     `;
     root.appendChild(style);
@@ -685,19 +721,18 @@ class DrMapView extends HTMLElement {
       return;
     }
 
-    // Ghost + GPS tracks (both always drawn, SPEC §14.1).
+    // Ghost + GPS tracks (both always drawn, SPEC §14.1). The ghost
+    // (DR) track is the plugin's primary output, so it draws heavier
+    // over a dark casing — the dominant line on any tileset — while
+    // GPS rides thinner and slightly faded.
     if (snap.ghostTrack?.length > 0) {
-      this.replacePolyline("ghost", snap.ghostTrack, {
-        color: vm.STYLE.ghostTrack,
-        weight: 2,
-        opacity: 0.9,
-      });
+      this.renderGhostTrack(snap.ghostTrack, snap.drCourse);
     }
     if (snap.gpsTrack?.length > 0) {
       this.replacePolyline("gps", snap.gpsTrack, {
         color: vm.STYLE.gpsTrack,
-        weight: 2,
-        opacity: 0.8,
+        weight: vm.STYLE.track.gpsWeight,
+        opacity: 0.75,
       });
     }
 
@@ -727,13 +762,16 @@ class DrMapView extends HTMLElement {
       this.lastDrPosition = snap.drPosition;
       if (this.follow) this.map.panTo(snap.drPosition, { animate: true });
       this.layers.drMarker.clearLayers();
-      L.circleMarker(snap.drPosition, {
-        radius: 6,
-        color: vm.STYLE.drMarker,
-        fillOpacity: 0.9,
-        weight: 2,
-      })
-        .bindTooltip("DR", { direction: "top" })
+      // The DR position plots as the navigator's X (traditional
+      // chartwork: X = dead reckoned position, distinct from any fix
+      // symbol), labeled with its time — always Z.
+      const drLabel = vm.drTimeLabel(snap.drTimeMs);
+      L.marker(snap.drPosition, { icon: this._drIcon(), keyboard: false })
+        .bindTooltip(drLabel || "DR", {
+          direction: "right",
+          permanent: true,
+          className: "dr-plabel",
+        })
         .addTo(this.layers.drMarker);
 
       this.layers.uncertainty.clearLayers();
@@ -755,7 +793,12 @@ class DrMapView extends HTMLElement {
     // REST-sourced overlays.
     this.renderFixes(snap.fixes ?? [], vm);
     this.renderLops(snap.lops ?? [], vm, snap.highlight);
-    this.renderCpls(snap.cpls ?? [], vm, snap.highlight);
+    this.renderCpls(
+      snap.cpls ?? [],
+      vm,
+      snap.highlight,
+      snap.drPosition ?? this.lastDrPosition,
+    );
     this.renderSnaps(snap.corrections ?? [], vm);
     this.renderCandidate(snap.candidate);
     this.renderAdvancements(snap.candidate?.advancements ?? null, snap);
@@ -857,23 +900,76 @@ class DrMapView extends HTMLElement {
         )
         .addTo(layer);
       // The advanced constraint itself: LOP drawn at the advanced
-      // position with the row's azimuth.
+      // position with the row's azimuth — a transferred position
+      // line, marked with a double arrowhead at both ends.
       if (spec.kind === "lop" && spec.azimuthDeg != null) {
+        const lopType = rowsById.lop.get(spec.id)?.lop_type ?? "celestial";
         const line = vm.extendLineSpec(
           {
             anchor: spec.advanced,
             azimuthDeg: spec.azimuthDeg,
-            lopType: rowsById.lop.get(spec.id)?.lop_type ?? "celestial",
+            lopType,
           },
           40,
         );
+        const color = warn ?? "#ffffff";
         L.polyline(line, {
-          color: warn ?? "#ffffff",
+          color,
           weight: 1,
           opacity: 0.6,
           dashArray: "2 6",
-        }).addTo(layer);
+        })
+          .bindTooltip("transferred position line", { direction: "top" })
+          .addTo(layer);
+        this.renderArrows(
+          vm.lopArrowheads(line, spec.azimuthDeg, lopType, true),
+          color,
+          layer,
+        );
       }
+    }
+  }
+
+  /**
+   * Ghost (DR) track — the primary rendered output (SPEC §14.1): a
+   * dark casing under a heavier teal line, the cartographic trick
+   * that keeps the DR track readable over any tileset (light raster
+   * charts included) and visually dominant over GPS. Both lines are
+   * non-interactive so chart picks and the context menu keep working
+   * on and near the track. When movement data is available the track
+   * also carries the traditional course-line label ("C 290° S 6.1")
+   * just behind the DR head.
+   *
+   * @param {Array<[number, number]>} pts
+   * @param {{courseDeg: number, speedKn: number}|null} [movement]
+   * @returns {void}
+   */
+  renderGhostTrack(pts, movement = null) {
+    this.layers.ghost?.clearLayers();
+    if (pts.length < 2) return;
+    const t = vm.STYLE.track;
+    L.polyline(pts, {
+      color: t.casingColor,
+      weight: t.ghostWeight + t.casingWidth,
+      opacity: 0.85,
+      interactive: false,
+    }).addTo(this.layers.ghost);
+    L.polyline(pts, {
+      color: vm.STYLE.ghostTrack,
+      weight: t.ghostWeight,
+      opacity: 0.95,
+      interactive: false,
+    }).addTo(this.layers.ghost);
+    const course = vm.courseText(movement);
+    if (course) {
+      L.marker(pts[pts.length - 2], {
+        icon: L.divIcon({
+          className: "dr-course-label",
+          html: `<span>${course}</span>`,
+        }),
+        interactive: false,
+        keyboard: false,
+      }).addTo(this.layers.ghost);
     }
   }
 
@@ -899,13 +995,18 @@ class DrMapView extends HTMLElement {
     this.layers.fixes.clearLayers();
     for (const f of fixes) {
       const spec = vm.fixPointSpec(f);
-      L.circleMarker(spec.position, {
-        radius: 4,
-        color: spec.color,
-        fillOpacity: 0.9,
-        weight: 1.5,
+      // Traditional chartwork fix symbols: outlined triangle with a
+      // dot for an electronic (GPS) fix, outlined circle with a dot
+      // for fixes by observation or manual plotting — color still
+      // carries the source type.
+      L.marker(spec.position, {
+        icon: this._fixIcon(vm.fixSymbolType(f.source_type), spec.color),
       })
-        .bindTooltip(spec.label, { direction: "top" })
+        .bindTooltip(vm.fixTimeLabel(f.timestamp) || spec.label, {
+          direction: "right",
+          permanent: true,
+          className: "dr-plabel",
+        })
         .addEventListener("click", () => this.dispatchInspect("fix", f.fix_id))
         .addTo(this.layers.fixes);
     }
@@ -923,8 +1024,13 @@ class DrMapView extends HTMLElement {
       const spec = vm.lopLineSpec(lop);
       const line = vm.extendLineSpec(spec, 60);
       const hl = highlight?.kind === "lop" && highlight.id === lop.lop_id;
+      const color = hl
+        ? "#ffffff"
+        : spec.used
+          ? vm.STYLE.lopUsed
+          : vm.STYLE.lop;
       L.polyline(line, {
-        color: hl ? "#ffffff" : spec.used ? vm.STYLE.lopUsed : vm.STYLE.lop,
+        color,
         weight: hl ? 3.5 : 1.5,
         opacity: 0.9,
       })
@@ -936,6 +1042,14 @@ class DrMapView extends HTMLElement {
           this.dispatchInspect("lop", lop.lop_id),
         )
         .addTo(this.layers.lops);
+      // Traditional chartwork marking: single arrowhead at the outer
+      // end for a bearing PL; single arrowheads at both ends for an
+      // astronomical PL.
+      this.renderArrows(
+        vm.lopArrowheads(line, spec.azimuthDeg, spec.lopType),
+        color,
+        this.layers.lops,
+      );
     }
   }
 
@@ -943,18 +1057,31 @@ class DrMapView extends HTMLElement {
    * @param {Array<object>} cpls
    * @param {object} vm
    * @param {{kind: string, id: number}|null} [highlight]
+   * @param {[number, number]|null|undefined} [drPosition] - live DR
+   *   position; centers the traditional range arc on the navigator
    * @returns {void}
    */
-  renderCpls(cpls, vm, highlight) {
+  renderCpls(cpls, vm, highlight, drPosition) {
     this.layers.cpls.clearLayers();
     for (const cpl of cpls) {
       const spec = vm.cplCircleSpec(cpl);
       const hl = highlight?.kind === "cpl" && highlight.id === cpl.cpl_id;
+      const color = hl
+        ? "#ffffff"
+        : spec.used
+          ? vm.STYLE.cplUsed
+          : vm.STYLE.cpl;
+      // Traditional chartwork marking: a range CPL draws as an arc
+      // around the navigator with a single arrowhead at both arc
+      // ends; the full dashed circle stays underneath (faded) as the
+      // complete constraint — the position lies anywhere on it.
+      const arc = vm.cplArcSpec(cpl, drPosition ?? this.lastDrPosition);
       L.circle(spec.center, {
         radius: spec.radiusNm * 1852,
-        color: hl ? "#ffffff" : spec.used ? vm.STYLE.cplUsed : vm.STYLE.cpl,
+        color,
         fillOpacity: 0.05,
         weight: hl ? 3.5 : 1.5,
+        opacity: arc ? 0.4 : 0.9,
         dashArray: "6 4",
       })
         .bindTooltip(
@@ -964,7 +1091,107 @@ class DrMapView extends HTMLElement {
           this.dispatchInspect("cpl", cpl.cpl_id),
         )
         .addTo(this.layers.cpls);
+      if (arc) {
+        L.polyline(arc.points, {
+          color,
+          weight: hl ? 3.5 : 2,
+          opacity: 0.9,
+          dashArray: "6 4",
+          interactive: false,
+        }).addTo(this.layers.cpls);
+        this.renderArrows(arc.arrowheads, color, this.layers.cpls);
+      }
     }
+  }
+
+  /**
+   * Builds the divIcon for a traditional chartwork fix symbol: an
+   * outlined shape with a dot in the middle — triangle for an
+   * electronic (GPS) fix, circle for a fix by observation or manual
+   * plotting — stroked in the fix's source-type color.
+   *
+   * @param {"triangle"|"circle"} shape - fixSymbolType result
+   * @param {string} color
+   * @returns {object} Leaflet divIcon
+   */
+  _fixIcon(shape, color) {
+    const s = `stroke="${color}" fill="none" stroke-width="1.5"`;
+    const dot = `<circle cx="12" cy="12" r="2" fill="${color}" />`;
+    const body =
+      shape === "triangle"
+        ? `<polygon points="12,3.5 21.5,19.5 2.5,19.5" ${s} />`
+        : `<circle cx="12" cy="12" r="8.5" ${s} />`;
+    return L.divIcon({
+      className: "dr-fix",
+      iconSize: [24, 24],
+      iconAnchor: [12, 12],
+      html: `<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">${body}${dot}</svg>`,
+    });
+  }
+
+  /**
+   * Builds the divIcon for the DR position: the navigator's X
+   * (traditional chartwork — a dead reckoned position, deliberately
+   * NOT a fix symbol), in the marker white for maximal contrast over
+   * the teal ghost track it rides.
+   *
+   * @returns {object} Leaflet divIcon
+   */
+  _drIcon() {
+    return L.divIcon({
+      className: "dr-fix",
+      iconSize: [14, 14],
+      iconAnchor: [7, 7],
+      html: `<svg width="14" height="14" viewBox="0 0 14 14" xmlns="http://www.w3.org/2000/svg"><path d="M2 2 L12 12 M12 2 L2 12" stroke="${vm.STYLE.drMarker}" stroke-width="2.2" fill="none" /></svg>`,
+    });
+  }
+
+  /**
+   * Adds non-interactive arrowhead markers (traditional chartwork
+   * position-line marking) to a layer group. The arrows decorate
+   * their line — clicks and hovers stay with the line itself.
+   *
+   * @param {Array<{at: [number, number], rotationDeg: number,
+   *   double: boolean}>} arrows - lopArrowheads/cplArcSpec result
+   * @param {string} color - must match the line it decorates
+   * @param {object} layer - Leaflet layer group
+   * @returns {void}
+   */
+  renderArrows(arrows, color, layer) {
+    for (const a of arrows ?? []) {
+      L.marker(a.at, {
+        icon: this._arrowIcon(a.rotationDeg, color, a.double),
+        interactive: false,
+        keyboard: false,
+      }).addTo(layer);
+    }
+  }
+
+  /**
+   * Builds the divIcon for a traditional chartwork arrowhead: a solid
+   * chevron rotated to point outward along its line — single for a
+   * position line from an observation, double for a transferred
+   * position line. Bare divIcon (className drops Leaflet's default
+   * white box), same trick as the AIS glyphs.
+   *
+   * @param {number} rotationDeg - compass bearing the chevron points
+   * @param {string} color
+   * @param {boolean} [double=false] - double chevron (transferred PL)
+   * @returns {object} Leaflet divIcon
+   */
+  _arrowIcon(rotationDeg, color, double = false) {
+    const rot = `transform:rotate(${Math.round(rotationDeg)}deg);`;
+    const f = ` fill="${color}"`;
+    const size = double ? 16 : 12;
+    const paths = double
+      ? `<path d="M8 1 L13 8.5 L3 8.5 Z"${f}/><path d="M8 7 L13 14.5 L3 14.5 Z"${f}/>`
+      : `<path d="M6 1 L11 10 L1 10 Z"${f}/>`;
+    return L.divIcon({
+      className: "dr-arrow",
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+      html: `<div style="${rot}"><svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">${paths}</svg></div>`,
+    });
   }
 
   /**

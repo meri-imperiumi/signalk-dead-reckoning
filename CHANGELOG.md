@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Chartwork overlays now follow traditional navigation conventions.**
+  - Position lines carry their traditional arrowheads: a bearing PL
+    has a single arrowhead at its outer end (the ray's far end, away
+    from the observed object); a celestial PL has single arrowheads
+    at both ends; a transferred (running-fix) PL has a double
+    arrowhead at both ends.
+  - A range CPL draws as an arc sweeping ±45° around the bearing from
+    the observed object toward the DR position, with single
+    arrowheads at both arc ends; the full dashed circle stays
+    underneath (faded) as the complete constraint. Without a DR
+    position the full circle renders as before.
+  - Fixes plot with their traditional symbols: an outlined triangle
+    with a dot for a GPS fix, an outlined circle with a dot for fixes
+    by observation or manual plotting, and the DR position as the
+    navigator's X — all still color-coded by source.
+  - Plotted positions and the course line carry traditional labels,
+    always in Zulu time: "Fix 02:30Z" beside each fix, "DR 02:50Z"
+    beside the DR position, and "C 290° S 6.1" along the ghost track
+    (course & speed derived from the last minute of DR movement; no
+    label when moored).
+- **The DR ghost track now renders as the dominant track on the chart.**
+  It draws at 3.5 px (up from 2, GPS stays at 2) over a dark casing
+  line, so the teal DR output stays legible on any tileset — light
+  raster charts included — instead of reading as an equal-weight twin
+  of the GPS track. Track weights/casing constants live in
+  `STYLE.track` in the view-model; the ghost lines are non-interactive
+  so chart picks and the context menu keep working on and near the
+  track.
+
 ## [0.10.0] - 2026-09-17
 
 ### Fixed
