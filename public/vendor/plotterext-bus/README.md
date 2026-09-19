@@ -4,9 +4,14 @@ dependency, no build tooling — same policy as vendor/leaflet). Fetched via
 
 - extension.js (the /extension entry, re-exports the client)
 - chunk-7XRFPDQL.js (ExtensionClient + connectExtension)
-- chunk-4W6N34SD.js (bus protocol core: envelope, JSON-RPC, wildcard events)
+- host.js (the /host entry, re-exports HostConnection + protocol core)
+- chunk-RED55KML.js (HostConnection: subscriptions, handshake)
+- chunk-4W6N34SD.js (bus protocol core: envelope, JSON-RPC, wildcard
+  events — shared by both entries)
 - LICENSE (MIT, Copyright (c) 2026 Joel Kozikowski)
 
-Only the extension side is vendored; the host side runs inside the chart
-plotter (Freeboard-SK), not here. The documented wire format is the contract —
-see freeboard-sk docs/api/plotter-extensions-api.md.
+Both sides are vendored: the extension client runs inside our
+`dr-ext-widget.html` iframe on host chartplotters (Freeboard-SK), and
+HostConnection powers the DR webapp's own plotter-extension host
+(dr-ext-host.js, work doc #27). The documented wire format is the
+contract — see plotter-extensions.md.

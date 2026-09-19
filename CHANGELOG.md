@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The webapp is now also a plotter-extension host (Plotter
+  Extensions API v1).** Beside providing its own extension, the DR
+  webapp discovers other plugins' `plotterExtensions` manifests and
+  hosts their widgets: two 2×2 widget grids anchored *below* the
+  webapp's own top panels (so they can never cover the entry tools
+  or GPS status), placed and removed through a picker dialog with a
+  persistent localStorage layout (`dr.plotterext.layout.v1`, stable
+  per-placement instance ids). Hosted cells reuse the webapp's
+  visual language (translucent panel + corner brackets), the area
+  stays pointer-transparent where empty so the chart keeps dragging
+  through. Capabilities offered: `widgets`, `panels.iframe`
+  (configuration panels — persistent dialogs so `keepAlive` panels
+  survive close/reopen without iframe reloads), `signalk.stream`
+  (multiplexed onto the app's single WebSocket with per-path
+  ref-counting and incremental subscribe/unsubscribe) and
+  `signalk.put`. Widget long-press gestures reach the host via
+  `ui.openConfigPanel`/`ui.toggleConfigPanel` on the bus; the picker
+  provides the gesture-independent configure/remove path every
+  widget must get. The host-side bus (`signalk-plotterext-bus`
+  `/host` entry) is vendored alongside the extension side.
+
 ### Changed
 - **The webapp now uses a plotter layout: the chart fills the whole
   viewport.** `<dr-map-view>` is the app; every control floats over

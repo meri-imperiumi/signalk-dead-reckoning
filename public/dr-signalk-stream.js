@@ -11,6 +11,13 @@
  * frame's self context is captured so consumers can route own-vessel vs.
  * target deltas.
  *
+ * Plotter-extension host (work doc #27): the host's Signal K relay is
+ * multiplexed over this same socket. `subscribeShared`/`unsubscribeShared`
+ * hold per-path refcounts for extension contexts; while the socket is
+ * open the path set is reconciled with incremental subscribe/unsubscribe
+ * messages instead of a reconnect, so widgets can come and go without
+ * interrupting the app's own data.
+ *
  * @file dr-signalk-stream.js
  */
 
@@ -18,9 +25,15 @@
 const RETRY_MS = 5000;
 
 class DrSignalkStream {
-  constructor() {
+  /**
+   * @param {object} [opts]
+   * @param {new (url: string) => WebSocket} [opts.socketFactory]
+   *   injectable for tests (defaults to the global WebSocket)
+   */
+  constructor(opts = {}) {
     /** @type {WebSocket|null} */
     this.ws = null;
+    this.socketFactory = opts.socketFactory ?? ((url) => new WebSocket(url));
     /** @type {Array<string>} */
     this.paths = [
       "navigation.deadReckoning.position",
@@ -38,6 +51,19 @@ class DrSignalkStream {
      * @type {Array<string>}
      */
     this.aisPaths = [];
+    /**
+     * Ref-counted shared (plotter-extension) self paths. The host relay
+     * aggregates its contexts' literal paths here; a path stays
+     * subscribed while at least one context holds it.
+     * @type {Map<string, number>}
+     */
+    this.sharedPaths = new Map();
+    /**
+     * Self-scope paths the server currently holds (diff base for
+     * reconcile). Reset when the socket (re)connects.
+     * @type {Set<string>}
+     */
+    this.sentSelf = new Set();
     /**
      * The server's self context from the stream Hello frame (e.g.
      * `vessels.urn:mrn:signalk:uuid:…`) — deltas arrive with their REAL
@@ -59,13 +85,26 @@ class DrSignalkStream {
   }
 
   /**
-   * Builds the stream URL from window.location.
+   * Builds the stream URL from the page location (falls back to a
+   * placeholder outside the browser — tests inject their socket).
    *
    * @returns {string}
    */
   url() {
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    return `${proto}://${window.location.host}/signalk/v1/stream?subscribe=none&sendMeta=all`;
+    const loc = globalThis.location;
+    const proto = loc?.protocol === "https:" ? "wss" : "ws";
+    const host = loc?.host ?? "localhost:3000";
+    return `${proto}://${host}/signalk/v1/stream?subscribe=none&sendMeta=all`;
+  }
+
+  /**
+   * The self-scope path set the server should hold: the app's own
+   * paths plus the active shared (extension) paths, deduplicated.
+   *
+   * @returns {Array<string>}
+   */
+  desiredSelfPaths() {
+    return [...new Set([...this.paths, ...this.sharedPaths.keys()])];
   }
 
   /**
@@ -78,7 +117,7 @@ class DrSignalkStream {
     if (this.closed) return;
     this.retryMs = RETRY_MS;
     this.emitStatus("connecting");
-    const ws = new WebSocket(this.url());
+    const ws = this.socketFactory(this.url());
     this.ws = ws;
 
     ws.addEventListener("open", () => {
@@ -126,17 +165,19 @@ class DrSignalkStream {
    * minPeriod is looser than the self subscription — AIS position
    * reports are 2–30 s apart (Class A) and up to 3 min (Class B), so a
    * 2 s throttle per path loses nothing while keeping busy-water
-   * traffic from flooding the link.
+   * traffic from flooding the link. Shared (extension) paths are part
+   * of the self scope and ride the same subscribe message.
    *
    * @returns {void}
    */
   sendSubscription() {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
-    if (this.paths.length > 0) {
+    const self = this.desiredSelfPaths();
+    if (self.length > 0) {
       this.ws.send(
         JSON.stringify({
           context: "vessels.self",
-          subscribe: this.paths.map((path) => ({
+          subscribe: self.map((path) => ({
             path,
             policy: "instant",
             minPeriod: 1000,
@@ -144,6 +185,7 @@ class DrSignalkStream {
         }),
       );
     }
+    this.sentSelf = new Set(self);
     if (this.aisPaths.length > 0) {
       this.ws.send(
         JSON.stringify({
@@ -156,6 +198,42 @@ class DrSignalkStream {
         }),
       );
     }
+  }
+
+  /**
+   * Reconciles the server's self-scope subscription with the desired
+   * path set using incremental subscribe/unsubscribe messages — only
+   * meaningful while the socket is open; a closed socket just waits
+   * for the reconnect to send the full set.
+   *
+   * @returns {void}
+   */
+  reconcile() {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const desired = new Set(this.desiredSelfPaths());
+    const added = [...desired].filter((p) => !this.sentSelf.has(p));
+    const removed = [...this.sentSelf].filter((p) => !desired.has(p));
+    if (added.length > 0) {
+      this.ws.send(
+        JSON.stringify({
+          context: "vessels.self",
+          subscribe: added.map((path) => ({
+            path,
+            policy: "instant",
+            minPeriod: 1000,
+          })),
+        }),
+      );
+    }
+    if (removed.length > 0) {
+      this.ws.send(
+        JSON.stringify({
+          context: "vessels.self",
+          unsubscribe: removed.map((path) => ({ path })),
+        }),
+      );
+    }
+    this.sentSelf = desired;
   }
 
   /**
@@ -182,6 +260,36 @@ class DrSignalkStream {
   subscribeAis(paths) {
     this.aisPaths = paths;
     this.sendSubscription();
+  }
+
+  /**
+   * Adds refcounts for shared (plotter-extension host, work doc #27)
+   * self paths and reconciles the live socket.
+   *
+   * @param {Array<string>} paths
+   * @returns {void}
+   */
+  subscribeShared(paths) {
+    for (const p of paths) {
+      this.sharedPaths.set(p, (this.sharedPaths.get(p) ?? 0) + 1);
+    }
+    this.reconcile();
+  }
+
+  /**
+   * Drops one reference per path; paths falling to zero leave the
+   * subscription.
+   *
+   * @param {Array<string>} paths
+   * @returns {void}
+   */
+  unsubscribeShared(paths) {
+    for (const p of paths) {
+      const n = (this.sharedPaths.get(p) ?? 0) - 1;
+      if (n <= 0) this.sharedPaths.delete(p);
+      else this.sharedPaths.set(p, n);
+    }
+    this.reconcile();
   }
 
   /**
@@ -238,7 +346,11 @@ class DrSignalkStream {
   }
 }
 
-window.drSignalkStream = new DrSignalkStream();
-window.addEventListener("DOMContentLoaded", () => {
-  window.drSignalkStream.start();
-});
+export { DrSignalkStream };
+
+if (typeof window !== "undefined") {
+  window.drSignalkStream = new DrSignalkStream();
+  window.addEventListener("DOMContentLoaded", () => {
+    window.drSignalkStream.start();
+  });
+}

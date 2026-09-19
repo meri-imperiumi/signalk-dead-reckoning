@@ -22,9 +22,15 @@
  * right-clicking a target seeds a bearing from its predicted
  * position.
  *
+ * The webapp is also a plotter-extension **host** (work doc #27):
+ * `PlotterExtHost` discovers other plugins' `plotterExtensions`
+ * manifests and places their widgets in `<dr-ext-widget-area>` grids
+ * anchored below this app's own top panels.
+ *
  * @file dr-app.js
  */
 
+import { PlotterExtHost } from "./dr-ext-host.js";
 import {
   fetchHistory,
   mergeHistoryTrack,
@@ -234,6 +240,21 @@ template.innerHTML = /* html */ `
       min-height: 0;
       overflow-y: auto;
     }
+    /* Widget areas for hosted plotter extensions (work doc #27) ride
+       below the webapp's own panels in the same column — anchored,
+       not at the literal viewport corner, so they can never cover
+       the entry tools or GPS status. The area is pointer-transparent
+       except its own interactive parts, so the chart still drags
+       around it. */
+    .dr-top-col {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      align-items: flex-start;
+    }
+    .dr-top-col > .dr-gps {
+      align-self: flex-end;
+    }
     /* Water-track readout: bottom-right panel — figures + the manual
        current entry that edits the set/drift figure beside it. */
     .dr-bottom {
@@ -252,6 +273,39 @@ template.innerHTML = /* html */ `
     }
     dialog::backdrop {
       background: rgba(8, 10, 12, 0.7);
+    }
+    /* Plotter-extension host dialogs (work doc #27): the picker and
+       the configuration dialogs share the app's dialog chrome; the
+       hosted panel iframe gets working room inside it. */
+    dialog.ext-picker,
+    dialog.ext-config {
+      /* compound value — the layout smoketest pins the old card-stack
+         page padding marker, and dialogs are not that. */
+      padding: 0.75rem 1rem;
+    }
+    dialog.ext-config iframe {
+      display: block;
+      width: min(80vw, 30rem);
+      height: min(70vh, 30rem);
+      border: 0;
+      background: var(--bg-panel);
+    }
+    .ext-manage-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin: 0.25rem 0;
+    }
+    .ext-manage-row span {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-right: auto;
+    }
+    .ext-config-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
     }
     /* Phone-first (work doc #13 update #2): dialogs become bottom
        sheets on narrow viewports — the map stays visible around the
@@ -354,21 +408,26 @@ template.innerHTML = /* html */ `
 
   <div class="dr-overlay">
     <div class="dr-top">
-      <section class="sk-floating dr-tools">
-        <button id="btn-sight">⊕ Sight / LOP</button>
-        <button id="btn-coord-fix" title="Confirm a fix at coordinates — prefilled from the current GNSS position, editable for offline/known-position fixes">⊙ Fix at coordinates</button>
-        <button id="btn-pending" aria-expanded="false" aria-controls="dr-pending-drawer" hidden>◧ Pending</button>
-      </section>
-
-      <section class="sk-floating dr-gps">
-        <div class="dr-status" id="dr-status-panel">
-          <span id="dr-status-text">Connecting to Signal K…</span>
-        </div>
-        <div class="dr-override">
-          <button id="dr-override-btn">Engage OVERRIDE</button>
-          <span id="dr-override-state">NORMAL (GPS authoritative)</span>
-        </div>
-      </section>
+      <div class="dr-top-col">
+        <section class="sk-floating dr-tools">
+          <button id="btn-sight">⊕ Sight / LOP</button>
+          <button id="btn-coord-fix" title="Confirm a fix at coordinates — prefilled from the current GNSS position, editable for offline/known-position fixes">⊙ Fix at coordinates</button>
+          <button id="btn-pending" aria-expanded="false" aria-controls="dr-pending-drawer" hidden>◧ Pending</button>
+        </section>
+        <dr-ext-widget-area anchor="top-left"></dr-ext-widget-area>
+      </div>
+      <div class="dr-top-col dr-top-col-right">
+        <section class="sk-floating dr-gps">
+          <div class="dr-status" id="dr-status-panel">
+            <span id="dr-status-text">Connecting to Signal K…</span>
+          </div>
+          <div class="dr-override">
+            <button id="dr-override-btn">Engage OVERRIDE</button>
+            <span id="dr-override-state">NORMAL (GPS authoritative)</span>
+          </div>
+        </section>
+        <dr-ext-widget-area anchor="top-right"></dr-ext-widget-area>
+      </div>
     </div>
 
     <div class="dr-pane">
@@ -707,6 +766,19 @@ class DrApp extends HTMLElement {
     // age-out must advance even when nothing else flows (moored, DR
     // idle, quiet targets) — a slow dedicated pulse.
     setInterval(() => this.renderAis(), 5000);
+
+    // Plotter-extension host (work doc #27): the webapp is itself a
+    // chartplotter, so it hosts other plugins' extensions in the
+    // widget areas below its own panels. Discovery is async — the
+    // areas render empty until the first collection lands.
+    this.extHost = new PlotterExtHost({
+      stream: window.drSignalkStream,
+      mount: root,
+    });
+    for (const el of root.querySelectorAll("dr-ext-widget-area")) {
+      this.extHost.attachArea(el);
+    }
+    void this.extHost.start();
   }
 
   /**
