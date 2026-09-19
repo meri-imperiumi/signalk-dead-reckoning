@@ -39,6 +39,7 @@
     ],
     "screenshots": [
       "./doc/dr-map.png",
+      "./doc/dr-mobile.png",
       "./doc/dr-celestial.png",
       "./doc/dr-bearing-to.png"
     ]

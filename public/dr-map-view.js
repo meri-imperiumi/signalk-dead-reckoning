@@ -143,9 +143,15 @@ class DrMapView extends HTMLElement {
       /* Phones: pinch-zoom replaces the zoom button stack — with the
          pending bottom sheet open, the full stack would ride high
          enough to poke into the top control bands. The chart-layers
-         control and the re-center button stay. */
+         control and the re-center button stay. While the sheet is
+         open (data-controls-hidden) the whole stack hides: the sheet
+         spans the full width and covers it anyway. */
       @media (max-width: 600px) {
         .leaflet-control-zoom { display: none; }
+      }
+      :host([data-controls-hidden]) .leaflet-bottom.leaflet-left,
+      :host([data-controls-hidden]) .dr-recenter {
+        display: none;
       }
       .leaflet-control-layers {
         background-color: rgba(17, 20, 20, 0.8) !important;

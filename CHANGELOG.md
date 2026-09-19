@@ -28,10 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everywhere except on the panels, so the chart stays draggable
   between the controls; phones collapse to full-width bands with
   the safety-critical figures (elapsed, divergence, current). On
-  phones the map's bottom-left control stack rides above the bottom
-  bands (chart-layers + follow, measured via a custom property so
-  the stack stays reachable beside the readout band and the open
-  pending sheet), and the zoom buttons give way to pinch-zoom.
+  phones the map's bottom-left control stack rides above the readout
+  band (chart-layers + follow, measured via a custom property), the
+  zoom buttons give way to pinch-zoom, and while the pending sheet is
+  open the whole control stack hides — the sheet spans the full width
+  and would otherwise push the stack up into the top control bands.
+  Phone bands are compact — tighter padding, figures as inline
+  value+label chips, the manual-current entry collapses to its ≋
+  glyph, the divergence sparkline hides — reclaiming ~60px of chart
+  (bands 346px of 844 with the sheet closed leaving 57% chart).
   Dialog focus outlines are solid instead of dashed.
 
 ### Fixed

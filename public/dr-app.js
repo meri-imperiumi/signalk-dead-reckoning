@@ -262,6 +262,20 @@ template.innerHTML = /* html */ `
        safety-critical figures (elapsed, divergence, current) so the
        chart keeps the bulk of the screen. */
     @media (max-width: 600px) {
+      /* Compact bands: a phone screen is ~840px tall and the chart
+         must keep the bulk of it — tighter padding, figures as inline
+         value+label chips instead of stacked columns, buttons sharing
+         rows. */
+      .dr-top,
+      .dr-bottom {
+        padding: 6px;
+      }
+      .dr-tools,
+      .dr-gps,
+      .dr-readout,
+      .dr-drawer {
+        padding: 0.35rem 0.5rem;
+      }
       .dr-top {
         flex-direction: column;
         align-items: stretch;
@@ -271,17 +285,50 @@ template.innerHTML = /* html */ `
       .dr-gps {
         justify-content: flex-start;
       }
+      .dr-tools button {
+        flex: 1 1 calc(50% - 0.5rem);
+      }
+      .dr-gps {
+        gap: 0.35rem;
+      }
+      .dr-status {
+        font-size: 0.7rem;
+        max-width: 14rem;
+      }
+      .dr-override button {
+        min-width: 11rem;
+        padding: 0 0.6rem;
+      }
       #dr-log-fig,
       #dr-method-fig {
         display: none;
       }
+      /* Figures become inline chips: value + label on one baseline,
+         so the figures fit fewer rows; the manual-current entry
+         collapses to its ≋ glyph (meaning in the tooltip) and the
+         sparkline hides — 80px of chart is meaningless at a glance
+         on a phone. */
+      .dr-figure {
+        flex-direction: row;
+        align-items: baseline;
+        gap: 0.35rem;
+      }
       .dr-figure .value {
-        font-size: clamp(1.1rem, 5vw, 1.4rem);
+        font-size: clamp(1.05rem, 4.5vw, 1.3rem);
+      }
+      .dr-figure .label {
+        font-size: 0.6rem;
+      }
+      .dr-readout .btn-label {
+        display: none;
+      }
+      #dr-spark {
+        display: none;
       }
       .dr-pane {
         justify-content: stretch;
         align-items: flex-end;
-        padding: 0 8px;
+        padding: 0 6px;
       }
       .dr-drawer {
         width: 100%;
@@ -289,7 +336,7 @@ template.innerHTML = /* html */ `
       }
       .dr-bottom {
         justify-content: stretch;
-        padding: 0 8px 8px;
+        padding: 0 6px 6px;
       }
       dialog {
         margin: auto auto 0 auto;
@@ -357,7 +404,7 @@ template.innerHTML = /* html */ `
             <span class="value" id="dr-method">—</span>
             <span class="label">Active method</span>
           </div>
-          <button id="btn-current" title="Manual set &amp; drift — the override outranks weather/pilot-chart sources while its TTL lasts">≋ Current</button>
+          <button id="btn-current" title="Manual set &amp; drift — the override outranks weather/pilot-chart sources while its TTL lasts">≋ <span class="btn-label">Current</span></button>
         </div>
       </section>
     </div>
@@ -609,24 +656,29 @@ class DrApp extends HTMLElement {
     // Phone fit (verified headless 2026-09-19): the full-width readout
     // band owns the bottom edge, so the map's bottom-left control
     // stack (zoom, chart layers, re-center) must ride above it —
-    // otherwise the band covers the controls. The open pending
-    // drawer (a non-modal bottom sheet) counts too: zooming while
-    // checking pending observations must stay possible. Panel
-    // heights are dynamic (figures wrap, rows come and go), so
-    // measure and export the offset to the map as a custom property
-    // (it pierces the shadow boundary). Desktop keeps 0: the readout
-    // is right-docked, the drawer left-docked, no collision.
+    // otherwise the band covers the controls. The band's height is
+    // dynamic (figures wrap), so measure it and export the offset to
+    // the map as a custom property (it pierces the shadow boundary);
+    // an open pending sheet hides the stack entirely (see below).
+    // Desktop keeps 0: the readout is right-docked, no collision.
     const readout = root.querySelector(".dr-readout");
     if (readout && typeof ResizeObserver !== "undefined") {
       const mq = window.matchMedia("(max-width: 600px)");
       const syncMapOffset = () => {
         let off = 0;
+        // An open pending sheet spans the full phone width — keeping
+        // the map's control stack reachable would mean pushing it up
+        // into the top control bands (verified: it landed on the GPS
+        // panel). The sheet covers the controls anyway, so hide the
+        // stack while it's open: pinch-zoom still works, and re-center
+        // + chart layers return the moment the sheet closes.
+        const sheetOpen = mq.matches && this.drawerOpen;
+        this.map?.toggleAttribute("data-controls-hidden", sheetOpen);
         if (mq.matches) {
-          const tops = [readout, this.drawer]
-            .filter((el) => el && !el.hidden)
-            .map((el) => el.getBoundingClientRect().top);
-          if (tops.length > 0)
-            off = Math.ceil(window.innerHeight - Math.min(...tops)) + 8;
+          off =
+            Math.ceil(
+              window.innerHeight - readout.getBoundingClientRect().top,
+            ) + 8;
         }
         this.map?.style.setProperty("--dr-map-bottom-offset", `${off}px`);
       };

@@ -241,15 +241,24 @@ test("dr-map-view: the divergence chip is gone — readout owns that corner", ()
 });
 
 test("dr-app: phone fit — map controls ride above the bottom bands", () => {
-  // On phones the full-width readout band (and the open pending
-  // sheet) own the bottom edge; dr-app measures them and exports the
-  // offset to the map as a custom property (it pierces the shadow
-  // boundary). Desktop keeps 0 — the panels are corner-docked there.
+  // On phones the full-width readout band owns the bottom edge; dr-app
+  // measures it and exports the offset to the map as a custom property
+  // (it pierces the shadow boundary). Desktop keeps 0 — the panels are
+  // corner-docked there.
   assert.match(appSrc, /--dr-map-bottom-offset/);
   assert.match(appSrc, /new ResizeObserver\(syncMapOffset\)/);
   // The drawer open/close flip is a display:none toggle — re-sync
   // explicitly so the stack never sits behind the sheet.
   assert.match(appSrc, /this\._syncMapOffset\?\.\(\)/);
+  // An open pending sheet spans the full phone width: the control
+  // stack hides instead of being pushed up into the top control bands
+  // (verified 390×844: the offset would land it on the GPS panel).
+  assert.match(appSrc, /toggleAttribute\("data-controls-hidden", sheetOpen\)/);
+  assert.match(
+    mapSrc,
+    /:host\(\[data-controls-hidden\]\) \.dr-recenter/,
+    "map hides the control stack while the sheet is open",
+  );
 });
 
 test("dr-map-view: control stack consumes the offset; phones pinch-zoom", () => {
