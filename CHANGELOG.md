@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-20
+
 ### Added
 - **The webapp is now also a plotter-extension host (Plotter
   Extensions API v1).** Beside providing its own extension, the DR
