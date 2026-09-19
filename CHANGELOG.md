@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Widget placement moved into the chart's context menu.** The
+  hosted-widget areas no longer carry their own "＋ EXT" buttons —
+  right-clicking the chart where a widget area sits (below the entry
+  tools or the GPS panel — the full 2×2 footprint is reserved and
+  stays pointer-transparent) shows the existing pick menu with an
+  added "Plotter widgets" entry that opens the placement picker for
+  that area. Only placed cells capture pointer events, so the chart
+  keeps dragging and right-clicking through the gaps.
+
 ## [0.11.0] - 2026-09-20
 
 ### Added

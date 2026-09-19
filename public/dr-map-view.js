@@ -643,13 +643,26 @@ class DrMapView extends HTMLElement {
   }
 
   /**
+   * Hosted-widget-area hit test, registered by dr-app: given a client
+   * point, returns the `<dr-ext-widget-area>` anchor it lands on (or
+   * null). The areas carry no buttons of their own — widget placement
+   * rides the pick menu when the right-click lands on a reserved area
+   * footprint.
+   *
+   * @type {((clientX: number, clientY: number) => (string|null))|null}
+   */
+  areaAt = null;
+
+  /**
    * Shows a small context menu at a chart point offering to pre-seed a
    * sight form with that position as the object. Dispatches
    * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode,
    * label, tMs }` — `label` carries the picked symbol's charted name
    * (or an AIS target's name, work doc #23), `tMs` the pick instant the
    * position is valid for (an AIS target's predicted position is
-   * anchored to it).
+   * anchored to it). When the pick lands on a hosted widget-area
+   * footprint (`areaAt`), the menu also offers widget placement via a
+   * `dr-open-ext-picker` event.
    *
    * @param {L.LatLng|[number, number]} latlng
    * @param {L.Point|null|undefined} [containerPoint]
@@ -690,6 +703,31 @@ class DrMapView extends HTMLElement {
         );
       });
       menu.appendChild(btn);
+    }
+    // Hosted plotter widgets (dr-app registers the hit test): a pick
+    // landing on a widget-area footprint offers placement there in
+    // the same menu — the areas carry no on-chart buttons.
+    if (containerPoint && this.areaAt) {
+      const r = this.mapEl.getBoundingClientRect();
+      const anchor = this.areaAt(
+        r.left + containerPoint.x,
+        r.top + containerPoint.y,
+      );
+      if (anchor) {
+        const btn = document.createElement("button");
+        btn.textContent = ` Plotter widgets (${anchor})…`;
+        btn.addEventListener("click", () => {
+          this.hidePickMenu();
+          this.dispatchEvent(
+            new CustomEvent("dr-open-ext-picker", {
+              bubbles: true,
+              composed: true,
+              detail: { anchor },
+            }),
+          );
+        });
+        menu.appendChild(btn);
+      }
     }
     // Position the menu at the screen point of the click.
     const point = this.map.latLngToContainerPoint(latlng);

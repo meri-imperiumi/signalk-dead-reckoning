@@ -243,9 +243,11 @@ template.innerHTML = /* html */ `
     /* Widget areas for hosted plotter extensions (work doc #27) ride
        below the webapp's own panels in the same column — anchored,
        not at the literal viewport corner, so they can never cover
-       the entry tools or GPS status. The area is pointer-transparent
-       except its own interactive parts, so the chart still drags
-       around it. */
+       the entry tools or GPS status. The area reserves its 2×2
+       footprint but is pointer-transparent except its cells, so the
+       chart still drags through; placement is offered by the chart
+       context menu (right-click on the footprint), not by any
+       on-chart button. */
     .dr-top-col {
       display: flex;
       flex-direction: column;
@@ -516,6 +518,24 @@ class DrApp extends HTMLElement {
       openSight();
       this.sight?.seedObjectPosition(lat, lng, mode, label, tMs);
     });
+    // Hosted plotter-widget areas (work doc #27) carry no buttons: the
+    // chart context menu offers placement when the pick lands on a
+    // reserved area footprint. dr-app owns the hit test (the areas
+    // live in this shadow root) and opens the ext host's picker.
+    if (this.map) {
+      this.map.areaAt = (x, y) => {
+        for (const el of root.querySelectorAll("dr-ext-widget-area")) {
+          const r = el.getBoundingClientRect();
+          if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
+            return el.getAttribute("anchor") ?? "top-left";
+          }
+        }
+        return null;
+      };
+      this.map.addEventListener("dr-open-ext-picker", (e) => {
+        this.extHost?.openPicker(e.detail.anchor);
+      });
+    }
 
     /** @type {HTMLDialogElement|null} */
     this.sightDialog = root.querySelector("#sight-dialog");

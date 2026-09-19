@@ -21,6 +21,7 @@ const read = (f) =>
   });
 const hostSrc = read("dr-ext-host.js");
 const appSrc = read("dr-app.js");
+const mapSrc = read("dr-map-view.js");
 const streamSrc = read("dr-signalk-stream.js");
 
 // ---- fakes --------------------------------------------------------------
@@ -383,6 +384,28 @@ test("dr-ext-host: widget cells reuse the theme's visual language", () => {
   assert.match(hostSrc, /background: transparent;/);
   // Empty space stays chart-draggable.
   assert.match(hostSrc, /:host \{[^}]*pointer-events: none/s);
+});
+
+test("placement rides the chart context menu, not an on-chart button", () => {
+  // No “＋ EXT” button stuck to the chart.
+  assert.doesNotMatch(hostSrc, /＋ EXT/);
+  assert.doesNotMatch(hostSrc, /\.add \{/);
+  // The empty area still reserves its 2×2 footprint so there is a
+  // stable region for the context-menu hit test.
+  assert.match(hostSrc, /min-width: calc\(2 \* \$\{CELL_CSS\} \+ 6px\)/);
+  assert.match(hostSrc, /min-height: calc\(2 \* \$\{CELL_CSS\} \+ 6px\)/);
+  // Only the cells capture pointer events — gaps and empty cells
+  // stay clickable as chart (right-click reaches the map).
+  assert.match(hostSrc, /\.grid \{[\s\S]*?pointer-events: none/s);
+  assert.match(hostSrc, /\.cell \{[^}]*pointer-events: auto/s);
+  // The pick menu grows the placement entry over an area footprint.
+  assert.match(mapSrc, /areaAt = null;/);
+  assert.match(mapSrc, /this\.areaAt\(/);
+  assert.match(mapSrc, / Plotter widgets \(\$\{anchor\}\)…/);
+  assert.match(mapSrc, /dr-open-ext-picker/);
+  // dr-app owns the hit test and opens the host's picker.
+  assert.match(appSrc, /this\.map\.areaAt = /);
+  assert.match(appSrc, /this\.extHost\?\.openPicker\(e\.detail\.anchor\)/);
 });
 
 test("dr-ext-host: dialogs are persistent for panels, transient for removal", () => {

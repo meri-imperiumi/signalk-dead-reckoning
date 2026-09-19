@@ -903,9 +903,10 @@ const AreaBase = typeof HTMLElement !== "undefined" ? HTMLElement : class {};
  * webapp's own floating panels. Pure chrome: the frames are owned by
  * the manager; the visual language (translucent panel, corner
  * brackets) comes from dr-theme.js so hosted widgets sit in the same
- * frame as `.dr-tools`/`.dr-gps`. Empty cells stay pointer-transparent
- * so the chart keeps dragging through the gaps; the compact "＋ EXT"
- * affordance opens the placement picker.
+ * frame as `.dr-tools`/`.dr-gps`. The element carries no buttons —
+ * it stays pointer-transparent everywhere except its cells, and the
+ * host reserves the full 2×2 footprint so the chart's context menu
+ * (see dr-map-view) can offer widget placement over it.
  */
 export class DrExtWidgetArea extends AreaBase {
   constructor() {
@@ -918,13 +919,19 @@ export class DrExtWidgetArea extends AreaBase {
         --theme-color: var(--color-teal, #4b8b99);
         pointer-events: none; /* chart drags through empty space */
         display: block;
+        /* Reserve the full 2×2 grid footprint even while empty: the
+           chart context menu offers widget placement here (dr-app
+           hit-tests this rect), so the area needs a stable location
+           without carrying any on-chart button of its own. */
+        min-width: calc(2 * ${CELL_CSS} + 6px);
+        min-height: calc(2 * ${CELL_CSS} + 6px);
       }
       .grid {
         display: none; /* only with placements */
         grid-template-columns: repeat(2, ${CELL_CSS});
         grid-auto-rows: ${CELL_CSS};
         gap: 6px;
-        pointer-events: auto;
+        pointer-events: none; /* only the cells are interactive */
       }
       .grid.active { display: grid; }
       .cell {
@@ -935,6 +942,7 @@ export class DrExtWidgetArea extends AreaBase {
         overflow: hidden;
         min-width: 0;
         min-height: 0;
+        pointer-events: auto;
       }
       /* Corner brackets — same hardware-mounting language as the app
          panels, but thinner so the widget content dominates. */
@@ -963,25 +971,12 @@ export class DrExtWidgetArea extends AreaBase {
         border: 0;
         background: transparent;
       }
-      .add {
-        pointer-events: auto;
-        margin-top: 6px;
-        min-height: 32px;
-        padding: 0 0.6rem;
-        font-size: 0.7rem;
-      }
     `;
     root.appendChild(style);
     const grid = document.createElement("div");
     grid.className = "grid";
-    const add = document.createElement("button");
-    add.className = "add";
-    add.type = "button";
-    add.textContent = "＋ EXT";
-    add.title = "Place a plotter-extension widget";
-    root.append(grid, add);
+    root.appendChild(grid);
     this.grid = grid;
-    this.addButton = add;
     /** @type {Map<string, HTMLDivElement>} instanceId → cell */
     this.cells = new Map();
     /** @type {Array<object>} current placements */
@@ -996,9 +991,6 @@ export class DrExtWidgetArea extends AreaBase {
   }
 
   connectedCallback() {
-    this.addButton.addEventListener("click", () => {
-      this.manager?.openPicker(this.anchor);
-    });
     this.render();
   }
 
