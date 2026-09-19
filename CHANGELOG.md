@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-20
+
 ### Changed
 - **Widget placement moved into the chart's context menu.** The
   hosted-widget areas no longer carry their own "＋ EXT" buttons —
