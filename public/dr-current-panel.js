@@ -88,7 +88,7 @@ template.innerHTML = /* html */ `
       <button id="close-btn" title="Close">✕</button>
     </h2>
     <div class="active" id="active-stats">Reading current state…</div>
-    <form class="form" id="form-current">
+    <form class="form" id="form-current" novalidate>
       <div class="row">
         <label>Set (° true)
           <input name="set_true" type="number" step="0.1" required />
@@ -104,7 +104,7 @@ template.innerHTML = /* html */ `
       </div>
       <p class="hint">Set is the direction the current flows toward. The manual override outranks weather and pilot-chart sources until its TTL expires — DR integrates it immediately.</p>
       <div class="actions">
-        <button type="button" class="primary" id="set-btn">Set override</button>
+        <button type="submit" class="primary" id="set-btn">Set override</button>
         <button type="button" class="danger" id="clear-btn" disabled>Clear override</button>
       </div>
     </form>
@@ -128,9 +128,15 @@ class DrCurrentPanel extends HTMLElement {
     /** @type {HTMLButtonElement|null} */
     this.clearBtn = root.querySelector("#clear-btn");
 
-    root
-      .querySelector("#set-btn")
-      ?.addEventListener("click", () => this.setOverride());
+    // Submit: real submit button + novalidate — Enter and click share
+    // one path (the app's own validation messages replace Safari's
+    // implicit-submission bubbles; see the sight panel's wiring).
+    // Clear stays a plain button: a destructive secondary action must
+    // not fire on Enter.
+    this.form?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      this.setOverride();
+    });
     this.clearBtn?.addEventListener("click", () => this.clearOverride());
     root
       .querySelector("#close-btn")

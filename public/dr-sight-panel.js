@@ -155,7 +155,7 @@ template.innerHTML = /* html */ `
       <button data-tab="celestial">Celestial</button>
     </div>
 
-    <form class="form" id="form-bearing">
+    <form class="form" id="form-bearing" novalidate>
       <label>Object
         <input name="object" placeholder="lighthouse, tower…" />
       </label>
@@ -216,11 +216,11 @@ template.innerHTML = /* html */ `
         <div class="coord-lon"></div>
       </fieldset>
       <div class="actions">
-        <button type="button" class="primary" data-submit="bearing">Add bearing LOP</button>
+        <button type="submit" class="primary" data-submit="bearing">Add bearing LOP</button>
       </div>
     </form>
 
-    <form class="form" id="form-vertical" hidden>
+    <form class="form" id="form-vertical" hidden novalidate>
       <label>Object
         <input name="object" placeholder="lighthouse…" />
       </label>
@@ -267,11 +267,11 @@ template.innerHTML = /* html */ `
         <div class="coord-lon"></div>
       </fieldset>
       <div class="actions">
-        <button type="button" class="primary" data-submit="vertical">Add distance CPL</button>
+        <button type="submit" class="primary" data-submit="vertical">Add distance CPL</button>
       </div>
     </form>
 
-    <form class="form" id="form-celestial" hidden>
+    <form class="form" id="form-celestial" hidden novalidate>
       <label>Body
         <select name="body"></select>
       </label>
@@ -329,7 +329,7 @@ template.innerHTML = /* html */ `
         <div class="coord-lon"></div>
       </fieldset>
       <div class="actions">
-        <button type="button" class="primary" data-submit="celestial">Reduce &amp; add LOP</button>
+        <button type="submit" class="primary" data-submit="celestial">Reduce &amp; add LOP</button>
       </div>
       <div class="reduction" id="reduction" hidden></div>
     </form>
@@ -357,10 +357,19 @@ class DrSightPanel extends HTMLElement {
       btn.addEventListener("click", () => this.switchTab(btn.dataset.tab));
     });
 
-    // Submit handlers
-    root.querySelectorAll("[data-submit]").forEach((btn) => {
-      btn.addEventListener("click", () => this.submit(btn.dataset.submit));
-    });
+    // Submit handlers — the buttons are real type="submit" controls
+    // and the forms carry novalidate, so a click and Enter in any
+    // field funnel into ONE path (Safari's implicit submission used to
+    // run native constraint validation instead, surfacing its own
+    // bubbles — "The string did not match the expected pattern." —
+    // and never reaching the app's submit). Required-ness is enforced
+    // by requiredMissing() with the app's own error styling.
+    for (const form of root.querySelectorAll("form.form")) {
+      form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        this.submit(form.id.slice("form-".length));
+      });
+    }
 
     // Live distance calc for vertical-angle form
     const vForm = root.querySelector("#form-vertical");
@@ -792,6 +801,50 @@ class DrSightPanel extends HTMLElement {
   }
 
   /**
+   * First empty [required] control in the form, as a human label —
+   * the app-side replacement for the disabled native constraint
+   * bubbles (forms carry novalidate so Enter can't trigger Safari's
+   * own validation wording; the panel's error element carries the
+   * message instead).
+   *
+   * Coordinate sub-fields hidden by the position format (the decimal
+   * field in DM/DMS, seconds in DM, deg/min/sec/hem in decimal) are
+   * skipped: they carry `required` from the fieldset builder but are
+   * invisible — flagging them was the Safari Enter-bubble trap (the
+   * browser's own implicit-submission validation tripped over the
+   * same hidden empties before the novalidate switch).
+   *
+   * @param {HTMLFormElement} form
+   * @returns {string|null} label of the first missing field, or null
+   */
+  requiredMissing(form) {
+    const format = this.getAttribute("data-pos-format") ?? "dms";
+    for (const el of form.querySelectorAll("[required]")) {
+      const fs = el.closest("fieldset.coord");
+      if (fs) {
+        // Only the sub-fields the current format actually shows count.
+        const part = el.dataset.part;
+        if (format === "decimal" && part !== "dec") continue;
+        if (format !== "decimal" && part === "dec") continue;
+        if (format === "dm" && part === "sec") continue;
+      }
+      const empty = el.type === "checkbox" ? !el.checked : !el.value?.trim();
+      if (!empty) continue;
+      if (fs) {
+        const axis = el.name.includes("_lat") ? "latitude" : "longitude";
+        const legend = fs.querySelector("legend")?.textContent?.trim();
+        return `${legend ?? "Position"} (${axis})`;
+      }
+      const label = el
+        .closest("label")
+        ?.textContent?.trim()
+        ?.replace(/\s+/g, " ");
+      return label || el.name;
+    }
+    return null;
+  }
+
+  /**
    * Reads a form by mode name, builds the REST body via the view-model,
    * submits, and on success records the returned id.
    *
@@ -802,6 +855,14 @@ class DrSightPanel extends HTMLElement {
     this.hideError();
     const form = this.shadowRoot.querySelector(`#form-${mode}`);
     const data = this.readForm(form);
+    // Native validation is off (novalidate — see the submit wiring) —
+    // enforce [required] here so the app's error element, not a
+    // browser bubble, explains what's missing.
+    const missing = this.requiredMissing(form);
+    if (missing) {
+      this.showError(`${missing} — required`);
+      return;
+    }
     // Parse text coordinate fields (decimal/DM/DMS) → signed degrees
     // so the view-model shapers receive numbers.
     this.parseFormCoords(data, mode);

@@ -8,12 +8,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The webapp now uses a plotter layout: the chart fills the whole
+  viewport.** `<dr-map-view>` is the app; every control floats over
+  it as a translucent `.sk-floating` panel — corner brackets and
+  flat geometry preserved, chart context showing through. Corner
+  assignment: top-left carries the bearing & fix entry tools; top-
+  right the engine status badge and the failover control; bottom-
+  right the water-track readout (log, elapsed since fix, divergence
+  with its trend sparkline, current set/drift, active method) with
+  the manual current entry beside the figure it edits; bottom-left
+  keeps the map's own controls (zoom and chart layers moved there,
+  stacked above the follow control). The pending-observations box —
+  toggle and drawer both — only appears while there ARE pending
+  observations, docking left under the entry tools (bottom sheet on
+  phones), and the drawer opens automatically when the first
+  observation arrives on wide screens. The divergence readout +
+  sparkline moved from the map's old bottom-right chip into the
+  readout panel. The overlay layer passes pointer events through
+  everywhere except on the panels, so the chart stays draggable
+  between the controls; phones collapse to full-width bands with
+  the safety-critical figures (elapsed, divergence, current). On
+  phones the map's bottom-left control stack rides above the bottom
+  bands (chart-layers + follow, measured via a custom property so
+  the stack stays reachable beside the readout band and the open
+  pending sheet), and the zoom buttons give way to pinch-zoom.
+  Dialog focus outlines are solid instead of dashed.
+
+### Fixed
+- **Selecting pending observations no longer repaints their lines
+  white on the chart.** The selection highlight keeps each line's
+  semantic color (orange = active constraint, grey = used) and
+  emphasizes with line weight instead — white was invisible over
+  light chart tiles. Applies to LOPs and CPLs (circle + arc) alike.
+- **Every selected observation now renders highlighted on the
+  chart** — previously only the most recently clicked one did, even
+  though the pending list allows multi-selection. The resolve button
+  also reads the same — "Preview selected (n)" — for one sight and
+  many: a single selection resolves as a running fix against the
+  last confirmed fix (tooltip explains, the status line names the
+  mode once the candidate is ready); both go through the same
+  preview→confirm flow.
+- **Submitting the sight/fix/current forms with Enter now goes through
+  the app's own submit flow (Safari).** The submit buttons were
+  `type="button"` with click handlers, so the forms had no submit
+  button — pressing Enter fell into the browser's implicit-submission
+  constraint validation, which tripped over hidden-but-required
+  coordinate sub-fields (empty in the active position format) and
+  surfaced Safari's "The string did not match the expected pattern."
+  bubble without ever submitting. All three entry forms now use real
+  submit buttons + `novalidate` with the panel's own validation
+  (`requiredMissing` explains the first missing field in the app's
+  error element and skips sub-fields hidden by the position format);
+  the destructive "Clear override" stays a plain button so Enter
+  can't fire it. The sight-time field — required, but previously only
+  seeded after a first submit — is now seeded when the dialog opens.
 - **Chartwork overlays now follow traditional navigation conventions.**
   - Position lines carry their traditional arrowheads: a bearing PL
-    has a single arrowhead at its outer end (the ray's far end, away
-    from the observed object); a celestial PL has single arrowheads
-    at both ends; a transferred (running-fix) PL has a double
-    arrowhead at both ends.
+    has a single arrowhead at the object end pointing INTO the
+    observed object (the marking that identifies what was sighted);
+    a celestial PL has single arrowheads at both ends; a transferred
+    (running-fix) PL has a double arrowhead at both ends.
+  - A bearing PL is a ray that starts at the charted object and runs
+    toward the navigator — it never crosses or extends past the mark
+    it was taken from.
   - A range CPL draws as an arc sweeping ±45° around the bearing from
     the observed object toward the DR position, with single
     arrowheads at both arc ends; the full dashed circle stays

@@ -23,14 +23,18 @@ const mapSrc = readFileSync(
   { encoding: "utf8" },
 );
 
-test('dr-app: the "Ghost Track" heading is gone and the map card is bare', () => {
+test('dr-app: the "Ghost Track" heading is gone and the map is bare', () => {
   // The heading above the map wasted vertical space — removed so the
-  // map opens higher. The map card now holds only <dr-map-view>.
+  // map opens higher. Since the plotter layout (work doc #26) the map
+  // isn't card-wrapped at all: it fills the viewport edge-to-edge
+  // with the controls floating over it.
   assert.doesNotMatch(appSrc, /Ghost Track/);
   assert.doesNotMatch(appSrc, /<h2>[^<]*Ghost Track/);
-  assert.match(
+  assert.match(appSrc, /<dr-map-view id="dr-map"><\/dr-map-view>/);
+  assert.doesNotMatch(
     appSrc,
-    /<section class="sk-card">\s*<dr-map-view id="dr-map"><\/dr-map-view>\s*<\/section>/,
+    /<section class="sk-card">\s*<dr-map-view/,
+    "map no longer card-wrapped",
   );
 });
 
@@ -43,8 +47,12 @@ test("dr-app: no longer wires the recenter button — the map owns it", () => {
 test("dr-map-view: floats a recenter control wired to recenter()", () => {
   // The control is a floating overlay styled like the divergence chip
   // (bottom-left — the only free corner) and calls recenter() directly.
+  // Its bottom rides above the phone bottom bands via the offset var.
   assert.match(mapSrc, /\.dr-recenter\s*\{/);
-  assert.match(mapSrc, /bottom: 8px;/);
+  assert.match(
+    mapSrc,
+    /bottom: calc\(8px \+ var\(--dr-map-bottom-offset, 0px\)\);/,
+  );
   assert.match(mapSrc, /left: 8px;/);
   assert.match(
     mapSrc,

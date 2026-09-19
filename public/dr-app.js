@@ -1,15 +1,26 @@
 /**
  * `<dr-app>` — top-level layout for the Dead Reckoning webapp.
  *
- * Composes the map view, headline figures, and the manual OVERRIDE control
- * (SPEC §14.1: prominent, always human-initiated). Live data flows from
- * the Signal K WebSocket stream through the view-model (tracks,
- * sparkline) into `<dr-map-view>`; REST overlays (fixes, LOPs, CPLs,
- * snap vectors) refresh on a slow poll and after any confirm POST.
- * AIS targets (work doc #23) ride the same stream under `vessels.*`,
- * accumulate in a pure store (dr-viewmodel), and render through the
- * map's AIS layer — right-clicking a target seeds a bearing from its
- * predicted position.
+ * Plotter layout (work doc #26): the chart IS the app — `<dr-map-view>`
+ * fills the whole viewport, and every DR control floats over it as a
+ * translucent `.sk-floating` overlay. Corner assignment: top-left =
+ * taking bearings & fixes (Sight/LOP + Fix entry, plus the
+ * pending-observations drawer when it has rows — the whole box only
+ * appears when there ARE pending observations); top-right = GPS
+ * status (engine status badge) and the failover control; bottom-right
+ * = the water-track readout (log, elapsed, divergence + trend
+ * sparkline, current, method) with the manual current entry beside
+ * the figure it edits; bottom-left = the map's own control stack
+ * (zoom, chart layers, follow). The overlay layer is
+ * pointer-transparent except on the panels themselves, so the chart
+ * stays draggable between the controls. Live data flows from the Signal K WebSocket stream
+ * through the view-model (tracks, sparkline) into `<dr-map-view>`;
+ * REST overlays (fixes, LOPs, CPLs, snap vectors) refresh on a slow
+ * poll and after any confirm POST. AIS targets (work doc #23) ride
+ * the same stream under `vessels.*`, accumulate in a pure store
+ * (dr-viewmodel), and render through the map's AIS layer —
+ * right-clicking a target seeds a bearing from its predicted
+ * position.
  *
  * @file dr-app.js
  */
@@ -36,42 +47,97 @@ const template = document.createElement("template");
 template.innerHTML = /* html */ `
   <style>
     ${THEME_CSS}
-    :host { display: block; padding: 1rem; }
-    /* Headline figures: massive monospace payload, tracked labels */
+    /* Plotter layout (work doc #26): no page scroll — the host is the
+       viewport, the map fills it, controls float on top. */
+    :host {
+      position: relative;
+      display: block;
+      height: 100vh; /* fallback for pre-dvh browsers */
+      height: 100dvh;
+      overflow: hidden;
+    }
+    /* The chart IS the app. */
+    #dr-map {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+    }
+    /* Floating control layer: transparent to pointer events except
+       where a panel sits, so the chart stays draggable/zoomable in
+       every gap between the controls. */
+    .dr-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 1100;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+    }
+    .dr-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 8px;
+    }
+    .dr-tools,
+    .dr-gps,
+    .dr-readout,
+    .dr-drawer {
+      pointer-events: auto;
+    }
+    /* Corner assignment (work doc #26 update #2): top-left = taking
+       bearings & fixes (+ the pending list when it has rows); top-right
+       = GPS status & override; bottom-right = water-track readout &
+       other status; bottom-left = the map's own control stack. */
+    /* Headline figures: compact strip payload — still tabular-nums
+       monospace, sized for a glance without eating the viewport. */
     .dr-headline {
       display: flex;
-      gap: clamp(1rem, 3vw, 2.5rem);
+      gap: clamp(0.75rem, 2vw, 1.5rem);
       flex-wrap: wrap;
       align-items: end;
     }
     .dr-figure { display: flex; flex-direction: column; gap: 0.15rem; }
     .dr-figure .value {
       font-family: ui-monospace, "Fira Code", monospace;
-      font-size: clamp(1.5rem, 4vw, 2.5rem);
+      font-size: clamp(1.2rem, 2.5vw, 1.9rem);
       font-weight: 700;
       line-height: 1.05;
       color: var(--text-main);
       font-variant-numeric: tabular-nums;
     }
     .dr-figure .label {
-      font-size: 0.75rem;
+      font-size: 0.7rem;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.1em;
       color: var(--theme-color);
     }
-    .dr-toolbar {
+    /* Divergence figure carries its trend sparkline beside the
+       value (SPEC §14.1) — moved here from the map's old bottom-right
+       chip when that corner was assigned to this panel. */
+    .dr-figure .value-row {
       display: flex;
-      gap: 0.5rem;
-      margin-left: auto;
       align-items: center;
-      flex-wrap: wrap;
+      gap: 0.5rem;
     }
-    /* Engine status line — semantic theme per state */
+    .dr-figure canvas {
+      display: block;
+    }
+    /* Engine status badge — inline in the GPS panel, semantic theme
+       per state. Single line with ellipsis so the panel stays one row
+       tall (matching the tools panel); the full text rides along as
+       the hover title — the long alert wording is for the deliberate
+       look, the glance gets the gist. */
     .dr-status {
+      margin: 0;
+      max-width: 22rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       font-family: ui-monospace, "Fira Code", monospace;
-      font-size: 0.9rem;
-      text-align: center;
+      font-size: 0.75rem;
       color: var(--text-muted);
       --theme-color: var(--color-green);
     }
@@ -90,11 +156,38 @@ template.innerHTML = /* html */ `
       color: var(--color-red);
       font-weight: 600;
     }
-    /* Failover control — alternate-power semantics: orange, red when
-       engaged (DR authoritative). */
+    /* Entry tools — top-left panel: taking bearings and fixes. The
+       pending toggle only renders when there ARE pending observations
+       (hidden while the list is empty). */
+    .dr-tools {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-start;
+    }
+    .dr-tools #btn-pending[aria-expanded="true"] {
+      --theme-color: var(--color-teal);
+      background: var(--color-teal);
+      color: var(--bg-base);
+    }
+    /* Failover control — top-right panel, inline with the status
+       badge: one row, same vertical size as the tools panel. Alternate-
+       power semantics: orange, red when engaged (DR authoritative).
+       The button keeps its minimum width — SPEC §14.1: prominent,
+       always human-initiated. */
+    .dr-gps {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
     .dr-override {
       display: flex;
       align-items: center;
+      justify-content: flex-end;
       gap: 0.75rem;
       flex-wrap: wrap;
     }
@@ -117,6 +210,37 @@ template.innerHTML = /* html */ `
       letter-spacing: 0.08em;
       color: var(--text-muted);
     }
+    /* Pending-observations drawer: docked left, below the entry
+       tools; the list scrolls inside, the panel never grows past the
+       viewport. The whole box (toggle included) disappears when there
+       are no pending observations. */
+    .dr-pane {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      justify-content: flex-start;
+      align-items: flex-start;
+      padding: 0 8px 8px 8px;
+    }
+    .dr-drawer {
+      width: min(24rem, 100%);
+      max-height: 100%;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .dr-drawer[hidden] { display: none; }
+    .dr-drawer dr-pending-list {
+      min-height: 0;
+      overflow-y: auto;
+    }
+    /* Water-track readout: bottom-right panel — figures + the manual
+       current entry that edits the set/drift figure beside it. */
+    .dr-bottom {
+      display: flex;
+      justify-content: flex-end;
+      padding: 0 8px 8px 0;
+    }
     dialog {
       max-width: 32rem;
       width: 90vw;
@@ -131,8 +255,42 @@ template.innerHTML = /* html */ `
     }
     /* Phone-first (work doc #13 update #2): dialogs become bottom
        sheets on narrow viewports — the map stays visible around the
-       form, dismissable with ✕, re-visible on submit. */
+       form, dismissable with ✕, re-visible on submit. The corners
+       collapse to full-width bands: tools + GPS panels stack at the
+       top, the pending drawer docks as a bottom sheet directly above
+       the readout band, and the readout collapses to the
+       safety-critical figures (elapsed, divergence, current) so the
+       chart keeps the bulk of the screen. */
     @media (max-width: 600px) {
+      .dr-top {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .dr-tools,
+      .dr-override,
+      .dr-gps {
+        justify-content: flex-start;
+      }
+      #dr-log-fig,
+      #dr-method-fig {
+        display: none;
+      }
+      .dr-figure .value {
+        font-size: clamp(1.1rem, 5vw, 1.4rem);
+      }
+      .dr-pane {
+        justify-content: stretch;
+        align-items: flex-end;
+        padding: 0 8px;
+      }
+      .dr-drawer {
+        width: 100%;
+        max-height: 50vh;
+      }
+      .dr-bottom {
+        justify-content: stretch;
+        padding: 0 8px 8px;
+      }
       dialog {
         margin: auto auto 0 auto;
         width: 100vw;
@@ -144,46 +302,66 @@ template.innerHTML = /* html */ `
       }
     }
   </style>
-  <section class="sk-card theme-teal dr-headline">
-    <div class="dr-figure">
-      <span class="value" id="dr-log">— nm</span>
-      <span class="label">Water-track log</span>
-    </div>
-    <div class="dr-figure">
-      <span class="value" id="dr-elapsed">—</span>
-      <span class="label">Since last fix</span>
-    </div>
-    <div class="dr-figure">
-      <span class="value" id="dr-divergence">— nm</span>
-      <span class="label">DR vs GPS</span>
-    </div>
-    <div class="dr-figure" id="dr-current-fig">
-      <span class="value" id="dr-current">—</span>
-      <span class="label" id="dr-current-label">Current set/drift</span>
-    </div>
-    <div class="dr-figure">
-      <span class="value" id="dr-method">—</span>
-      <span class="label">Active method</span>
-    </div>
-    <div class="dr-toolbar">
-      <button id="btn-current" title="Manual set &amp; drift — the override outranks weather/pilot-chart sources while its TTL lasts">≋ Current</button>
-      <button id="btn-sight">⊕ Sight / LOP</button>
-      <button id="btn-coord-fix" title="Confirm a fix at coordinates — prefilled from the current GNSS position, editable for offline/known-position fixes">⊙ Fix at coordinates</button>
-    </div>
-  </section>
 
-  <section class="sk-card dr-status" id="dr-status-panel">
-    <span id="dr-status-text">Connecting to Signal K…</span>
-  </section>
+  <dr-map-view id="dr-map"></dr-map-view>
 
-  <section class="sk-card">
-    <dr-map-view id="dr-map"></dr-map-view>
-  </section>
+  <div class="dr-overlay">
+    <div class="dr-top">
+      <section class="sk-floating dr-tools">
+        <button id="btn-sight">⊕ Sight / LOP</button>
+        <button id="btn-coord-fix" title="Confirm a fix at coordinates — prefilled from the current GNSS position, editable for offline/known-position fixes">⊙ Fix at coordinates</button>
+        <button id="btn-pending" aria-expanded="false" aria-controls="dr-pending-drawer" hidden>◧ Pending</button>
+      </section>
 
-  <section class="sk-card">
-    <h2>Pending Observations</h2>
-    <dr-pending-list id="dr-pending"></dr-pending-list>
-  </section>
+      <section class="sk-floating dr-gps">
+        <div class="dr-status" id="dr-status-panel">
+          <span id="dr-status-text">Connecting to Signal K…</span>
+        </div>
+        <div class="dr-override">
+          <button id="dr-override-btn">Engage OVERRIDE</button>
+          <span id="dr-override-state">NORMAL (GPS authoritative)</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="dr-pane">
+      <aside class="sk-floating dr-drawer" id="dr-pending-drawer" hidden>
+        <h2>Pending Observations <button id="btn-pending-close" title="Close pending observations" aria-label="Close pending observations">✕</button></h2>
+        <dr-pending-list id="dr-pending"></dr-pending-list>
+      </aside>
+    </div>
+
+    <div class="dr-bottom">
+      <section class="sk-floating theme-teal dr-readout">
+        <div class="dr-headline">
+          <div class="dr-figure" id="dr-log-fig">
+            <span class="value" id="dr-log">— nm</span>
+            <span class="label">Water-track log</span>
+          </div>
+          <div class="dr-figure" id="dr-elapsed-fig">
+            <span class="value" id="dr-elapsed">—</span>
+            <span class="label">Since last fix</span>
+          </div>
+          <div class="dr-figure" id="dr-divergence-fig">
+            <span class="value-row">
+              <span class="value" id="dr-divergence">— nm</span>
+              <canvas id="dr-spark" width="80" height="20"></canvas>
+            </span>
+            <span class="label">DR vs GPS</span>
+          </div>
+          <div class="dr-figure" id="dr-current-fig">
+            <span class="value" id="dr-current">—</span>
+            <span class="label" id="dr-current-label">Current set/drift</span>
+          </div>
+          <div class="dr-figure" id="dr-method-fig">
+            <span class="value" id="dr-method">—</span>
+            <span class="label">Active method</span>
+          </div>
+          <button id="btn-current" title="Manual set &amp; drift — the override outranks weather/pilot-chart sources while its TTL lasts">≋ Current</button>
+        </div>
+      </section>
+    </div>
+  </div>
 
   <dialog id="current-dialog">
     <dr-current-panel id="dr-current-panel"></dr-current-panel>
@@ -200,12 +378,6 @@ template.innerHTML = /* html */ `
   <dialog id="detail-dialog">
     <dr-detail-popover id="dr-detail"></dr-detail-popover>
   </dialog>
-
-  <section class="sk-card dr-override">
-    <h2>Failover Control</h2>
-    <button id="dr-override-btn">Engage OVERRIDE</button>
-    <span id="dr-override-state">NORMAL (GPS authoritative)</span>
-  </section>
 `;
 
 class DrApp extends HTMLElement {
@@ -242,8 +414,13 @@ class DrApp extends HTMLElement {
     /** @type {HTMLDialogElement|null} */
     this.sightDialog = root.querySelector("#sight-dialog");
     /** Opens the sight dialog (entry form — the pending list lives
-     *  alongside the map now, work doc #13 stage A). */
+     *  alongside the map now, work doc #13 stage A). Seeds the sight
+     *  time first: the field is required and only self-seeds after a
+     *  submit, so a first-open would otherwise sit empty (and, since
+     *  the forms went novalidate, block on requiredMissing).
+     */
     const openSight = () => {
+      this.sight?.seedSightTime();
       this.sightDialog?.showModal();
     };
     root.querySelector("#btn-sight")?.addEventListener("click", openSight);
@@ -291,18 +468,16 @@ class DrApp extends HTMLElement {
 
     // Pending observations list (work doc #13 stage A): selection drives
     // the map highlight; preview/confirm resolve the selected subset.
+    /** @type {Set<string>} */
+    this.selectedObservations = new Set();
     /** @type {import("./dr-pending-list.js").default|null} */
     this.pendingList = root.querySelector("#dr-pending");
-    this.pendingList?.refresh();
+    this.refreshPending();
     this.pendingList?.addEventListener("dr-select-observation", (e) => {
       const { kind, id, selected } = e.detail;
       const key = `${kind}:${id}`;
-      this.selectedObservations ??= new Set();
       if (selected) this.selectedObservations.add(key);
       else this.selectedObservations.delete(key);
-      // Highlight the most recent selection; clear when none remain.
-      this.snap.highlight =
-        this.selectedObservations.size > 0 ? { kind, id } : null;
       this.render();
     });
     this.pendingList?.addEventListener("dr-candidate-resolved", (e) =>
@@ -310,9 +485,34 @@ class DrApp extends HTMLElement {
     );
     this.pendingList?.addEventListener("dr-fix-confirmed", () => {
       this.snap.candidate = null;
-      this.snap.highlight = null;
-      this.selectedObservations = new Set();
+      this.selectedObservations.clear();
       this.refreshOverlays();
+      this.refreshPending();
+    });
+
+    // Pending-observations drawer (work doc #26): the pending list
+    // docks over the chart instead of stacking under it. The whole
+    // box — toggle included — only appears once there ARE pending
+    // observations (refreshPending drives visibility); when rows
+    // first appear the drawer opens on wide screens, stays a closed
+    // bottom sheet on phones. Deliberately stateless — no
+    // persistence, every load starts from the viewport class.
+    /** @type {HTMLElement|null} */
+    this.drawer = root.querySelector("#dr-pending-drawer");
+    /** @type {HTMLButtonElement|null} */
+    this.drawerToggle = root.querySelector("#btn-pending");
+    /** @type {boolean} */
+    this.drawerOpen = false;
+    /** @type {boolean} whether the pending list had rows last refresh */
+    this._hadPending = false;
+    this.renderDrawer();
+    this.drawerToggle?.addEventListener("click", () => {
+      this.drawerOpen = !this.drawerOpen;
+      this.renderDrawer();
+    });
+    root.querySelector("#btn-pending-close")?.addEventListener("click", () => {
+      this.drawerOpen = false;
+      this.renderDrawer();
     });
 
     // Detail popover (work doc #13 update #1): map-click inspection.
@@ -353,7 +553,7 @@ class DrApp extends HTMLElement {
     // list, popover) refreshes overlays + the pending list.
     this.addEventListener("dr-observations-changed", () => {
       this.refreshOverlays();
-      this.pendingList?.refresh();
+      this.refreshPending();
     });
     this.sight?.addEventListener("dr-close", () => this.sightDialog?.close());
     // Esc closes the native dialog without a dr-close event — clear
@@ -397,10 +597,46 @@ class DrApp extends HTMLElement {
       drCourse: null,
       sparkStats: null,
       gnss: null,
-      highlight: null,
+      // The pending selection (Set of `kind:id` keys) — the map
+      // highlights EVERY selected observation, not just the latest
+      // click, so the whole subset can be sanity-checked on the
+      // chart before previewing it.
+      highlight: this.selectedObservations,
       current: null,
       manualCurrent: null,
     };
+
+    // Phone fit (verified headless 2026-09-19): the full-width readout
+    // band owns the bottom edge, so the map's bottom-left control
+    // stack (zoom, chart layers, re-center) must ride above it —
+    // otherwise the band covers the controls. The open pending
+    // drawer (a non-modal bottom sheet) counts too: zooming while
+    // checking pending observations must stay possible. Panel
+    // heights are dynamic (figures wrap, rows come and go), so
+    // measure and export the offset to the map as a custom property
+    // (it pierces the shadow boundary). Desktop keeps 0: the readout
+    // is right-docked, the drawer left-docked, no collision.
+    const readout = root.querySelector(".dr-readout");
+    if (readout && typeof ResizeObserver !== "undefined") {
+      const mq = window.matchMedia("(max-width: 600px)");
+      const syncMapOffset = () => {
+        let off = 0;
+        if (mq.matches) {
+          const tops = [readout, this.drawer]
+            .filter((el) => el && !el.hidden)
+            .map((el) => el.getBoundingClientRect().top);
+          if (tops.length > 0)
+            off = Math.ceil(window.innerHeight - Math.min(...tops)) + 8;
+        }
+        this.map?.style.setProperty("--dr-map-bottom-offset", `${off}px`);
+      };
+      const ro = new ResizeObserver(syncMapOffset);
+      ro.observe(readout);
+      if (this.drawer) ro.observe(this.drawer);
+      mq.addEventListener?.("change", syncMapOffset);
+      this._syncMapOffset = syncMapOffset;
+      syncMapOffset();
+    }
 
     this.connectStream();
     this.loadPluginConfig();
@@ -905,10 +1141,80 @@ class DrApp extends HTMLElement {
     // Headline: divergence + elapsed since last fix.
     this.shadowRoot.querySelector("#dr-divergence").textContent =
       vm.divergenceText(this.snap.divergence);
+    this.renderSparkline();
     this.map?.render(this.snap);
     // AIS ranges/leaders move with the own boat — cheap to re-shape
     // alongside the snapshot (markers are reused in the map).
     this.renderAis();
+  }
+
+  /**
+   * Draws the divergence trend sparkline (SPEC §14.1) beside the
+   * DR-vs-GPS figure — ported from the map's old bottom-right chip
+   * when that corner was assigned to this readout panel (work doc
+   * #26). The view-model's Sparkline normalizes points to 0–1, so
+   * the canvas just maps them to pixels.
+   *
+   * @returns {void}
+   */
+  renderSparkline() {
+    const canvas = this.shadowRoot.querySelector("#dr-spark");
+    const stats = this.snap.sparkStats;
+    if (!canvas || !stats || stats.points.length < 2) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const { width: w, height: h } = canvas;
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = "#4b8b99";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    stats.points.forEach((y, i) => {
+      const x = (i / (stats.points.length - 1)) * (w - 2) + 1;
+      const py = h - 2 - y * (h - 4);
+      if (i === 0) ctx.moveTo(x, py);
+      else ctx.lineTo(x, py);
+    });
+    ctx.stroke();
+  }
+
+  /**
+   * Refreshes the pending-observations list and drives the pending
+   * box's visibility (work doc #26): the whole box — toggle included
+   * — only appears when there ARE pending observations. When the
+   * first row arrives the drawer opens on wide screens (the new
+   * observation is immediately glanceable); resolving the last one
+   * closes and hides the box again.
+   *
+   * @returns {Promise<void>}
+   */
+  async refreshPending() {
+    await this.pendingList?.refresh();
+    const has = (this.pendingList?.rows?.length ?? 0) > 0;
+    if (has && !this._hadPending) {
+      this.drawerOpen = !window.matchMedia("(max-width: 600px)").matches;
+    } else if (!has) {
+      this.drawerOpen = false;
+    }
+    this._hadPending = has;
+    this.drawer?.toggleAttribute("hidden", !has);
+    this.drawerToggle?.toggleAttribute("hidden", !has);
+    this.renderDrawer();
+  }
+
+  /**
+   * Applies the pending-drawer open/closed state (work doc #26):
+   * `hidden` on the aside, mirrored as aria-expanded on the toggle
+   * (which inverts to a filled “engaged” look while open).
+   *
+   * @returns {void}
+   */
+  renderDrawer() {
+    this.drawer?.toggleAttribute("hidden", !this.drawerOpen);
+    this.drawerToggle?.setAttribute("aria-expanded", String(this.drawerOpen));
+    // The open/closed flip moves the phone bottom sheet — re-sync the
+    // map control stack's bottom offset (no resize fires for a
+    // display:none toggle on some engines).
+    this._syncMapOffset?.();
   }
 
   /**

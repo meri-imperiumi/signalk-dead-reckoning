@@ -106,7 +106,7 @@ template.innerHTML = /* html */ `
       <button id="close-btn" title="Close">✕</button>
     </h2>
     <div class="gnss" id="gnss-stats"></div>
-    <form class="form" id="form-fix">
+    <form class="form" id="form-fix" novalidate>
       <fieldset class="coord" data-prefix="fix">
         <legend>Position</legend>
         <div class="coord-lat"></div>
@@ -140,7 +140,7 @@ template.innerHTML = /* html */ `
         </label>
       </div>
       <div class="actions">
-        <button type="button" class="primary" id="confirm-btn">Confirm fix</button>
+        <button type="submit" class="primary" id="confirm-btn">Confirm fix</button>
       </div>
     </form>
     <div class="result" id="result" hidden></div>
@@ -183,9 +183,13 @@ class DrFixPanel extends HTMLElement {
     /** Last-seeded GNSS quality object for live re-seeding. */
     this.lastGnss = null;
 
-    root
-      .querySelector("#confirm-btn")
-      ?.addEventListener("click", () => this.confirm());
+    // Submit: real submit button + novalidate — Enter and click share
+    // one path (the app's own validation messages replace Safari's
+    // implicit-submission bubbles; see the sight panel's wiring).
+    this.form?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      this.confirm();
+    });
     root
       .querySelector("#close-btn")
       ?.addEventListener("click", () => this.dispatchClose());

@@ -46,23 +46,29 @@ const closeTo = (actual, expected, tol, msg) =>
     `${msg}: ${actual} vs ${expected} (±${tol})`,
   );
 
-test("lopArrowheads: bearing PL — one single arrowhead at the outer end", () => {
-  // Object bears 045°: extendLineSpec draws the ray from just past
-  // the object toward the navigator (135° side). The single arrowhead
-  // must sit at that far outer end, pointing outward along the line.
+test("lopArrowheads: bearing PL — one single arrowhead at the object end", () => {
+  // Object bears 045° from the navigator: extendLineSpec draws the
+  // ray from the charted object itself (no stub on the away side —
+  // the line must stop AT the object) toward the navigator (135°
+  // side). The single arrowhead sits at the object end, pointing
+  // INTO the object (back along the measured bearing, 315° here) —
+  // the traditional marking identifying what was sighted.
   const spec = {
     anchor: [60, 24],
     azimuthDeg: 45,
     lopType: "bearing",
   };
   const line = vm.extendLineSpec(spec, 60);
+  // The ray starts exactly at the object — no 1 nm stub past it.
+  closeTo(line[0][0], 60, 0.001, "ray starts at the object (lat)");
+  closeTo(line[0][1], 24, 0.001, "ray starts at the object (lon)");
   const arrows = vm.lopArrowheads(line, 45, "bearing");
   assert.equal(arrows.length, 1, "single arrowhead at one end only");
   assert.equal(arrows[0].double, false, "single, not double");
-  // The outer end ≈ destinationPoint([60,24], 135°, 60 nm).
-  closeTo(arrows[0].at[0], 59.293, 0.05, "outer end lat");
-  closeTo(arrows[0].at[1], 25.414, 0.05, "outer end lon");
-  closeTo(arrows[0].rotationDeg, 135, 2, "chevron points along the ray");
+  // At the object end, pointing into it (measured-bearing direction).
+  closeTo(arrows[0].at[0], 60, 0.05, "arrow at the object (lat)");
+  closeTo(arrows[0].at[1], 24, 0.05, "arrow at the object (lon)");
+  closeTo(arrows[0].rotationDeg, 315, 2, "chevron points into the object");
 });
 
 test("lopArrowheads: celestial PL — single arrowheads at both ends", () => {

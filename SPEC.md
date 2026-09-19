@@ -478,6 +478,8 @@ Celestial sight reduction and the solar-panel sanity check (§7.5) both assume t
 
 Native Web Components + OpenLayers/Leaflet (EUPL-1.2 compatible), no build tooling required.
 
+**Plotter layout:** the chart is the app — `<dr-map-view>` fills the entire viewport and every control floats over it as a translucent overlay, with a fixed corner assignment: top-left carries the bearing & fix entry tools plus the pending-observations drawer; top-right the engine status badge and the failover control; bottom-right the water-track readout (with the divergence trend sparkline) and the manual current entry beside the figure it edits; bottom-left keeps the map's own controls (zoom, chart layers, follow). The pending-observations box — toggle included — only appears while there are pending observations. The overlay layer is pointer-transparent except on the panels themselves, so the chart stays draggable between the controls; on phones the corners collapse to full-width bands and the pending drawer docks as a bottom sheet.
+
 ### 14.1 Core Capabilities
 
 - **Dual/continuous track rendering:** physical GPS track vs. the always-on inertial "Ghost Track," regardless of current mode.

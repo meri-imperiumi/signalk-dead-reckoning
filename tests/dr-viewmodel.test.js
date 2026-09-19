@@ -590,7 +590,7 @@ test("celestialSightBody: required + optional fields, assumed position shape", a
   assert.strictEqual(noonBody.noon, true);
 });
 
-test("extendLineSpec: bearing LOP draws a ray toward the navigator (reciprocal), not symmetric through the object", async () => {
+test("extendLineSpec: bearing LOP draws a ray from the object toward the navigator (reciprocal)", async () => {
   const vm = await loadVm();
   // Bearing LOP: bearing 0° (object due north of navigator). azimuth_true
   // = bearing+90 = 90. The navigator is south of the object (reciprocal).
@@ -603,11 +603,15 @@ test("extendLineSpec: bearing LOP draws a ray toward the navigator (reciprocal),
     lop_type: "bearing",
   });
   assert.strictEqual(spec.lopType, "bearing");
-  const [stub, far] = vm.extendLineSpec(spec, 30);
+  const [start, far] = vm.extendLineSpec(spec, 30);
   // Far endpoint is south of the object (toward navigator).
   assert.ok(far[0] < 60, `far lat ${far[0]} should be south of 60`);
-  // Stub is just north of the object (the short past-object tail).
-  assert.ok(stub[0] > 60, `stub lat ${stub[0]} should be north of 60`);
+  // The ray starts AT the charted object — it must not run through
+  // or past the mark it was taken from.
+  assert.ok(
+    Math.abs(start[0] - 60) < 1e-9 && Math.abs(start[1] - 24) < 1e-9,
+    `start ${start} should be the object position`,
+  );
 });
 
 test("extendLineSpec: celestial LOP stays symmetric (no lopType)", async () => {

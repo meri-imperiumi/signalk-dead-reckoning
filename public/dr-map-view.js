@@ -43,46 +43,35 @@ class DrMapView extends HTMLElement {
     const style = document.createElement("style");
     style.textContent = `
       ${THEME_CSS}
-      /* Desktop aggressively consumes viewport height; mobile keeps a
-         strict floor so the page stays scrollable (UI spec §7). */
+      /* Plotter layout (work doc #26): the map fills its host —
+         dr-app gives it the whole viewport and floats its controls
+         on top. Sizing is owned by the host app; the map just fills
+         it (the ResizeObserver below keeps Leaflet honest). */
       :host {
         display: block;
         position: relative;
-        height: max(50vh, calc(100vh - 260px));
-        min-height: 50vh;
+        width: 100%;
+        height: 100%;
         overflow: hidden;
       }
       .map-host { position: relative; width: 100%; height: 100%; }
       .map-wrap { width: 100%; height: 100%; background: var(--bg-base, #080a0c); }
       /* Floating overlays: semi-transparent dark panels with sharp 1px
          borders so they stay legible over any tileset (UI spec §7).
-         Bottom-right: the top-right corner belongs to Leaflet's layers
-         control — stacking the chip there covered the control's toggle
-         (same z-index, later sibling wins), which both looked broken and
-         swallowed the clicks that were meant to switch chart providers.
-         The bottom-right corner is free here: attribution is off. */
-      .dr-chip {
-        position: absolute;
-        bottom: 8px;
-        right: 8px;
-        z-index: 1000;
-        display: flex;
-        gap: 8px;
-        align-items: center;
-        padding: 4px 10px;
-        background-color: rgba(17, 20, 20, 0.8);
-        border: 1px solid rgba(75, 139, 153, 0.5);
-        color: var(--color-teal, #4b8b99);
-        font: 12px/1.4 ui-monospace, "Fira Code", monospace;
-        font-variant-numeric: tabular-nums;
-      }
+         Corner map (work doc #26): the top edge + bottom-right corner
+         belong to dr-app's floating panels (tools top-left, GPS
+         status & override top-right, readout bottom-right); this
+         component keeps only the bottom-left control stack — zoom,
+         chart layers, re-center — and the pick menu. Attribution is
+         off. */
       /* Re-center (follow DR position) control: the bottom-left corner
-         is the last free spot — zoom is top-left, layers top-right,
-         the divergence chip bottom-right. Filled means auto-follow is
-         ON; dragging the map pauses follow and outlines the button. */
+         is its own — the Leaflet zoom + layers stack sits directly
+         above it (bottom-left container margin clears the button).
+         Filled means auto-follow is ON; dragging the map pauses
+         follow and outlines the button. */
       .dr-recenter {
         position: absolute;
-        bottom: 8px;
+        bottom: calc(8px + var(--dr-map-bottom-offset, 0px));
         left: 8px;
         z-index: 1000;
         display: flex;
@@ -138,6 +127,25 @@ class DrMapView extends HTMLElement {
         color: var(--color-teal, #4b8b99) !important;
         border-radius: 0 !important;
         border-bottom: 1px solid rgba(255, 255, 255, 0.2) !important;
+      }
+      /* Bottom-left stack (work doc #26): zoom + layers live above the
+         re-center button, which is not a Leaflet control and doesn't
+         participate in Leaflet's stacking — an explicit bottom margin
+         on the control container clears it (8px offset + 48px button
+         + 8px gap). --dr-map-bottom-offset (set by dr-app on phones,
+         where the full-width readout band owns the bottom edge)
+         lifts the whole stack above that band — custom properties
+         pierce the shadow boundary. */
+      .leaflet-bottom.leaflet-left {
+        margin-left: 8px;
+        margin-bottom: calc(64px + var(--dr-map-bottom-offset, 0px));
+      }
+      /* Phones: pinch-zoom replaces the zoom button stack — with the
+         pending bottom sheet open, the full stack would ride high
+         enough to poke into the top control bands. The chart-layers
+         control and the re-center button stay. */
+      @media (max-width: 600px) {
+        .leaflet-control-zoom { display: none; }
       }
       .leaflet-control-layers {
         background-color: rgba(17, 20, 20, 0.8) !important;
@@ -216,19 +224,10 @@ class DrMapView extends HTMLElement {
     wrap.setAttribute("part", "map");
     wrap.className = "map-wrap";
 
-    const chip = document.createElement("div");
-    chip.setAttribute("part", "divergence");
-    chip.className = "dr-chip";
-
-    const chipText = document.createElement("span");
-    chipText.textContent = "— nm";
-    const spark = document.createElement("canvas");
-    spark.width = 80;
-    spark.height = 20;
-    spark.style.display = "block";
-    spark.style.alignSelf = "center";
-    chip.appendChild(chipText);
-    chip.appendChild(spark);
+    // The divergence chip (readout + trend sparkline) used to float
+    // here; since the plotter layout's corner assignment (work doc
+    // #26) the bottom-right corner belongs to dr-app's readout panel,
+    // which draws the divergence figure + sparkline itself.
 
     // Re-center (follow DR) control — floated over the map's bottom-left
     // corner now that the "Ghost Track" heading is gone, so the map
@@ -248,7 +247,6 @@ class DrMapView extends HTMLElement {
     const host = document.createElement("div");
     host.className = "map-host";
     host.appendChild(wrap);
-    host.appendChild(chip);
     host.appendChild(recenterBtn);
     root.appendChild(host);
     /** @type {HTMLButtonElement} */
@@ -256,10 +254,6 @@ class DrMapView extends HTMLElement {
 
     /** @type {HTMLDivElement} */
     this.mapEl = wrap;
-    /** @type {HTMLElement} */
-    this.chipText = chipText;
-    /** @type {HTMLCanvasElement} */
-    this.sparkCanvas = spark;
     /** @type {import("leaflet").Map|null} */
     this.map = null;
     this.layers = {
@@ -316,9 +310,12 @@ class DrMapView extends HTMLElement {
     this.map = L.map(this.mapEl, {
       center: [60, 24],
       zoom: 10,
-      zoomControl: true,
+      // Bottom-left, stacked above the re-center button (work doc
+      // #26): the top corners belong to dr-app's floating controls.
+      zoomControl: false,
       attributionControl: false,
     });
+    L.control.zoom({ position: "bottomleft" }).addTo(this.map);
     for (const key of Object.keys(this.layers)) {
       this.layers[key] = L.layerGroup().addTo(this.map);
     }
@@ -471,7 +468,7 @@ class DrMapView extends HTMLElement {
           .layers(
             bases,
             { "AIS traffic": this.layers.ais },
-            { collapsed: true },
+            { collapsed: true, position: "bottomleft" },
           )
           .addTo(this.map);
       })
@@ -802,9 +799,6 @@ class DrMapView extends HTMLElement {
     this.renderSnaps(snap.corrections ?? [], vm);
     this.renderCandidate(snap.candidate);
     this.renderAdvancements(snap.candidate?.advancements ?? null, snap);
-
-    // Divergence readout + sparkline.
-    this.renderDivergence(snap.divergence, snap.sparkStats);
   }
 
   /**
@@ -1015,7 +1009,8 @@ class DrMapView extends HTMLElement {
   /**
    * @param {Array<object>} lops
    * @param {object} vm
-   * @param {{kind: string, id: number}|null} [highlight]
+   * @param {Set<string>|null} [highlight] - selected `kind:id` keys —
+   *   every selected LOP renders highlighted, not just the latest
    * @returns {void}
    */
   renderLops(lops, vm, highlight) {
@@ -1023,15 +1018,14 @@ class DrMapView extends HTMLElement {
     for (const lop of lops) {
       const spec = vm.lopLineSpec(lop);
       const line = vm.extendLineSpec(spec, 60);
-      const hl = highlight?.kind === "lop" && highlight.id === lop.lop_id;
-      const color = hl
-        ? "#ffffff"
-        : spec.used
-          ? vm.STYLE.lopUsed
-          : vm.STYLE.lop;
+      const hl = highlight?.has(`lop:${lop.lop_id}`) === true;
+      // Selection keeps the line's semantic color (orange = active
+      // constraint, grey = used) — white vanished over light chart
+      // tiles — and emphasizes with weight instead.
+      const color = spec.used ? vm.STYLE.lopUsed : vm.STYLE.lop;
       L.polyline(line, {
         color,
-        weight: hl ? 3.5 : 1.5,
+        weight: hl ? 4.5 : 1.5,
         opacity: 0.9,
       })
         .bindTooltip(
@@ -1042,9 +1036,9 @@ class DrMapView extends HTMLElement {
           this.dispatchInspect("lop", lop.lop_id),
         )
         .addTo(this.layers.lops);
-      // Traditional chartwork marking: single arrowhead at the outer
-      // end for a bearing PL; single arrowheads at both ends for an
-      // astronomical PL.
+      // Traditional chartwork marking: single arrowhead at the object
+      // end, pointing into the sighted mark, for a bearing PL; single
+      // arrowheads at both ends for an astronomical PL.
       this.renderArrows(
         vm.lopArrowheads(line, spec.azimuthDeg, spec.lopType),
         color,
@@ -1056,7 +1050,8 @@ class DrMapView extends HTMLElement {
   /**
    * @param {Array<object>} cpls
    * @param {object} vm
-   * @param {{kind: string, id: number}|null} [highlight]
+   * @param {Set<string>|null} [highlight] - selected `kind:id` keys
+   *   (every selected CPL renders highlighted)
    * @param {[number, number]|null|undefined} [drPosition] - live DR
    *   position; centers the traditional range arc on the navigator
    * @returns {void}
@@ -1065,12 +1060,10 @@ class DrMapView extends HTMLElement {
     this.layers.cpls.clearLayers();
     for (const cpl of cpls) {
       const spec = vm.cplCircleSpec(cpl);
-      const hl = highlight?.kind === "cpl" && highlight.id === cpl.cpl_id;
-      const color = hl
-        ? "#ffffff"
-        : spec.used
-          ? vm.STYLE.cplUsed
-          : vm.STYLE.cpl;
+      const hl = highlight?.has(`cpl:${cpl.cpl_id}`) === true;
+      // Selection keeps the semantic color and emphasizes with
+      // weight (white was invisible over light tiles — see LOPs).
+      const color = spec.used ? vm.STYLE.cplUsed : vm.STYLE.cpl;
       // Traditional chartwork marking: a range CPL draws as an arc
       // around the navigator with a single arrowhead at both arc
       // ends; the full dashed circle stays underneath (faded) as the
@@ -1080,7 +1073,7 @@ class DrMapView extends HTMLElement {
         radius: spec.radiusNm * 1852,
         color,
         fillOpacity: 0.05,
-        weight: hl ? 3.5 : 1.5,
+        weight: hl ? 4.5 : 1.5,
         opacity: arc ? 0.4 : 0.9,
         dashArray: "6 4",
       })
@@ -1094,7 +1087,7 @@ class DrMapView extends HTMLElement {
       if (arc) {
         L.polyline(arc.points, {
           color,
-          weight: hl ? 3.5 : 2,
+          weight: hl ? 5 : 2,
           opacity: 0.9,
           dashArray: "6 4",
           interactive: false,
@@ -1341,31 +1334,6 @@ class DrMapView extends HTMLElement {
         entry.leader = null;
       }
     }
-  }
-
-  /**
-   * @param {{distance_nm: number, bearing_true: number}|null} divergence
-   * @param {object|null} [sparkStats]
-   * @returns {void}
-   */
-  renderDivergence(divergence, sparkStats) {
-    this.chipText.textContent = vm
-      ? vm.divergenceText(divergence)
-      : `${divergence?.distance_nm?.toFixed(2) ?? "—"} nm`;
-    const ctx = this.sparkCanvas.getContext("2d");
-    if (!ctx || !sparkStats || sparkStats.points.length < 2) return;
-    const { width: w, height: h } = this.sparkCanvas;
-    ctx.clearRect(0, 0, w, h);
-    ctx.strokeStyle = "#4b8b99";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    sparkStats.points.forEach((y, i) => {
-      const x = (i / (sparkStats.points.length - 1)) * (w - 2) + 1;
-      const py = h - 2 - y * (h - 4);
-      if (i === 0) ctx.moveTo(x, py);
-      else ctx.lineTo(x, py);
-    });
-    ctx.stroke();
   }
 }
 

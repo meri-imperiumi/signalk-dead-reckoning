@@ -94,6 +94,46 @@ export const THEME_CSS = `
     border-top: none;
   }
 
+  /* Floating overlay panels (plotter layout, work doc #26): the
+     chart fills the viewport and the controls ride on top of it.
+     Same flat geometry and mounting brackets as .sk-card, but
+     translucent so chart context shows through, and more compact —
+     overlays must not eat the viewport the chart was given. The
+     color-mix line sits after a solid fallback: browsers without
+     color-mix keep an opaque panel (still legible, just not see-
+     through). Day mode lifts --bg-panel, and translucency alone must
+     not drop contrast over light tiles — the border + brackets
+     carry the panel edge either way. */
+  .sk-floating {
+    position: relative;
+    background: var(--bg-panel, #111414);
+    background: color-mix(in srgb, var(--bg-panel, #111414) 88%, transparent);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 0;
+    padding: 0.5rem 0.75rem;
+  }
+  .sk-floating::before,
+  .sk-floating::after {
+    content: "";
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--theme-color);
+    pointer-events: none;
+  }
+  .sk-floating::before {
+    top: -2px;
+    left: -2px;
+    border-right: none;
+    border-bottom: none;
+  }
+  .sk-floating::after {
+    bottom: -2px;
+    right: -2px;
+    border-left: none;
+    border-top: none;
+  }
+
   /* Headers: small, bold, uppercase, tracked, theme-colored */
   h2 {
     margin: 0 0 0.75rem 0;
@@ -194,7 +234,7 @@ export const THEME_CSS = `
   }
 
   :focus-visible {
-    outline: 1px dashed var(--color-teal, #4b8b99);
+    outline: 1px solid var(--color-teal, #4b8b99);
     outline-offset: 2px;
   }
 `;

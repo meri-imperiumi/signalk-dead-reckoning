@@ -342,13 +342,12 @@ export function extendLineSpec(spec, lengthNm = 60) {
   const perp = (spec.azimuthDeg + 90) % 360;
   if (spec.lopType === "bearing") {
     // perp already points toward the navigator (reciprocal of the
-    // measured bearing). Draw a ray from just past the object (the
-    // short stub on the away side) toward the navigator's side.
-    const away = (perp + 180) % 360;
-    return [
-      destinationPoint(spec.anchor, away, 1),
-      destinationPoint(spec.anchor, perp, lengthNm),
-    ];
+    // measured bearing). The ray starts AT the charted object and
+    // extends toward the navigator's side — a bearing PL never runs
+    // through or past the mark it was taken from (sea trial
+    // 2026-09-19: the old 1 nm stub on the away side read as the line
+    // crossing the object).
+    return [spec.anchor, destinationPoint(spec.anchor, perp, lengthNm)];
   }
   return [
     destinationPoint(spec.anchor, perp, lengthNm),
@@ -360,14 +359,14 @@ export function extendLineSpec(spec, lengthNm = 60) {
  * Traditional chartwork arrowheads for position lines (SPEC §14.1):
  *
  * - **Bearing of a terrestrial object**: a single arrowhead at the
- *   outer end — the ray's far end on the observer's side, away from
- *   the object.
+ *   object end of the ray, pointing INTO the observed object — the
+ *   traditional marking that identifies what was sighted (sea trial
+ *   2026-09-19: pointing outward at the far end read backwards, as
+ *   if the line ran the other way).
  * - **Astronomical observation** (and any other symmetric line): a
- *   single arrowhead at both ends.
+ *   single arrowhead at both ends, pointing outward along the line.
  * - **Transferred** (running-fix advanced line): a double arrowhead
  *   at both ends.
- *
- * Arrowheads point outward along the line at each end.
  *
  * @param {Array<[number, number]>} line - extended LOP endpoints (≥2)
  * @param {number} azimuthDeg - true bearing of the observed object
@@ -387,12 +386,13 @@ export function lopArrowheads(line, azimuthDeg, lopType, transferred = false) {
     return ends.map((e) => ({ ...e, double: true }));
   }
   if (lopType === "bearing") {
-    // The outer end: the endpoint lying toward azimuth + 90° — for a
-    // bearing PL that is the far end of the ray away from the charted
-    // object (extendLineSpec draws it through destinationPoint at the
-    // same bearing, so the match is exact).
+    // The object end: the endpoint AT the charted object — the ray's
+    // start, lying toward azimuth + 270° from the line's midpoint
+    // (extendLineSpec anchors it there exactly, so the match is
+    // exact). The arrow points outward at that end, i.e. INTO the
+    // object — back along the measured bearing.
     const mid = [(first[0] + last[0]) / 2, (first[1] + last[1]) / 2];
-    const target = (azimuthDeg + 90) % 360;
+    const target = (azimuthDeg + 270) % 360;
     const off = (b) => Math.abs(((b - target + 540) % 360) - 180);
     const pick =
       off(bearingBetween(mid, first)) <= off(bearingBetween(mid, last))

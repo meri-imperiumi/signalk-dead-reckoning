@@ -300,13 +300,17 @@ class DrPendingList extends HTMLElement {
     const confirmBtn = this.shadowRoot.querySelector("#confirm-btn");
     // One selected observation resolves as a running fix against the
     // last confirmed fix; two or more resolve as an ordinary fix.
+    // The button label is the same action either way — preview —
+    // with the single-selection running-fix mode explained by the
+    // tooltip and named in the status line once the candidate is
+    // ready ("candidate ready · running fix").
     previewBtn.disabled = n < 1;
     previewBtn.textContent =
+      n > 0 ? `Preview selected (${n})` : "Preview selected";
+    previewBtn.title =
       n === 1
-        ? "Running fix (1)"
-        : n > 1
-          ? `Preview selected (${n})`
-          : "Preview selected";
+        ? "One observation resolves as a running fix against the last confirmed fix"
+        : "";
     confirmBtn.disabled = !this.candidate;
     const runTag = this.candidate?.derived_from_fix_id ? " · running fix" : "";
     this.statusEl.textContent = this.candidate
