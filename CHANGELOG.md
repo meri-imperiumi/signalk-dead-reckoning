@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-09-21
+
 ### Added
 - **The active Signal K route renders on the chart.** When the
   own-vessel course state carries an active route
