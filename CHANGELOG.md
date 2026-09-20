@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The active Signal K route renders on the chart.** When the
+  own-vessel course state carries an active route
+  (`navigation.course.activeRoute.href` — the discovery pattern
+  Freeboard-SK uses), the webapp fetches the route resource from
+  `/signalk/v1/api/resources/routes/{id}` and draws it in the
+  chartplotter convention: a magenta leg line over a dark casing,
+  one waypoint marker per point, and the point currently being
+  navigated to (`pointIndex`) emphasized with a filled marker and a
+  "— next" tooltip. Waypoint names from the route's
+  `coordinatesMeta` label the markers; the layer is toggleable via
+  the map's layers control ("Active route"). The route clears when
+  the course is cancelled, re-renders from cache on waypoint
+  advances (no refetch), and seeds from the REST self snapshot so a
+  route activated before the page loaded shows immediately.
+
 ## [0.11.1] - 2026-09-20
 
 ### Changed

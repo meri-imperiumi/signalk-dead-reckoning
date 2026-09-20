@@ -47,6 +47,10 @@ export const STYLE = {
   ais: "#c77bd9",
   aisBuddy: "#6b9e78",
   aisExpiring: "#888899",
+  // Active Signal K route (navigation.course.activeRoute): the
+  // chartplotter convention — routes draw magenta, distinct from
+  // every DR-family color above so own track never reads as plan.
+  route: "#d05fa2",
   fix: {
     gps: "#6b9e78",
     celestial: "#c77b28",
@@ -2024,4 +2028,126 @@ export function aisTargetsForRender(store, nowMs, own, opts = {}) {
   }
   if (own) specs.sort((a, b) => (a.rangeNm ?? 0) - (b.rangeNm ?? 0));
   return specs;
+}
+
+/**
+ * Extracts the resource id from a Signal K resource href —
+ * `/resources/routes/{id}` → `{id}`, `/resources/waypoints/{id}` →
+ * `{id}`. Freeboard-SK parses the same trailing segment off
+ * `navigation.course.activeRoute.href` to look the route up.
+ *
+ * @param {string|null|undefined} href
+ * @returns {string|null} resource id, or null when not a resource href
+ */
+export function resourceIdFromHref(href) {
+  if (typeof href !== "string" || href.length === 0) return null;
+  const segs = href.split("/").filter((s) => s.length > 0);
+  return segs.length > 0 ? segs[segs.length - 1] : null;
+}
+
+/**
+ * Unwraps a Signal K value node: the REST tree wraps leaves as
+ * `{value, timestamp, $source}`, stream deltas carry bare values.
+ * The course subtree arrives both ways (REST self-snapshot seed,
+ * stream deltas), so both shapes must parse.
+ *
+ * @param {unknown} v
+ * @returns {unknown} the bare value
+ */
+function unwrapValue(v) {
+  return v && typeof v === "object" && "value" in v ? v.value : v;
+}
+
+/**
+ * Parses the own-vessel course state (`navigation.course.*` value
+ * object, or the same subtree from the REST self snapshot) into the
+ * active-route state the webapp tracks: which route is the current
+ * destination, and which of its points the boat is steering toward.
+ * A course without an activeRoute (single-waypoint destination) or a
+ * missing/null subtree yields null — the route layer clears.
+ *
+ * @param {object|null|undefined} course - `navigation.course` value
+ * @returns {{id: string, pointIndex: number}|null}
+ */
+export function activeRouteFromCourse(course) {
+  // Both REST shapes occur: the whole activeRoute node wrapped
+  // ({value: {href…}}) and/or individual leaves wrapped
+  // ({href: {value…}}). Unwrap both.
+  const active = unwrapValue(course?.activeRoute);
+  const href = unwrapValue(active?.href);
+  const id = resourceIdFromHref(href);
+  if (!id) return null;
+  const idx = unwrapValue(active?.pointIndex);
+  return {
+    id,
+    pointIndex: Number.isFinite(idx) && idx >= 0 ? idx : -1,
+  };
+}
+
+/**
+ * Shapes a Signal K route resource (`GET /signalk/v1/api/resources/routes/{id}`
+ * — a GeoJSON Feature whose LineString geometry carries the leg
+ * vertices as [lon, lat]) into the map's render spec: Leaflet-order
+ * points, the route name, and the index of the point currently being
+ * navigated to. Mirrors Freeboard-SK's route normalization: name
+ * falls back to a short-id label when the resource carries none, and
+ * a target index outside the point list degrades to "no highlight"
+ * rather than pointing at a wrong waypoint.
+ *
+ * @param {object|null|undefined} routeResource - route resource value
+ * @param {string} id - resource id (for the fallback name)
+ * @param {number} [pointIndex=-1] - active point index from the course
+ * @returns {{name: string, points: Array<[number, number]>,
+ *   targetIndex: number}|null} null when the resource has no geometry
+ */
+export function routeRenderSpec(routeResource, id, pointIndex = -1) {
+  const coords = routeResource?.feature?.geometry?.coordinates;
+  if (!Array.isArray(coords) || coords.length < 2) return null;
+  const points = [];
+  for (const c of coords) {
+    if (!Array.isArray(c) || !Number.isFinite(c[0]) || !Number.isFinite(c[1])) {
+      continue;
+    }
+    // GeoJSON order is [lon, lat]; the map wants [lat, lon].
+    points.push([c[1], c[0]]);
+  }
+  if (points.length < 2) return null;
+  const name =
+    typeof routeResource?.name === "string" && routeResource.name.length > 0
+      ? routeResource.name
+      : typeof routeResource?.feature?.properties?.name === "string" &&
+          routeResource.feature.properties.name.length > 0
+        ? routeResource.feature.properties.name
+        : `Route ${id.slice(-6)}`;
+  const targetIndex =
+    Number.isFinite(pointIndex) && pointIndex >= 0 && pointIndex < points.length
+      ? pointIndex
+      : -1;
+  return { name, points, targetIndex };
+}
+
+/**
+ * Waypoint labels for the active route, from the resource's
+ * coordinatesMeta (Freeboard-SK's per-point metadata — name carried
+ * per waypoint). Unnamed or absent metadata falls back to the
+ * traditional "WP n" numbering, 1-based.
+ *
+ * @param {object|null|undefined} routeResource
+ * @param {number} count - number of route points
+ * @returns {Array<string>} one label per point
+ */
+export function routeWaypointLabels(routeResource, count) {
+  const meta = Array.isArray(
+    routeResource?.feature?.properties?.coordinatesMeta,
+  )
+    ? routeResource.feature.properties.coordinatesMeta
+    : [];
+  const labels = [];
+  for (let i = 0; i < count; i++) {
+    const name = meta[i]?.name;
+    labels.push(
+      typeof name === "string" && name.length > 0 ? name : `WP ${i + 1}`,
+    );
+  }
+  return labels;
 }

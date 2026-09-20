@@ -275,6 +275,7 @@ class DrMapView extends HTMLElement {
       candidate: null,
       advancements: null,
       ais: null,
+      route: null,
     };
     this.tileLayers = {};
     this.follow = true;
@@ -469,11 +470,16 @@ class DrMapView extends HTMLElement {
         first?.addTo(this.map);
         // Always mounted (even single-chart installs): the AIS traffic
         // overlay (work doc #23) needs its checkbox so the chart can be
-        // de-cluttered.
+        // de-cluttered, and the active Signal K route too (a route
+        // crossing the leg being sailed shouldn't be forced on top of
+        // the chartwork).
         L.control
           .layers(
             bases,
-            { "AIS traffic": this.layers.ais },
+            {
+              "AIS traffic": this.layers.ais,
+              "Active route": this.layers.route,
+            },
             { collapsed: true, position: "bottomleft" },
           )
           .addTo(this.map);
@@ -1229,6 +1235,55 @@ class DrMapView extends HTMLElement {
       iconAnchor: [size / 2, size / 2],
       html: `<div style="${rot}"><svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">${paths}</svg></div>`,
     });
+  }
+
+  /**
+   * Renders the currently active Signal K route
+   * (`navigation.course.activeRoute`, discovered the Freeboard-SK
+   * way — href → `/resources/routes/{id}` fetch): a magenta leg line
+   * through the route's waypoints with one marker per waypoint, the
+   * point currently being navigated to emphasized. Dr-app pushes a
+   * `routeRenderSpec`; null (course cleared, or a destination that
+   * isn't a route) empties the layer. The whole layer is toggleable
+   * via the layers control ("Active route").
+   *
+   * @param {{name: string, points: Array<[number, number]>,
+   *   targetIndex: number, labels?: Array<string>}|null} spec
+   * @returns {void}
+   */
+  renderRoute(spec) {
+    const layer = this.layers.route;
+    if (!layer) return;
+    layer.clearLayers();
+    if (!spec || spec.points?.length < 2) return;
+    // Route line over a dark casing — same cartographic trick as the
+    // ghost track so the magenta stays legible over light raster tiles.
+    L.polyline(spec.points, {
+      color: vm.STYLE.track.casingColor,
+      weight: 4.5,
+      opacity: 0.85,
+      interactive: false,
+    }).addTo(layer);
+    L.polyline(spec.points, {
+      color: vm.STYLE.route,
+      weight: 2.5,
+      opacity: 0.95,
+    })
+      .bindTooltip(spec.name, { direction: "top" })
+      .addTo(layer);
+    for (let i = 0; i < spec.points.length; i++) {
+      const target = i === spec.targetIndex;
+      const label = spec.labels?.[i] ?? `WP ${i + 1}`;
+      L.circleMarker(spec.points[i], {
+        radius: target ? 6 : 4,
+        color: vm.STYLE.route,
+        fillColor: target ? vm.STYLE.route : "transparent",
+        fillOpacity: target ? 0.9 : 0,
+        weight: 2,
+      })
+        .bindTooltip(target ? `${label} — next` : label, { direction: "top" })
+        .addTo(layer);
+    }
   }
 
   /**

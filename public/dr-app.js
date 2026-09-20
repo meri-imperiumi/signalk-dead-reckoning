@@ -707,6 +707,22 @@ class DrApp extends HTMLElement {
      * @type {string|null}
      */
     this.shadowContext = null;
+    /**
+     * Active Signal K route (navigation.course.activeRoute), discovered
+     * the Freeboard-SK way: the course state carries a resource href,
+     * the route geometry is fetched from `/resources/routes/{id}`.
+     * @type {{id: string, pointIndex: number}|null}
+     */
+    this.activeRoute = null;
+    /** Route resources fetched this session — pointIndex deltas
+     * re-render from cache without a refetch. @type {Map<string, object>} */
+    this.routeCache = new Map();
+    /** Cache-buster key of the route spec currently on the map. */
+    this.routeRenderedKey = null;
+    /** Route ids with a fetch in progress — the 1 Hz course stream
+     * would otherwise re-issue the request until it lands.
+     * @type {Set<string>|null} */
+    this.routeFetchInFlight = null;
     this.snap = {
       drPosition: null,
       gpsPosition: null,
@@ -829,6 +845,12 @@ class DrApp extends HTMLElement {
       "environment.mode",
       "environment.current.setTrue",
       "environment.current.drift",
+      // Active route (Freeboard-SK's discovery pattern): the course
+      // provider publishes the whole activeRoute object — href, name,
+      // pointIndex, pointTotal — as ONE delta value at this path (not
+      // leaf paths; verified on the wire), pointing at
+      // `/resources/routes/{id}`.
+      "navigation.course.activeRoute",
     ]);
     // AIS targets (work doc #23): same socket, `vessels.*` scope — the
     // protocol scopes each subscribe message to its context. Static
@@ -942,10 +964,66 @@ class DrApp extends HTMLElement {
           hdop: pick("horizontalDilution"),
         });
       }
+      // Active route seed (Freeboard-SK pattern): the REST self snapshot
+      // carries the full course subtree, so a route activated before the
+      // page loaded shows immediately without waiting for a delta.
+      const active = vm.activeRouteFromCourse(nav?.navigation?.course);
+      if (active && active.id !== this.activeRoute?.id) {
+        this.activeRoute = active;
+        this.refreshActiveRoute();
+      }
       this.render();
     } catch {
       /* REST unavailable — stream will drive when it can */
     }
+  }
+
+  /**
+   * Fetches and renders the currently active Signal K route. The course
+   * state names the route by href (Freeboard-SK's discovery pattern);
+   * the geometry — a GeoJSON Feature per Signal K's route resources —
+   * comes from `/resources/routes/{id}` and is cached for the session
+   * so pointIndex advances re-render without a refetch. A null route
+   * (course cleared, single-waypoint destination) clears the map layer.
+   *
+   * @returns {Promise<void>}
+   */
+  async refreshActiveRoute() {
+    const active = this.activeRoute;
+    if (!active) {
+      this.routeRenderedKey = null;
+      this.map?.renderRoute(null);
+      return;
+    }
+    let resource = this.routeCache.get(active.id);
+    if (!resource) {
+      if (this.routeFetchInFlight?.has(active.id)) return; // already fetching
+      // Signal K v2 resources API — route/waypoint resources with a
+      // resource-provider backend are served under /signalk/v2 (the v1
+      // path 404s; Freeboard-SK also uses v2).
+      (this.routeFetchInFlight ??= new Set()).add(active.id);
+      try {
+        const res = await fetch(
+          `/signalk/v2/api/resources/routes/${encodeURIComponent(active.id)}`,
+        );
+        if (!res.ok) return; // resource unavailable — next course delta retries
+        resource = await res.json();
+        this.routeCache.set(active.id, resource);
+      } catch {
+        return; // REST unavailable — next course delta retries
+      } finally {
+        this.routeFetchInFlight.delete(active.id);
+      }
+    }
+    const spec = vm.routeRenderSpec(resource, active.id, active.pointIndex);
+    if (!spec) return;
+    // Skip re-renders for course updates that don't change anything
+    // visible (the stream repeats the whole course subtree at 1 Hz).
+    const key = `${active.id}:${active.pointIndex}:${spec.points.length}`;
+    if (key === this.routeRenderedKey) return;
+    this.routeRenderedKey = key;
+    spec.labels = vm.routeWaypointLabels(resource, spec.points.length);
+    this.map?.renderRoute(spec);
   }
 
   /**
@@ -1141,6 +1219,24 @@ class DrApp extends HTMLElement {
           this.sight?.setMagneticVariation(vm.radToDeg(value));
         }
         break;
+      case "navigation.course.activeRoute": {
+        // Route activation / advancement / cancellation (null when the
+        // course clears). The value carries href, pointIndex and
+        // pointTotal together — one parse covers all three; only an
+        // actual change triggers work (the stream repeats the subtree).
+        const next = vm.activeRouteFromCourse({ activeRoute: value });
+        const prev = this.activeRoute;
+        if (
+          (next?.id ?? null) === (prev?.id ?? null) &&
+          (next?.pointIndex ?? -1) === (prev?.pointIndex ?? -1)
+        ) {
+          break;
+        }
+        this.activeRoute = next;
+        this.refreshActiveRoute();
+        break;
+      }
+      case "environment.current.setTrue":
       case "environment.current.setTrue":
         // Bus value is radians; the snap (and /status) carry degrees.
         if (Number.isFinite(value)) {
