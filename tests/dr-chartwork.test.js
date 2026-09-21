@@ -210,17 +210,42 @@ test("dr-map-view: fixes plot as outlined triangle/circle with a dot", () => {
 });
 
 test("chartwork labels: times are always Z", () => {
-  // 2026-09-17T02:30:00Z → "02:30".
+  // 2026-09-17T02:30:00Z → "02:30". The fix label's age test needs a
+  // pinned clock (the default is the real one), so the “today” case
+  // stays deterministic.
+  const now = Date.UTC(2026, 8, 17, 12, 0);
   assert.equal(vm.clockTextZ(Date.UTC(2026, 8, 17, 2, 30)), "02:30");
-  assert.equal(vm.fixTimeLabel("2026-09-17T02:30:00.000Z"), "Fix 02:30Z");
-  assert.equal(vm.fixTimeLabel(null), "");
-  assert.equal(vm.fixTimeLabel("not-a-date"), "");
+  assert.equal(vm.fixTimeLabel("2026-09-17T02:30:00.000Z", now), "Fix 02:30Z");
+  assert.equal(vm.fixTimeLabel(null, now), "");
+  assert.equal(vm.fixTimeLabel("not-a-date", now), "");
   // A local-time-looking timestamp still renders as its Z value:
   // 2026-09-17T05:30+03:00 === 02:30Z.
-  assert.equal(vm.fixTimeLabel("2026-09-17T05:30:00+03:00"), "Fix 02:30Z");
+  assert.equal(vm.fixTimeLabel("2026-09-17T05:30:00+03:00", now), "Fix 02:30Z");
   assert.equal(vm.drTimeLabel(Date.UTC(2026, 8, 17, 2, 50)), "DR 02:50Z");
   assert.equal(vm.drTimeLabel(null), "");
   assert.equal(vm.drTimeLabel(Number.NaN), "");
+});
+
+test("chartwork labels: fixes over a day old carry their date", () => {
+  const now = Date.UTC(2026, 8, 21, 12, 0);
+  // Exactly 24h old — still same-day rendering boundary… over it:
+  assert.equal(
+    vm.fixTimeLabel("2026-09-19T12:00:00.000Z", now),
+    "Fix 19.9. 12:00Z",
+  );
+  // Two days ago, and a date-rendering case with single-digit day/month.
+  assert.equal(
+    vm.fixTimeLabel("2026-09-18T02:36:00.000Z", now),
+    "Fix 18.9. 02:36Z",
+  );
+  assert.equal(
+    vm.fixTimeLabel("2026-01-02T02:36:00.000Z", now),
+    "Fix 2.1. 02:36Z",
+  );
+  // Under a day → time only.
+  assert.equal(vm.fixTimeLabel("2026-09-21T02:36:00.000Z", now), "Fix 02:36Z");
+  // Future timestamp (bad clock) → time only, not a bogus date.
+  assert.equal(vm.fixTimeLabel("2026-09-22T02:36:00.000Z", now), "Fix 02:36Z");
 });
 
 test("courseText: traditional course-line label", () => {

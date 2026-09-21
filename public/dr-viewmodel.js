@@ -517,14 +517,24 @@ export function clockTextZ(ms) {
 
 /**
  * Traditional chartwork fix label: "Fix 02:30Z" — the plotted fix
- * carries its time. Invalid/missing timestamp → "".
+ * carries its time. Fixes older than a day also carry their date
+ * ("Fix 18.9. 02:36Z") — a 7-day history window means most fixes on
+ * the chart are NOT from today, and the time alone is ambiguous.
+ * Invalid/missing timestamp → "".
  *
  * @param {string} iso - fix row timestamp
+ * @param {number} [nowMs=Date.now()] - wall clock for the age test
+ *   (the renderer passes nothing; tests pin it)
  * @returns {string}
  */
-export function fixTimeLabel(iso) {
+export function fixTimeLabel(iso, nowMs = Date.now()) {
   const t = Date.parse(iso);
-  return Number.isFinite(t) ? `Fix ${clockTextZ(t)}Z` : "";
+  if (!Number.isFinite(t)) return "";
+  if (nowMs - t > 24 * 3600 * 1000) {
+    const d = new Date(t);
+    return `Fix ${d.getUTCDate()}.${d.getUTCMonth() + 1}. ${clockTextZ(t)}Z`;
+  }
+  return `Fix ${clockTextZ(t)}Z`;
 }
 
 /**

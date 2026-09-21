@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reload it).
 
 ### Added
+- **Fixes over a day old carry their date on the chart** —
+  "Fix 18.9. 02:36Z" instead of the ambiguous "Fix 02:36Z". With the
+  new 7-day history window most fixes on the chart aren't from
+  today, so the time alone no longer identifies the fix. Under 24 h
+  the label is unchanged.
 - **History-aware chart window: tracks, overlays and trip
   boundaries.** The webapp now shows the last
   `max(7 days, since trip start)` on the chart instead of nothing:
