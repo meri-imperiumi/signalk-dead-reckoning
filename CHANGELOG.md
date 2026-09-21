@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Hosted plotter widgets showed as empty black squares with no
+  data** (sea trial 2026-09-21). Two independent bugs, both in the
+  widget host, both reproducible with a locally served webapp against
+  a stub Signal K server:
+  - The bus port captured the widget iframe's `contentWindow` at
+    context creation — but a browser replaces that Window object when
+    the frame navigates from `about:blank` to its `src` (and the
+    frame is still detached, window `null`, when the context is
+    created). Every message from the loaded widget was silently
+    dropped: the handshake never completed and the tile sat on its
+    placeholder grid. The port now resolves the live window per
+    message (`liveWindowPort`).
+  - A placement restored from layout storage (page reload) rendered
+    an empty dark cell forever: the area element renders its cells
+    before discovery has created the widget contexts, and the iframe
+    was only adopted at cell creation. Adoption is now idempotent —
+    every render adopts a context's iframe into its cell unless it's
+    already home (never re-parenting a live iframe, which would
+    reload it).
+
 ### Added
 - **History-aware chart window: tracks, overlays and trip
   boundaries.** The webapp now shows the last

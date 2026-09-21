@@ -368,9 +368,23 @@ test("dr-ext-host: sandboxed same-origin iframes, origin-pinned bus", () => {
     hostSrc,
     /allow-top-navigation|allow-popups|allow-modals/,
   );
+  // The bus port must resolve the iframe's CURRENT window per message:
+  // an iframe's Window object is replaced when it navigates from
+  // about:blank to its src (and is null while the frame is still
+  // detached — contexts are created before the area adopts the
+  // iframe). A port that captured the peer window at context creation
+  // silently dropped every message from the loaded widget (sea trial
+  // 2026-09-21: the dr-status tile showed an empty dark square).
+  assert.match(hostSrc, /liveWindowPort\(ctx\.iframe, this\.origin\)/);
   assert.match(
     hostSrc,
-    /windowPort\(ctx\.iframe\.contentWindow, \{ origin: this\.origin \}\)/,
+    /iframe\.contentWindow\?\.postMessage\(data, origin\)/,
+    "port posts to the live window",
+  );
+  assert.match(
+    hostSrc,
+    /ev\.source !== iframe\.contentWindow/,
+    "port listens against the live window",
   );
 });
 
@@ -413,6 +427,25 @@ test("dr-ext-host: dialogs are persistent for panels, transient for removal", ()
   assert.match(hostSrc, /ctx\.dialog = dlg;/);
   assert.match(hostSrc, /dlg\.addEventListener\("close", \(\) => \{/);
   assert.match(hostSrc, /this\.openConfig = \{\s*ctx,\s*dialog: ctx\.dialog,/s);
+});
+
+test("dr-ext-host: a restored placement's iframe is adopted once its context exists", () => {
+  // Page-load ordering: attachArea renders cells BEFORE discovery
+  // creates the widget contexts, so a placement restored from layout
+  // storage would render an empty dark square forever if the iframe
+  // were only adopted at cell creation (sea trial 2026-09-21).
+  // Adoption must be idempotent per render — and never re-parent a
+  // live iframe (re-parenting reloads the frame).
+  assert.match(
+    hostSrc,
+    /const ctx = this\.manager\?\.widgetCtxs\.get\(p\.instanceId\);/,
+    "render looks the context up on every pass",
+  );
+  assert.match(
+    hostSrc,
+    /if \(ctx && ctx\.iframe\.parentElement !== cell\) \{/,
+    "iframe adopted only when not already home",
+  );
 });
 
 test("vendor: host bus entry is vendored alongside the extension side", () => {

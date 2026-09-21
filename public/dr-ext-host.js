@@ -31,7 +31,6 @@ import {
   HostConnection,
   RPC_ERRORS,
   RpcError,
-  windowPort,
 } from "./vendor/plotterext-bus/host.js";
 
 /** Display metadata for the handshake. The host *API* version is the
@@ -320,7 +319,7 @@ export class PlotterExtHost {
    */
   connectCtx(ctx) {
     const conn = new HostConnection({
-      port: windowPort(ctx.iframe.contentWindow, { origin: this.origin }),
+      port: liveWindowPort(ctx.iframe, this.origin),
       hostInfo: {
         host: HOST_NAME,
         hostVersion: HOST_VERSION,
@@ -998,6 +997,16 @@ export class DrExtWidgetArea extends AreaBase {
    * New placements from the manager; reuses existing cells so placed
    * iframes are never re-parented (re-parenting reloads an iframe).
    *
+   * The iframe adoption is idempotent, not create-only: on page load
+   * the first render runs BEFORE discovery has created the widget
+   * contexts (attachArea renders the reserved cells immediately), so a
+   * cell can exist while its context doesn't yet. If the iframe were
+   * only adopted at cell creation, a placement restored from layout
+   * storage would render as an empty dark square forever — the
+   * context's iframe would never reach the DOM. Adopting on every
+   * render (only when the iframe isn't already in the cell) closes
+   * that ordering gap without ever re-parenting a live iframe.
+   *
    * @param {Array<object>} placements
    * @returns {void}
    */
@@ -1018,15 +1027,22 @@ export class DrExtWidgetArea extends AreaBase {
       }
     }
     for (const p of this.placements) {
-      if (this.cells.has(p.instanceId)) continue;
-      const size = core.parseSize(p.size) ?? { cols: 1, rows: 1 };
-      const cell = document.createElement("div");
-      cell.className = "cell";
-      cell.style.gridArea = `${p.row + 1} / ${p.col + 1} / span ${size.rows} / span ${size.cols}`;
-      this.grid.appendChild(cell);
-      this.cells.set(p.instanceId, cell);
+      let cell = this.cells.get(p.instanceId);
+      if (!cell) {
+        const size = core.parseSize(p.size) ?? { cols: 1, rows: 1 };
+        cell = document.createElement("div");
+        cell.className = "cell";
+        cell.style.gridArea = `${p.row + 1} / ${p.col + 1} / span ${size.rows} / span ${size.cols}`;
+        this.grid.appendChild(cell);
+        this.cells.set(p.instanceId, cell);
+      }
+      // Late-arriving context (page-load discovery after the cells
+      // rendered): adopt the iframe now — never move it if it's
+      // already home (re-parenting would reload the frame).
       const ctx = this.manager?.widgetCtxs.get(p.instanceId);
-      if (ctx) cell.appendChild(ctx.iframe);
+      if (ctx && ctx.iframe.parentElement !== cell) {
+        cell.appendChild(ctx.iframe);
+      }
     }
     this.grid.classList.toggle("active", this.placements.length > 0);
   }
@@ -1037,6 +1053,39 @@ if (
   !customElements.get("dr-ext-widget-area")
 ) {
   customElements.define("dr-ext-widget-area", DrExtWidgetArea);
+}
+
+/**
+ * The bus port for a context's iframe. Same wire contract as the
+ * vendored `windowPort`, but the peer window is resolved at event
+ * time instead of captured: an iframe's Window object is replaced
+ * when it navigates from about:blank to its `src` (and is `null`
+ * entirely while the frame is still detached — contexts are created
+ * before the area adopts the iframe). A port that captured the peer
+ * at context creation would silently drop every message from the
+ * loaded widget — the handshake would hang and the widget would sit
+ * on its placeholder grid with no data (sea trial 2026-09-21: the
+ * dr-status tile placed on the chart showed an empty dark square).
+ *
+ * @param {HTMLIFrameElement} iframe
+ * @param {string} origin - target origin for postMessage
+ * @returns {{post: (data: unknown) => void, listen: (handler: (data: unknown) => void) => () => void}}
+ */
+function liveWindowPort(iframe, origin) {
+  return {
+    post(data) {
+      iframe.contentWindow?.postMessage(data, origin);
+    },
+    listen(handler) {
+      const fn = (ev) => {
+        if (ev.source !== iframe.contentWindow) return;
+        if (origin !== "*" && ev.origin !== origin) return;
+        handler(ev.data);
+      };
+      window.addEventListener("message", fn);
+      return () => window.removeEventListener("message", fn);
+    },
+  };
 }
 
 /**
