@@ -654,10 +654,14 @@ function dequeueLogbookPending(db, pendingId) {
 
 /**
  * Lists recent confirmed fixes for the UI (SPEC §14.1 fix points).
+ * The webapp's history window filters via `sinceMs` (epoch ms): rows
+ * older than the boundary are left out so the chart shows current
+ * chartwork, not everything since install.
  *
  * @param {import("node:sqlite").DatabaseSync} db
  * @param {object} [q]
  * @param {number} [q.limit=100]
+ * @param {number|null} [q.sinceMs] - include rows at/after this epoch ms
  * @returns {Array<object>} newest-first
  */
 function listFixes(db, q = {}) {
@@ -666,9 +670,35 @@ function listFixes(db, q = {}) {
       `SELECT fix_id, timestamp, source_type, latitude, longitude,
               estimated_error_radius, confirmed_by, resets_dr_origin,
               derived_from_fix_id
-       FROM fixes ORDER BY fix_id DESC LIMIT ?`,
+       FROM fixes ${sinceClause(q)} ORDER BY fix_id DESC LIMIT ?`,
     )
-    .all(q.limit ?? 100);
+    .all(...sinceArgs(q), q.limit ?? 100);
+}
+
+/**
+ * WHERE fragment for the optional `sinceMs` window filter, shared by
+ * the overlay list queries — fixes, LOPs, CPLs and corrections all
+ * carry the same ISO-8601 `timestamp` column. Compares via julianday()
+ * rather than string comparison: stored timestamps vary in shape
+ * (`…00Z` vs `…00.001Z` vs `…00.000Z`), and lexicographic order is
+ * wrong across those shapes (a bare `Z` sorts AFTER a fraction).
+ *
+ * @param {object} q - the query options carrying `sinceMs`
+ * @returns {string} "" or the WHERE clause (args from sinceArgs)
+ */
+function sinceClause(q) {
+  return q.sinceMs != null ? "WHERE julianday(timestamp) >= julianday(?)" : "";
+}
+
+/**
+ * Positional args matching {@link sinceClause}; callers pass them to
+ * .all() BEFORE the limit.
+ *
+ * @param {object} q
+ * @returns {Array<unknown>}
+ */
+function sinceArgs(q) {
+  return q.sinceMs != null ? [new Date(q.sinceMs).toISOString()] : [];
 }
 
 /**
@@ -709,10 +739,12 @@ function getCircularPositionLine(db, id) {
 
 /**
  * Lists persisted lines of position for the UI (SPEC §14.1 LOP overlay).
+ * `sinceMs` window-filters as in listFixes.
  *
  * @param {import("node:sqlite").DatabaseSync} db
  * @param {object} [q]
  * @param {number} [q.limit=100]
+ * @param {number|null} [q.sinceMs]
  * @returns {Array<object>} newest-first
  */
 function listLinesOfPosition(db, q = {}) {
@@ -720,9 +752,9 @@ function listLinesOfPosition(db, q = {}) {
     .prepare(
       `SELECT lop_id, timestamp, lop_type, assumed_lat, assumed_lon,
               azimuth_true, intercept_nm, body_or_object, used_in_fix_id
-       FROM lines_of_position ORDER BY lop_id DESC LIMIT ?`,
+       FROM lines_of_position ${sinceClause(q)} ORDER BY lop_id DESC LIMIT ?`,
     )
-    .all(q.limit ?? 100);
+    .all(...sinceArgs(q), q.limit ?? 100);
 }
 
 /**
@@ -732,6 +764,7 @@ function listLinesOfPosition(db, q = {}) {
  * @param {import("node:sqlite").DatabaseSync} db
  * @param {object} [q]
  * @param {number} [q.limit=100]
+ * @param {number|null} [q.sinceMs]
  * @returns {Array<object>} newest-first
  */
 function listCircularPositionLines(db, q = {}) {
@@ -739,18 +772,20 @@ function listCircularPositionLines(db, q = {}) {
     .prepare(
       `SELECT cpl_id, timestamp, center_lat, center_lon, radius_nm,
               source_object, used_in_fix_id
-       FROM circular_position_lines ORDER BY cpl_id DESC LIMIT ?`,
+       FROM circular_position_lines ${sinceClause(q)} ORDER BY cpl_id DESC LIMIT ?`,
     )
-    .all(q.limit ?? 100);
+    .all(...sinceArgs(q), q.limit ?? 100);
 }
 
 /**
  * Lists recent snap-to-fix corrections for the UI (SPEC §9.3/§14.1 —
  * dashed vector from pre-snap ghost position to confirmed fix).
+ * `sinceMs` window-filters as in listFixes.
  *
  * @param {import("node:sqlite").DatabaseSync} db
  * @param {object} [q]
  * @param {number} [q.limit=20]
+ * @param {number|null} [q.sinceMs]
  * @returns {Array<object>} newest-first
  */
 function listCorrections(db, q = {}) {
@@ -759,9 +794,9 @@ function listCorrections(db, q = {}) {
       `SELECT correction_id, timestamp, dr_lat, dr_lon, fix_lat, fix_lon,
               deviation_nm, deviation_bearing, dr_elapsed_seconds,
               sail_state, sea_state
-       FROM dr_corrections ORDER BY correction_id DESC LIMIT ?`,
+       FROM dr_corrections ${sinceClause(q)} ORDER BY correction_id DESC LIMIT ?`,
     )
-    .all(q.limit ?? 20);
+    .all(...sinceArgs(q), q.limit ?? 20);
 }
 
 // -------------------------------------------------------------------------

@@ -324,6 +324,18 @@ const DEFAULT_CONFIG = {
     clearS: 10,
   },
   /**
+   * Trip-boundary hysteresis (SPEC §9.2): how long navigation.state
+   * must STAY underway (leaving moored/anchored) before the transition
+   * counts as a trip start and resets the trip log. Longer than the
+   * sensor-health windows on purpose — untying, anchor aweigh and
+   * lunch stops all bounce the state for a few minutes — long enough
+   * that only real departure zeroes the trip log.
+   */
+  tripBoundary: {
+    sustainS: 300,
+    clearS: 300,
+  },
+  /**
    * §3.1 inertial-polar fallback (work doc #18): running-average window
    * and staleness cutoff for the polar speed — both the
    * `performance.polarSpeed` delta feed (polar performance plugin) and
@@ -610,6 +622,27 @@ module.exports = (app) => {
   /** @type {number|null} monotonic seconds counter for the training loop */
   let clockS = 0;
 
+  /**
+   * Trip boundary tracking (SPEC §9.2): the debounced moored/anchored
+   * → underway transition resets the trip log and records the trip
+   * start. Debounced symmetric hysteresis (createFlagState/flagTick)
+   * so a flapping autostate source can't zero the trip log spuriously.
+   * `raw` is this tick's underway verdict; the flag RAISES on the
+   * sustained underway edge and never drops mid-trip — the boundary
+   * event is the transition INTO a trip, not the trip's end.
+   * @type {ReturnType<typeof createFlagState>|null}
+   */
+  let tripFlag = null;
+
+  /**
+   * Trip start timestamp (ms) of the current/last trip — persisted in
+   * dr_state_store so a mid-trip restart keeps the boundary (and the
+   * webapp's history window: max(7 days, since trip start)). Null when
+   * no boundary has ever been observed.
+   * @type {number|null}
+   */
+  let tripStartMs = null;
+
   /** @type {ReturnType<typeof createDivergenceState>|null} §7.3 divergence monitor */
   let divergence = null;
 
@@ -859,6 +892,10 @@ module.exports = (app) => {
         ...DEFAULT_CONFIG.sensorHealth,
         ...(opts.sensorHealth ?? {}),
       };
+      config.tripBoundary = {
+        ...DEFAULT_CONFIG.tripBoundary,
+        ...(opts.tripBoundary ?? {}),
+      };
       config.logbook = {
         ...DEFAULT_CONFIG.logbook,
         ...(opts.logbook ?? {}),
@@ -955,6 +992,14 @@ module.exports = (app) => {
       shadowGate = deps.createPublishGate({
         everyTicks: config.publish.everyTicks,
       });
+      // Trip boundary tracking (SPEC §9.2): fresh debounce state per
+      // start; the trip start itself survives restarts via dr_state_store
+      // so the webapp's history window keeps the trip boundary across a
+      // mid-trip restart.
+      tripFlag = deps.createFlagState();
+      const savedTripStartMs = Number(deps.getState(db, "dr_trip_start_ms"));
+      tripStartMs = Number.isFinite(savedTripStartMs) ? savedTripStartMs : null;
+
       polarState = deps.createPolarSpeedState();
       polarModel = null;
       polarLoadedId = null;
@@ -1460,6 +1505,30 @@ module.exports = (app) => {
     // underway: not every install runs an autostate source.
     const navState = deltaState.get("navigation.state");
     const underway = navState !== "anchored" && navState !== "moored";
+
+    // Trip boundary (SPEC §9.2): a sustained moored/anchored → underway
+    // transition starts a trip — resets the trip log and records the
+    // start. The flag raises once on the sustained edge and never drops
+    // (a trip ends at the NEXT raise, not on the underway→moored edge),
+    // so an afternoon of anchoring for lunch doesn't zero the log. Only
+    // a reset that actually moves the count is recorded — restarting
+    // underway (no prior observed boundary) must not fabricate one.
+    const tripEdge = deps.flagTick(
+      tripFlag,
+      underway,
+      config.tickIntervalMs / 1000,
+      config.tripBoundary,
+    );
+    if (tripEdge.transition === "raise") {
+      if (engine.tripLogNm > 0) {
+        engine.resetTrip();
+        tripStartMs = Date.now();
+        deps.setState(db, "dr_trip_start_ms", String(tripStartMs));
+        app.debug(
+          `Trip boundary: navigation.state sustained underway — trip log reset, trip started ${new Date(tripStartMs).toISOString()}`,
+        );
+      }
+    }
 
     // GPS-derived motion (independent of the water-track sensors):
     // updated every tick, used to detect "idle but making way" below.
@@ -2725,6 +2794,11 @@ module.exports = (app) => {
     }
     deps.setState(db, "dr_log_nm", String(engine.logNm));
     deps.setState(db, "dr_trip_log_nm", String(engine.tripLogNm));
+    // Trip boundary (SPEC §9.2) survives restarts: persisted at the
+    // boundary tick AND on every flush (the boundary itself can't be
+    // re-derived — a restart mid-trip sees only "underway").
+    if (tripStartMs != null)
+      deps.setState(db, "dr_trip_start_ms", String(tripStartMs));
     deps.setState(db, "dr_log_since_origin", String(engine.logNmSinceOrigin));
     // Sea trial 2026-09-06: elapsed time drives the current-knowledge
     // term of the uncertainty cone — a restart must not zero it, or the
@@ -2747,6 +2821,25 @@ module.exports = (app) => {
   // --- REST API ----------------------------------------------------------
 
   /**
+   * Parses the optional `since` query parameter (ISO-8601 string or
+   * epoch ms) of the overlay endpoints into the db layer's `sinceMs`
+   * option. Invalid values are ignored (unfiltered) — the window is a
+   * display concern, never a reason to 4xx the chart.
+   *
+   * @param {object} req - Express request
+   * @returns {{sinceMs?: number}}
+   */
+  function sinceOpt(req) {
+    const raw = req.query?.since;
+    if (raw == null || raw === "") return {};
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return { sinceMs: n };
+    const t = Date.parse(String(raw));
+    if (Number.isFinite(t)) return { sinceMs: t };
+    return {};
+  }
+
+  /**
    * Registers REST routes on the plugin router.
    *
    * @param {object} router - Express router
@@ -2766,6 +2859,9 @@ module.exports = (app) => {
         origin: engine.origin,
         logNm: engine.logNm,
         tripLogNm: engine.tripLogNm,
+        // SPEC §9.2 trip boundary (null when none observed yet): the
+        // webapp's history window is max(7 days, since trip start).
+        tripStartMs,
         elapsedSinceOriginS: engine.elapsedSinceOriginS,
         underwaySinceOriginS: engine.underwaySinceOriginS,
         binCount: matrix.count(),
@@ -2794,8 +2890,9 @@ module.exports = (app) => {
     });
 
     /**
-     * GET /fixes — recent confirmed fixes for the map overlay (SPEC
-     * §14.1 fix points). `limit` caps the result (default 100).
+     * GET /fixes — confirmed fixes for the map overlay (SPEC §14.1 fix
+     * points). `limit` caps the result (default 100); `since` (ISO-8601
+     * or epoch ms) window-filters to the webapp's history window.
      */
     router.get("/fixes", (req, res) => {
       if (!engine || !db) {
@@ -2806,13 +2903,14 @@ module.exports = (app) => {
         1,
         Math.min(1000, Number(req.query?.limit) || 100),
       );
-      res.json({ fixes: deps.listFixes(db, { limit }) });
+      res.json({ fixes: deps.listFixes(db, { limit, ...sinceOpt(req) }) });
     });
 
     /**
      * GET /observations — persisted LOPs and CPLs for the map overlay
      * (SPEC §14.1 geometric primitives). Unused/unresolved observations
      * (used_in_fix_id IS NULL) are marked so the UI can emphasize them.
+     * `since` window-filters to the webapp's history window.
      */
     router.get("/observations", (req, res) => {
       if (!engine || !db) {
@@ -2823,15 +2921,17 @@ module.exports = (app) => {
         1,
         Math.min(1000, Number(req.query?.limit) || 100),
       );
+      const since = sinceOpt(req);
       res.json({
-        lops: deps.listLinesOfPosition(db, { limit }),
-        cpls: deps.listCircularPositionLines(db, { limit }),
+        lops: deps.listLinesOfPosition(db, { limit, ...since }),
+        cpls: deps.listCircularPositionLines(db, { limit, ...since }),
       });
     });
 
     /**
      * GET /corrections — recent snap-to-fix corrections for the dashed
-     * vector overlay (SPEC §9.3, §14.1).
+     * vector overlay (SPEC §9.3, §14.1). `since` window-filters to the
+     * webapp's history window.
      */
     router.get("/corrections", (req, res) => {
       if (!engine || !db) {
@@ -2839,7 +2939,9 @@ module.exports = (app) => {
         return;
       }
       const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 20));
-      res.json({ corrections: deps.listCorrections(db, { limit }) });
+      res.json({
+        corrections: deps.listCorrections(db, { limit, ...sinceOpt(req) }),
+      });
     });
 
     /**

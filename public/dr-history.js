@@ -68,11 +68,39 @@ export function parseHistoryValues(response) {
 }
 
 /**
+ * The webapp's chart history window: max(7 days, since trip start)
+ * — whichever is longer, so a trip older than a week still shows in
+ * full (the whole passage is the watchkeeper's working set), while
+ * routine use keeps the chart to the last week.
+ *
+ * Pure — unit-tested without a clock: pass the wall clock in.
+ *
+ * @param {number} nowMs - wall clock (ms)
+ * @param {number|null} tripStartMs - trip boundary from GET /status
+ *   (null when no boundary has been observed)
+ * @returns {{sinceMs: number, durationSec: number}} the window start
+ *   and its length up to now, for the History API and REST overlays
+ */
+export function chartWindow(nowMs, tripStartMs) {
+  const sinceMs =
+    tripStartMs != null && tripStartMs < nowMs
+      ? Math.min(tripStartMs, nowMs - 7 * 24 * 3600 * 1000)
+      : nowMs - 7 * 24 * 3600 * 1000;
+  return { sinceMs, durationSec: Math.max(1, (nowMs - sinceMs) / 1000) };
+}
+
+/**
  * Converts a position series into Leaflet-style `[lat, lon]` track
  * points, deduping near-identical fixes (a moored vessel holds one).
  *
+ * Position cells arrive in BOTH shapes the history provider emits:
+ * GeoJSON `[lon, lat]` pairs (raw `navigation.position`) and
+ * `{latitude, longitude}` objects (values this plugin publishes, e.g.
+ * `navigation.deadReckoning.position` — verified against the live
+ * API; the object form was previously dropped silently, so the DR
+ * track backfill never rendered).
+ *
  * @param {{t: string, v: unknown}[]} points - position series cells
- *   (GeoJSON `[lon, lat]` pairs)
  * @returns {Array<[number, number]>}
  */
 export function seriesToTrack(points) {
@@ -80,9 +108,17 @@ export function seriesToTrack(points) {
   let prevLat = null;
   let prevLon = null;
   for (const { v } of points) {
-    if (!Array.isArray(v) || v.length < 2) continue;
-    const lon = v[0];
-    const lat = v[1];
+    let lon;
+    let lat;
+    if (Array.isArray(v) && v.length >= 2) {
+      lon = v[0];
+      lat = v[1];
+    } else if (v && typeof v === "object") {
+      lat = v.latitude;
+      lon = v.longitude;
+    } else {
+      continue;
+    }
     if (lat == null || lon == null || Number.isNaN(lat) || Number.isNaN(lon))
       continue;
     if (

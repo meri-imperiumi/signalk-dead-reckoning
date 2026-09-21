@@ -32,6 +32,7 @@
 
 import { PlotterExtHost } from "./dr-ext-host.js";
 import {
+  chartWindow,
   fetchHistory,
   mergeHistoryTrack,
   seriesToTrack,
@@ -444,7 +445,7 @@ template.innerHTML = /* html */ `
         <div class="dr-headline">
           <div class="dr-figure" id="dr-log-fig">
             <span class="value" id="dr-log">— nm</span>
-            <span class="label">Water-track log</span>
+            <span class="label">Trip log</span>
           </div>
           <div class="dr-figure" id="dr-elapsed-fig">
             <span class="value" id="dr-elapsed">—</span>
@@ -695,6 +696,23 @@ class DrApp extends HTMLElement {
     this.gpsHistory = [];
     this.ghostHistory = [];
     /**
+     * Trip boundary from GET /status (SPEC §9.2, ms) — anchors the
+     * chart's history window: max(7 days, since trip start). Null
+     * when no boundary has been observed (7-day window).
+     * @type {number|null}
+     */
+    this.tripStartMs = null;
+    /** Whether the initial window-dependent fetches have run. */
+    this._windowFetched = false;
+    /**
+     * Headline log figures (nm): the trip water-track log (SPEC §9.2)
+     * is the glance value; the cumulative log rides in the tooltip.
+     * @type {number|null}
+     */
+    this.tripLogNm = null;
+    /** @type {number|null} */
+    this.logTotalNm = null;
+    /**
      * AIS target store (work doc #23): context → target state, fed by
      * `vessels.*` deltas + the REST snapshot seed, rendered through
      * `aisTargetsForRender`. Owned by dr-viewmodel's pure helpers.
@@ -788,9 +806,18 @@ class DrApp extends HTMLElement {
     this.connectStream();
     this.loadPluginConfig();
     this.bootstrapSelf();
-    this.fetchStatus().then(() => this.bootstrapAis());
-    this.refreshOverlays();
-    this.refreshTrackHistory();
+    // Status first — it carries the trip boundary (SPEC §9.2) the
+    // history window is anchored on; the window-dependent fetches
+    // (tracks, overlays) run once it lands (and re-run on a boundary
+    // change, see fetchStatus).
+    this.fetchStatus()
+      .then(() => {
+        this._windowFetched = true;
+        this.refreshOverlays();
+        this.refreshTrackHistory();
+        this.bootstrapAis();
+      })
+      .catch(() => {});
     // Slow REST refresh for persisted overlays; stream drives the live parts.
     // /status also refreshes the header current figure (manual TTL
     // countdown) between deltas.
@@ -830,6 +857,7 @@ class DrApp extends HTMLElement {
       "navigation.deadReckoning.active",
       "navigation.deadReckoning.method",
       "navigation.deadReckoning.log",
+      "navigation.deadReckoning.trip.log",
       "navigation.deadReckoning.uncertainty",
       "navigation.deadReckoning.divergence",
       "navigation.deadReckoning.state",
@@ -927,6 +955,9 @@ class DrApp extends HTMLElement {
       }
       if (dr?.log?.value != null) {
         this.applyValue("navigation.deadReckoning.log", dr.log.value);
+      }
+      if (dr?.trip?.log?.value != null) {
+        this.applyValue("navigation.deadReckoning.trip.log", dr.trip.log.value);
       }
       if (dr?.method?.value) {
         this.applyValue("navigation.deadReckoning.method", dr.method.value);
@@ -1152,8 +1183,16 @@ class DrApp extends HTMLElement {
         this.snap.sparkStats = this.spark.stats();
         break;
       case "navigation.deadReckoning.log":
-        this.shadowRoot.querySelector("#dr-log").textContent =
-          `${vm.metresToNm(Number(value ?? 0)).toFixed(2)} nm`;
+        // The headline figure is the TRIP log (SPEC §9.2 — resets at
+        // trip boundaries): the watchkeeper's distance-since-departure
+        // figure. The cumulative log keeps riding along as the hover
+        // tooltip.
+        this.logTotalNm = vm.metresToNm(Number(value ?? 0));
+        this.renderLogFigure();
+        break;
+      case "navigation.deadReckoning.trip.log":
+        this.tripLogNm = vm.metresToNm(Number(value ?? 0));
+        this.renderLogFigure();
         break;
       case "navigation.deadReckoning.method": {
         const methodEl = this.shadowRoot.querySelector("#dr-method");
@@ -1286,16 +1325,25 @@ class DrApp extends HTMLElement {
 
   /**
    * Loads persisted overlays (fixes, LOPs/CPLs, snap vectors) from the
-   * plugin REST API.
+   * plugin REST API, window-filtered to the chart's history window
+   * (max(7 days, since trip start)) so old chartwork outside the
+   * window stops cluttering the chart.
    *
    * @returns {Promise<void>}
    */
   async refreshOverlays() {
     try {
+      const since = new Date(
+        chartWindow(Date.now(), this.tripStartMs).sinceMs,
+      ).toISOString();
       const [fixes, observations, corrections] = await Promise.all([
-        fetch(`${API}/fixes?limit=200`).then((r) => r.json()),
-        fetch(`${API}/observations?limit=200`).then((r) => r.json()),
-        fetch(`${API}/corrections?limit=50`).then((r) => r.json()),
+        fetch(`${API}/fixes?limit=200&since=${since}`).then((r) => r.json()),
+        fetch(`${API}/observations?limit=200&since=${since}`).then((r) =>
+          r.json(),
+        ),
+        fetch(`${API}/corrections?limit=50&since=${since}`).then((r) =>
+          r.json(),
+        ),
       ]);
       this.snap.fixes = fixes.fixes ?? [];
       // Oldest-first renders stacked nicely; db returns newest-first.
@@ -1333,24 +1381,29 @@ class DrApp extends HTMLElement {
   }
 
   /**
-   * Backfills restart-survival series from the Signal K History API in
-   * a single multi-path request: the GPS track (the baseline DR
-   * divergence is measured against), the DR ghost track, and the
-   * divergence record (an object — `:last` aggregation, the only kind
-   * non-numeric paths accept). Falls back silently to the live-session
-   * buffers when no history provider is configured (request fails).
+   * Backfills the chart's tracks from the Signal K History API over
+   * the history window (max(7 days, since trip start)): the GPS track
+   * (the baseline DR divergence is measured against), the DR ghost
+   * track, and the divergence record (an object — `:last`
+   * aggregation, the only kind non-numeric paths accept). The window
+   * is long, so resolution is 10 minutes — ~1000 points per track on
+   * a full 7-day window, plenty for a chart polyline (the 1 Hz live
+   * buffers merge the recent hour on top). Falls back silently to
+   * the live-session buffers when no history provider is configured
+   * (request fails).
    *
    * @returns {Promise<void>}
    */
   async refreshTrackHistory() {
+    const { durationSec } = chartWindow(Date.now(), this.tripStartMs);
     const series = await fetchHistory({
       paths: [
         "navigation.position",
         "navigation.deadReckoning.position",
         "navigation.deadReckoning.divergence:last",
       ],
-      durationSec: 6 * 3600,
-      resolutionSec: 60,
+      durationSec,
+      resolutionSec: 600,
     });
     if (!series) return; // no history provider — live buffers only
     const byPath = new Map(series.map((s) => [s.path, s]));
@@ -1386,6 +1439,25 @@ class DrApp extends HTMLElement {
     // AIS ranges/leaders move with the own boat — cheap to re-shape
     // alongside the snapshot (markers are reused in the map).
     this.renderAis();
+  }
+
+  /**
+   * Renders the headline log figure: the TRIP log (SPEC §9.2 — water
+   * track since the last trip boundary) as the glance value, with the
+   * cumulative water-track log in the hover tooltip — the glance
+   * wants "how far this trip", the manual can still find the total.
+   *
+   * @returns {void}
+   */
+  renderLogFigure() {
+    const el = this.shadowRoot.querySelector("#dr-log");
+    if (!el) return;
+    const tripNm = this.tripLogNm ?? this.logTotalNm ?? 0;
+    el.textContent = `${tripNm.toFixed(2)} nm`;
+    el.parentElement.title =
+      this.logTotalNm != null
+        ? `Trip water-track ${tripNm.toFixed(2)} nm — cumulative ${this.logTotalNm.toFixed(2)} nm`
+        : "";
   }
 
   /**
@@ -1471,6 +1543,24 @@ class DrApp extends HTMLElement {
       const body = await res.json();
       this.snap.current = body.current ?? this.snap.current;
       this.snap.manualCurrent = body.manualCurrent ?? null;
+      // Trip boundary (SPEC §9.2): the history window is
+      // max(7 days, since trip start). When it moves (first boundary
+      // observed, or a new trip), the window-dependent fetches re-run
+      // so the chart reflects it without a reload.
+      const nextTripStart = Number.isFinite(body.tripStartMs)
+        ? body.tripStartMs
+        : null;
+      if (nextTripStart !== this.tripStartMs) {
+        const prev = this.tripStartMs;
+        this.tripStartMs = nextTripStart;
+        // Only a CHANGE past the initial fetch re-runs the window
+        // fetches — the constructor's .then() chain owns the first
+        // one (with whatever boundary the initial status carried).
+        if (prev != null || this._windowFetched) {
+          this.refreshTrackHistory();
+          this.refreshOverlays();
+        }
+      }
       // Shadow vessel context (work doc #21/#23): once known, the AIS
       // layer filters it (the DR marker already covers that position).
       this.shadowContext = body.shadowVesselContext ?? this.shadowContext;

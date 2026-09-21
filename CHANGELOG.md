@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **History-aware chart window: tracks, overlays and trip
+  boundaries.** The webapp now shows the last
+  `max(7 days, since trip start)` on the chart instead of nothing:
+  both the GPS track and the DR ghost track backfill from the Signal K
+  History API over the window (10-minute resolution — ~1000 points per
+  track on a full week), and the persisted chartwork overlays (fixes,
+  LOPs, CPLs, snap vectors) are window-filtered via a new `since`
+  query parameter on the REST endpoints (`/fixes`, `/observations`,
+  `/corrections`; ISO-8601 or epoch ms, invalid values ignored).
+  Two bugs fixed on the way: the DR track backfill silently never
+  worked — the history provider emits plugin-published positions as
+  `{latitude, longitude}` objects where the parser only accepted
+  GeoJSON `[lon, lat]` pairs — and the 6-hour fetch window was
+  replaced by the proper window.
+- **Trip log now actually resets at trip boundaries (SPEC §9.2).**
+  `engine.resetTrip()` existed but nothing ever called it, so
+  `navigation.deadReckoning.trip.log` accumulated since install (the
+  production log read 703 nm — more than the last two trips
+  combined). A sustained `navigation.state` transition from
+  `anchored`/`moored` to underway (5-minute debounce, configurable
+  via `tripBoundary.sustainS`/`clearS`) now zeroes the trip log and
+  records the trip start, which is persisted across restarts
+  (mid-trip server restarts keep the boundary) and exposed via
+  GET /status as `tripStartMs` — the webapp uses it to anchor its
+  history window. A flapping autostate source can't zero the log:
+  blips shorter than the debounce are ignored.
+- **The headline log figure is now the trip log.** The bottom-right
+  readout shows `navigation.deadReckoning.trip.log` ("Trip log")
+  instead of the cumulative water-track log — the watchkeeper's
+  glance figure is distance-since-departure; the cumulative total
+  rides along as the figure's hover tooltip. Falls back to the
+  cumulative log until a first trip boundary is ever observed.
+
 ## [0.11.2] - 2026-09-21
 
 ### Added

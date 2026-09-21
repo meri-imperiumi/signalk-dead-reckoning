@@ -309,3 +309,32 @@ test("dr-theme: focus outlines are solid, not dashed", () => {
   assert.match(focus[0], /outline: 1px solid/);
   assert.doesNotMatch(focus[0], /dashed/);
 });
+
+test("dr-app: headline log figure is the TRIP log (SPEC §9.2)", () => {
+  // The glance value: water track since the last trip boundary, not
+  // the cumulative log (which on production read 703 nm after two
+  // trips — resetTrip was never wired before work doc #29).
+  assert.ok(
+    appSrc.includes("navigation.deadReckoning.trip.log"),
+    "trip log subscribed/applied",
+  );
+  assert.match(
+    appSrc,
+    /<span class="label">Trip log<\/span>/,
+    "the readout figure is labeled Trip log",
+  );
+  // The cumulative log survives as the hover tooltip of the figure.
+  assert.match(
+    appSrc,
+    /Trip water-track \$\{tripNm\.toFixed\(2\)\} nm — cumulative \$\{this\.logTotalNm\.toFixed\(2\)\} nm/,
+    "tooltip carries both figures",
+  );
+  // Until a trip boundary is ever observed (fresh installs, no
+  // autostate), the figure falls back to the cumulative log rather
+  // than reading 0.00 nm forever.
+  assert.match(
+    appSrc,
+    /this\.tripLogNm \?\? this\.logTotalNm \?\? 0/,
+    "fallback to cumulative log",
+  );
+});

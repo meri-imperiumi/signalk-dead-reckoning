@@ -2019,6 +2019,220 @@ test("water-track log survives restart via dr_log_nm state", async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test("trip boundary: sustained underway resets the trip log and records tripStartMs (SPEC §9.2)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-trip-boundary-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  // Sustain shorter than the boundary debounce (300 s default) so we
+  // can drive a real transition without wall-clock waiting.
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 50,
+    saveIntervalMs: 60000,
+    tripBoundary: { sustainS: 1, clearS: 1 },
+  });
+  try {
+    // Moored with DR integrating: drives the water track up so the
+    // trip log has something to reset.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "navigation.state", value: "moored" },
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "navigation.speedThroughWater", value: 2 }, // m/s
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    // Underway (sailing) — sustained past the debounce: the trip log
+    // zeroes and the boundary is recorded.
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [{ values: [{ path: "navigation.state", value: "sailing" }] }],
+    });
+    await new Promise((r) => setTimeout(r, 1500));
+    const router = new FakeRouter();
+    plugin.registerWithRouter(router);
+    const { body } = router.invoke("get", "/status");
+    assert.ok(
+      Number.isFinite(body.tripStartMs),
+      `tripStartMs recorded: ${body.tripStartMs}`,
+    );
+    assert.ok(
+      body.tripStartMs <= Date.now() && body.tripStartMs > Date.now() - 5000,
+      "tripStartMs is the boundary instant",
+    );
+    assert.ok(
+      body.tripLogNm < 1,
+      `trip log reset at the boundary (got ${body.tripLogNm})`,
+    );
+    // The cumulative log keeps accumulating across the boundary.
+    assert.ok(body.logNm > 0, "cumulative log survives the boundary");
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("trip boundary: a flapping navigation.state must not zero the trip log", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-trip-flap-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({
+    tickIntervalMs: 50,
+    saveIntervalMs: 60000,
+    tripBoundary: { sustainS: 2, clearS: 2 },
+  });
+  try {
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "navigation.state", value: "moored" },
+            {
+              path: "navigation.position",
+              value: { latitude: 60, longitude: 24 },
+            },
+            { path: "navigation.headingTrue", value: 90 },
+          ],
+        },
+      ],
+    });
+    app.emitDelta({
+      context: "vessels.self",
+      updates: [
+        {
+          values: [
+            { path: "navigation.speedThroughWater", value: 2 }, // m/s
+          ],
+        },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 600));
+    const before = lastTripLog(app);
+    // Flap: underway blips shorter than the debounce never trip a
+    // boundary, so the trip log keeps its water track.
+    for (let i = 0; i < 6; i++) {
+      app.emitDelta({
+        context: "vessels.self",
+        updates: [
+          {
+            values: [
+              {
+                path: "navigation.state",
+                value: i % 2 === 0 ? "sailing" : "moored",
+              },
+            ],
+          },
+        ],
+      });
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    const after = lastTripLog(app);
+    assert.ok(
+      after >= before,
+      `flapping state must not reset the trip log (before ${before}, after ${after})`,
+    );
+  } finally {
+    plugin.stop();
+  }
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("trip boundary: tripStartMs survives a mid-trip restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-trip-restart-"));
+  const boundaryMs = Date.parse("2026-09-18T06:00:00Z");
+  // Pre-seed the persisted boundary a previous run would have flushed.
+  const db = require("../plugin/db.js").openDatabase(
+    join(dir, "dead-reckoning.sqlite"),
+  );
+  const { setState } = require("../plugin/db.js");
+  setState(db, "dr_trip_start_ms", String(boundaryMs));
+  db.close();
+
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const plugin = makePlugin(app);
+  plugin.start({});
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  const { body } = router.invoke("get", "/status");
+  assert.strictEqual(body.tripStartMs, boundaryMs);
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("overlay endpoints: since query param window-filters rows", () => {
+  const { plugin, router } = makeStarted();
+  try {
+    // Two fixes: one old (outside), one fresh (inside the window).
+    router.invoke("post", "/fix", {
+      latitude: 60.001,
+      longitude: 24.001,
+      source_type: "gps",
+      confirmed_by: "Alice",
+      timestamp: "2026-01-01T00:00:00Z",
+    });
+    router.invoke("post", "/fix", {
+      latitude: 60.002,
+      longitude: 24.002,
+      source_type: "gps",
+      confirmed_by: "Alice",
+      timestamp: new Date().toISOString(),
+    });
+    // ISO-8601 since — the form the webapp sends.
+    const sinceIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const fixes = router.invoke("get", `/fixes?since=${sinceIso}`);
+    assert.strictEqual(fixes.status, 200);
+    assert.strictEqual(
+      fixes.body.fixes.length,
+      1,
+      "only the fresh fix is inside the window",
+    );
+    // No since → unfiltered, as before.
+    assert.strictEqual(router.invoke("get", "/fixes").body.fixes.length, 2);
+    // Invalid since is ignored, never a 4xx — the window is a display
+    // concern.
+    const bad = router.invoke("get", "/fixes?since=not-a-date");
+    assert.strictEqual(bad.status, 200);
+    assert.strictEqual(bad.body.fixes.length, 2);
+  } finally {
+    plugin.stop();
+  }
+});
+
+/**
+ * Latest published trip log (nm), or 0 when none published yet.
+ *
+ * @param {FakeSignalKApp} app
+ * @returns {number}
+ */
+function lastTripLog(app) {
+  const vals = app.handledMessages
+    .flatMap((m) => m.message?.updates ?? [])
+    .flatMap((u) => u.values ?? [])
+    .filter((v) => v.path === "navigation.deadReckoning.trip.log");
+  return vals.length === 0 ? 0 : Number(vals[vals.length - 1].value) / 1852;
+}
+
 /** Returns the latest published divergence readout, or throws. */
 function latestDivergence(app) {
   const vals = app.handledMessages

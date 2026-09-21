@@ -136,6 +136,103 @@ test("recordFix/listFixes round-trip derived_from_fix_id", () => {
   db.close();
 });
 
+test("overlay list queries window-filter on sinceMs", () => {
+  const db = openDatabase(join(tempDir, "since-window.sqlite"));
+  const { listLinesOfPosition, listCircularPositionLines, listCorrections } =
+    require("../plugin/db.js");
+  const old = "2026-01-01T00:00:00Z";
+  const recent = "2026-09-15T12:00:00Z";
+  recordFix(db, {
+    timestamp: old,
+    source_type: "gps",
+    latitude: 60,
+    longitude: 24,
+  });
+  const recentFixId = recordFix(db, {
+    timestamp: recent,
+    source_type: "gps",
+    latitude: 60.1,
+    longitude: 24.1,
+  });
+  const sinceMs = Date.parse("2026-09-01T00:00:00Z");
+  const fixes = listFixes(db, { sinceMs });
+  assert.strictEqual(
+    fixes.length,
+    1,
+    "only the recent fix is inside the window",
+  );
+  assert.strictEqual(fixes[0].fix_id, recentFixId);
+  // No filter → everything, as before.
+  assert.strictEqual(listFixes(db).length, 2);
+  // The boundary itself is inclusive.
+  const edgeMs = Date.parse(old) + 1;
+  assert.strictEqual(listFixes(db, { sinceMs: edgeMs }).length, 1);
+
+  // LOPs / CPLs / corrections share the same timestamp filter.
+  const { recordLineOfPosition, recordCircularPositionLine } =
+    require("../plugin/db.js");
+  recordLineOfPosition(db, {
+    timestamp: old,
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 45,
+    intercept_nm: 0.5,
+  });
+  recordLineOfPosition(db, {
+    timestamp: recent,
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 90,
+    intercept_nm: 0.2,
+  });
+  const lops = listLinesOfPosition(db, { sinceMs });
+  assert.strictEqual(lops.length, 1);
+  assert.ok(lops[0].timestamp >= new Date(sinceMs).toISOString());
+
+  recordCircularPositionLine(db, {
+    timestamp: old,
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 2,
+  });
+  recordCircularPositionLine(db, {
+    timestamp: recent,
+    cpl_type: "vertical-angle",
+    center_lat: 60,
+    center_lon: 24,
+    radius_nm: 1,
+  });
+  assert.strictEqual(listCircularPositionLines(db, { sinceMs }).length, 1);
+
+  recordCorrection(db, {
+    fix_id: recentFixId,
+    timestamp: recent,
+    dr_lat: 60,
+    dr_lon: 24,
+    fix_lat: 60.1,
+    fix_lon: 24.1,
+    deviation_nm: 0.3,
+    deviation_bearing: 10,
+    dr_elapsed_seconds: 100,
+  });
+  recordCorrection(db, {
+    fix_id: recentFixId,
+    timestamp: old,
+    dr_lat: 60,
+    dr_lon: 24,
+    fix_lat: 60.2,
+    fix_lon: 24.2,
+    deviation_nm: 0.9,
+    deviation_bearing: 20,
+    dr_elapsed_seconds: 100,
+  });
+  assert.strictEqual(listCorrections(db, { sinceMs }).length, 1);
+  db.close();
+});
+
 test("setState upserts and getState reads back", () => {
   const db = openDatabase(join(tempDir, "c.sqlite"));
   setState(db, "dr_log_nm", "123.45");
