@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-21
+
 ### Added
 - **Chartplotter UX (work doc #30, north-up phase):** the DR webapp
   navigates like a plotter, not a map viewer:
