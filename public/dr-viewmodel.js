@@ -47,10 +47,27 @@ export const STYLE = {
   ais: "#c77bd9",
   aisBuddy: "#6b9e78",
   aisExpiring: "#888899",
+  // CPA watch breach (work doc #30): the alarm red — a target closing
+  // inside the CPA/TCPA watch limits reads red, before any panel is
+  // even opened.
+  aisAlarm: "#ff5e5e",
   // Active Signal K route (navigation.course.activeRoute): the
   // chartplotter convention — routes draw magenta, distinct from
   // every DR-family color above so own track never reads as plan.
   route: "#d05fa2",
+  // Predictor vectors (work doc #30): each own-ship reference projects
+  // in its own family color — the GPS vector in the GPS green, the DR
+  // vector in the DR teal — so the 10-minute lines read as extensions
+  // of the tracks they belong to.
+  vector: { gps: "#6b9e78", dr: "#4b8b99" },
+  // Range rings (work doc #30): quiet grey — a measuring backdrop,
+  // not a data family.
+  ring: "#888899",
+  // Wind laylines (work doc #30): the racing convention — red for the
+  // port-tack layline, green for starboard — matching the navigation-
+  // light convention, drawn bright so the pair reads instantly.
+  laylinePort: "#ff5e5e",
+  laylineStbd: "#8dfcbb",
   fix: {
     gps: "#6b9e78",
     celestial: "#c77b28",
@@ -1626,8 +1643,13 @@ export const AIS_DROP_MS = 20 * 60_000;
  */
 export const AIS_RANGE_NM = 24;
 
-/** Velocity-leader length (minutes) — the plotter-standard 6-minute run. */
-export const AIS_LEADER_MIN = 6;
+/**
+ * Velocity-leader length (minutes). The plotter-standard 6-minute run
+ * was extended to the 10-minute convention (work doc #30) so every
+ * predictor on the chart — own-ship GPS, own-ship DR, AIS — projects
+ * the same horizon and the three read as one family.
+ */
+export const AIS_LEADER_MIN = 10;
 
 /** Extrapolation horizon: predictions freeze at the expiring threshold. */
 export const AIS_PREDICT_HORIZON_MS = AIS_EXPIRING_MS;
@@ -1700,6 +1722,16 @@ export function applyAisDelta(store, delta, nowMs = Date.now()) {
         cogRad: null,
         sogMs: null,
         headingRad: null,
+        // Static target details (work doc #30): dimensions, flag state,
+        // vessel type, destination & ETA — populated when providers
+        // publish them, absent otherwise (rows hide, never fake).
+        lengthM: null,
+        beamM: null,
+        country: null,
+        shipType: null,
+        typeName: null,
+        destination: null,
+        destinationEtaMs: null,
         receivedMs: nowMs,
       };
       store.set(ctx, t);
@@ -1732,6 +1764,59 @@ export function applyAisDelta(store, delta, nowMs = Date.now()) {
         case "navigation.headingTrue":
           if (Number.isFinite(value)) touch().headingRad = value;
           break;
+        // Static details (work doc #30). Values may ride as scalars or
+        // {value}-wrapped leaves depending on the provider.
+        case "design.length":
+        case "design.length.overall": {
+          const m = scalarValue(value);
+          let len = null;
+          if (Number.isFinite(m)) len = m;
+          else if (m && typeof m === "object" && m.overall != null) {
+            // Signal K shapes design.length as an object keyed by hull
+            // measurement; the plotter dimension is the overall length.
+            len = scalarValue(m.overall);
+          }
+          if (Number.isFinite(len)) touch().lengthM = len;
+          break;
+        }
+        case "design.beam": {
+          const m = scalarValue(value);
+          if (Number.isFinite(m)) touch().beamM = m;
+          break;
+        }
+        case "registrations.country": {
+          const c = scalarValue(value);
+          if (typeof c === "string" && c) touch().country = c;
+          break;
+        }
+        case "aisShipType": {
+          const code = scalarValue(value);
+          if (Number.isFinite(code)) touch().shipType = code;
+          break;
+        }
+        case "type": {
+          const name = scalarValue(value);
+          if (typeof name === "string" && name) touch().typeName = name;
+          break;
+        }
+        case "navigation.destination": {
+          // Providers differ: a plain string, or an object with name/eta
+          // (the Signal K destination keystore shape).
+          if (typeof value === "string" && value) touch().destination = value;
+          else if (value && typeof value === "object") {
+            if (typeof value.name === "string" && value.name) {
+              touch().destination = value.name;
+            }
+            const eta = etaToMs(value.eta);
+            if (eta != null) touch().destinationEtaMs = eta;
+          }
+          break;
+        }
+        case "navigation.destination.eta": {
+          const eta = etaToMs(value);
+          if (eta != null) touch().destinationEtaMs = eta;
+          break;
+        }
         case "name":
           if (typeof value === "string" && value) touch().name = value;
           break;
@@ -1742,7 +1827,8 @@ export function applyAisDelta(store, delta, nowMs = Date.now()) {
           break;
         case "": {
           // Root value: AIS providers commonly identify the target here
-          // (Freeboard's buddy flag arrives the same way).
+          // (Freeboard's buddy flag arrives the same way), and some
+          // providers fold the whole static block in as root too.
           if (value && typeof value === "object") {
             const target = touch();
             if (typeof value.name === "string" && value.name) {
@@ -1753,6 +1839,55 @@ export function applyAisDelta(store, delta, nowMs = Date.now()) {
                 typeof value.mmsi === "string" ? value.mmsi : `${value.mmsi}`;
             }
             if (typeof value.buddy === "boolean") target.buddy = value.buddy;
+            const lengthM = scalarValue(value.design?.length);
+            let rootLen = null;
+            if (Number.isFinite(lengthM)) rootLen = lengthM;
+            else if (
+              lengthM &&
+              typeof lengthM === "object" &&
+              lengthM.overall != null
+            ) {
+              rootLen = scalarValue(lengthM.overall);
+            }
+            if (Number.isFinite(rootLen)) target.lengthM = rootLen;
+            const beamM = scalarValue(value.design?.beam);
+            if (Number.isFinite(beamM)) target.beamM = beamM;
+            const country = scalarValue(value.registrations?.country);
+            if (typeof country === "string" && country) {
+              target.country = country;
+            }
+            const shipType = scalarValue(value.aisShipType);
+            if (Number.isFinite(shipType)) target.shipType = shipType;
+            const typeName = scalarValue(value.type);
+            if (typeof typeName === "string" && typeName) {
+              target.typeName = typeName;
+            }
+            if (typeof value.destination === "string" && value.destination) {
+              target.destination = value.destination;
+            } else if (
+              value.destination &&
+              typeof value.destination === "object"
+            ) {
+              if (
+                typeof value.destination.name === "string" &&
+                value.destination.name
+              ) {
+                target.destination = value.destination.name;
+              }
+              const eta = etaToMs(value.destination.eta);
+              if (eta != null) target.destinationEtaMs = eta;
+            }
+            // Root vessels carry the destination under navigation.
+            const navDest = value.navigation?.destination;
+            if (typeof navDest === "string" && navDest) {
+              target.destination = navDest;
+            } else if (navDest && typeof navDest === "object") {
+              if (typeof navDest.name === "string" && navDest.name) {
+                target.destination = navDest.name;
+              }
+              const eta = etaToMs(navDest.eta);
+              if (eta != null) target.destinationEtaMs = eta;
+            }
           }
           break;
         }
@@ -1827,6 +1962,24 @@ export function seedAisFromSnapshot(store, snapshot, opts = {}) {
               {
                 path: "navigation.headingTrue",
                 value: leaf(v.navigation, "headingTrue") ?? null,
+              },
+              // Static details (work doc #30): dimensions, flag, type,
+              // destination & ETA — whatever the snapshot carries.
+              {
+                path: "design.length",
+                value:
+                  leaf(v.design, "length") ?? leaf(v.design?.length, "overall"),
+              },
+              { path: "design.beam", value: leaf(v.design, "beam") ?? null },
+              {
+                path: "registrations.country",
+                value: leaf(v.registrations, "country") ?? null,
+              },
+              { path: "aisShipType", value: leaf(v, "aisShipType") ?? null },
+              { path: "type", value: leaf(v, "type") ?? null },
+              {
+                path: "navigation.destination",
+                value: leaf(v.navigation, "destination") ?? null,
               },
             ],
           },
@@ -1929,7 +2082,7 @@ export function predictAisPosition(target, nowMs, opts = {}) {
  *   leader: {from: [number, number], to: [number, number]}|null,
  *   tooltip: string}|null} null when the target has no position yet
  */
-export function aisMarkerSpec(target, nowMs, own) {
+export function aisMarkerSpec(target, nowMs, own, opts = {}) {
   const position = predictAisPosition(target, nowMs);
   if (!position) return null;
   const expiring = aisStaleness(target, nowMs) !== "active";
@@ -1959,11 +2112,44 @@ export function aisMarkerSpec(target, nowMs, own) {
           to: destinationPoint(position, cogDeg, sogKn * (AIS_LEADER_MIN / 60)),
         }
       : null;
+  // CPA/TCPA (work doc #30) against the own-ship reference the caller
+  // supplied — with `ownCourseDeg`/`ownSpeedKn` (the DR course/speed or
+  // COG/SOG matching `own`). Both references are shown in the target
+  // panel; the glyph cue keys on the reference the map was given.
+  let cpa = null;
+  if (
+    own &&
+    Number.isFinite(opts.ownCourseDeg) &&
+    Number.isFinite(opts.ownSpeedKn)
+  ) {
+    cpa = cpaTcpa(
+      own,
+      opts.ownCourseDeg,
+      opts.ownSpeedKn,
+      position,
+      cogDeg,
+      sogKn,
+    );
+  }
+  const alarm =
+    cpa != null &&
+    cpa.tcpaMin != null &&
+    cpa.cpaNm <= (opts.cpaAlarmNm ?? CPA_ALARM_NM) &&
+    cpa.tcpaMin <= (opts.cpaAlarmTcpaMin ?? CPA_ALARM_TCPA_MIN);
   const parts = [label];
   if (rangeNm != null) parts.push(`${rangeNm.toFixed(1)} nm`);
   if (sogKn != null && cogDeg != null) {
     parts.push(
       `${sogKn.toFixed(1)} kn / ${String(Math.round(cogDeg)).padStart(3, "0")}°`,
+    );
+  }
+  // Closing fast: the CPA figure rides the tooltip when below the
+  // watch threshold (work doc #30) — a glance-level collision cue.
+  if (cpa && cpa.cpaNm <= (opts.cpaTooltipNm ?? CPA_TOOLTIP_NM)) {
+    parts.push(
+      cpa.tcpaMin != null
+        ? `CPA ${cpa.cpaNm.toFixed(2)} nm / ${Math.round(cpa.tcpaMin)} min`
+        : `CPA ${cpa.cpaNm.toFixed(2)} nm`,
     );
   }
   if (expiring && age != null) {
@@ -1974,11 +2160,13 @@ export function aisMarkerSpec(target, nowMs, own) {
     label,
     position,
     rotationDeg,
-    color: expiring
-      ? STYLE.aisExpiring
-      : target.buddy
-        ? STYLE.aisBuddy
-        : STYLE.ais,
+    color: alarm
+      ? STYLE.aisAlarm
+      : expiring
+        ? STYLE.aisExpiring
+        : target.buddy
+          ? STYLE.aisBuddy
+          : STYLE.ais,
     expiring,
     buddy: Boolean(target.buddy),
     sogKn,
@@ -1986,6 +2174,9 @@ export function aisMarkerSpec(target, nowMs, own) {
     rangeNm,
     ageMin: age != null ? age / 60_000 : null,
     leader,
+    cpaNm: cpa?.cpaNm ?? null,
+    tcpaMin: cpa?.tcpaMin ?? null,
+    alarm,
     tooltip: parts.join(" · "),
   };
 }
@@ -2031,7 +2222,7 @@ export function aisTargetsForRender(store, nowMs, own, opts = {}) {
   for (const target of store.values()) {
     if (target.lat == null) continue;
     if (aisStaleness(target, nowMs) === "dropped") continue;
-    const spec = aisMarkerSpec(target, nowMs, own);
+    const spec = aisMarkerSpec(target, nowMs, own, opts);
     if (!spec) continue;
     if (own && spec.rangeNm != null && spec.rangeNm > rangeNm) continue;
     specs.push(spec);
@@ -2160,4 +2351,548 @@ export function routeWaypointLabels(routeResource, count) {
     );
   }
   return labels;
+}
+
+/**
+ * Nautical scale ladder (work doc #30): the values a helm scale bar may
+ * show — the traditional plotter progression, 0.1 NM up to 1000 NM.
+ */
+export const SCALE_LADDER_NM = [
+  0.1, 0.25, 0.5, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000,
+];
+
+/**
+ * Metric fallback ladder for sub-hectometre zooms (deep-zoomed harbor
+ * approaches where 0.1 NM = 185 m would blow past any readable bar).
+ */
+const SCALE_LADDER_M = [
+  1, 2, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 5000,
+];
+
+/** Readable scale-bar width range, in px (work doc #30: ~80–200). */
+const SCALE_BAR_MIN_PX = 80;
+const SCALE_BAR_MAX_PX = 200;
+
+/**
+ * Picks the scale-bar value for a screen scale: the ladder value whose
+ * bar renders between ~80 and 200 px on the map. Nautical by default
+ * (bar + NM label only — no `1:x` numeric readout); when the smallest
+ * nautical step (0.1 NM) would render wider than the maximum, the
+ * metric fallback ladder takes over and the label switches to metres.
+ *
+ * @param {number} metersPerPixel - ground meters covered by one screen
+ *   pixel at the current zoom/latitude
+ * @param {{minPx?: number, maxPx?: number}} [opts]
+ * @returns {{px: number, nm: number, metres: null, label: string}|
+ *   {px: number, nm: null, metres: number, label: string}|null} null
+ *   when nothing on either ladder fits (absurd zooms)
+ */
+export function scaleBarSpec(metersPerPixel, opts = {}) {
+  const minPx = opts.minPx ?? SCALE_BAR_MIN_PX;
+  const maxPx = opts.maxPx ?? SCALE_BAR_MAX_PX;
+  if (!Number.isFinite(metersPerPixel) || metersPerPixel <= 0) return null;
+  // Largest ladder value whose bar still fits under the maximum — the
+  // progression is coarse enough that this lands in the readable band
+  // for every zoom a chart is used at.
+  const pick = (values, toPx) => {
+    let best = null;
+    for (const v of values) {
+      const px = toPx(v);
+      if (px <= maxPx) best = { value: v, px };
+    }
+    return best;
+  };
+  const nmToPx = (nm) => (nm * METRES_PER_NM) / metersPerPixel;
+  const mToPx = (m) => m / metersPerPixel;
+  const hit = pick(SCALE_LADDER_NM, nmToPx);
+  if (hit && hit.px >= minPx) {
+    return {
+      px: hit.px,
+      nm: hit.value,
+      metres: null,
+      label: `${hit.value} nm`,
+    };
+  }
+  // Nautical nothing readable (0.1 nm too wide, or the picked step is
+  // thinner than the minimum) → metric ladder, metres label.
+  const metric = pick(SCALE_LADDER_M, mToPx);
+  if (metric && metric.px >= minPx) {
+    return {
+      px: metric.px,
+      nm: null,
+      metres: metric.value,
+      label: `${metric.value} m`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Ground meters covered by one screen pixel on a web-mercator map at
+ * the given zoom and latitude (256-px tiles — Leaflet's model).
+ *
+ * @param {number} zoom
+ * @param {number} latDeg
+ * @returns {number}
+ */
+export function metersPerPixel(zoom, latDeg) {
+  return (156543.03392 * Math.cos((latDeg * Math.PI) / 180)) / 2 ** zoom;
+}
+
+/**
+ * Chartplotter predictor vector (work doc #30): the 10-minute line —
+ * where the boat will be if course and speed hold. The line carries
+ * tick marks every `tickEveryMin` minutes (the traditional log scale
+ * on a course line: 2/4/6/8/10), positioned by great-circle
+ * destination so the geometry is honest at any range.
+ *
+ * @param {[number, number]} position - [lat, lon] the vector runs from
+ * @param {number|null|undefined} courseDeg - true course the vector
+ *   runs along (null → no vector)
+ * @param {number|null|undefined} speedKn - speed the vector integrates
+ *   (null/0 → no vector — a stationary boat projects nothing)
+ * @param {{minutes?: number, tickEveryMin?: number}} [opts]
+ * @returns {{from: [number, number], to: [number, number], minutes:
+ *   number, ticks: Array<{at: [number, number], minutes: number}>}|null}
+ */
+export function predictorVector(position, courseDeg, speedKn, opts = {}) {
+  const minutes = opts.minutes ?? 10;
+  const tickEveryMin = opts.tickEveryMin ?? 2;
+  if (!position || !Number.isFinite(courseDeg)) return null;
+  if (!Number.isFinite(speedKn) || speedKn <= 0) return null;
+  const to = destinationPoint(position, courseDeg, speedKn * (minutes / 60));
+  const ticks = [];
+  for (let m = tickEveryMin; m < minutes; m += tickEveryMin) {
+    ticks.push({
+      at: destinationPoint(position, courseDeg, speedKn * (m / 60)),
+      minutes: m,
+    });
+  }
+  return { from: position, to, minutes, ticks };
+}
+
+/**
+ * Range-ring spacing for the current zoom (work doc #30): the ladder
+ * step whose ring reads cleanly at the chart scale — a ring every
+ * ~60–200 px of screen. Rings draw at 1×, 2× and 3× this spacing
+ * (three rings is the plotter convention; more is clutter).
+ *
+ * @param {number} metersPerPixel - ground meters per screen pixel
+ * @param {{minPx?: number, maxPx?: number, maxSpacingNm?: number}} [opts]
+ * @returns {number|null} spacing in NM, or null when no ladder step
+ *   fits (absurd zooms) — no rings then
+ */
+export function rangeRingSpacingNm(metersPerPixel, opts = {}) {
+  const minPx = opts.minPx ?? 60;
+  const maxPx = opts.maxPx ?? 200;
+  const ladder = [0.25, 0.5, 1, 2, 5, 10, 20, 50];
+  if (!Number.isFinite(metersPerPixel) || metersPerPixel <= 0) return null;
+  const pxFor = (nm) => (nm * METRES_PER_NM) / metersPerPixel;
+  // Smallest ladder step inside the readable band; when nothing fits
+  // (extreme zooms), the smallest step that still clears the minimum —
+  // a slightly-wide ring beats no rings — or null when even that
+  // fails (rings are pointless at ocean zooms anyway).
+  const inBand = ladder.filter(
+    (nm) => pxFor(nm) >= minPx && pxFor(nm) <= maxPx,
+  );
+  if (inBand.length > 0) return inBand[0];
+  return ladder.find((nm) => pxFor(nm) >= minPx) ?? null;
+}
+
+/**
+ * AIS ship type name for a `aisShipType` code (work doc #30 target
+ * details, Freeboard-SK's field-set convention): exact names for the
+ * common single codes (30–37, 5x service craft), family names for the
+ * classed ranges (40s high-speed, 60s passenger, 70s cargo, 80s
+ * tanker, 90s other). Unknown/absent → null (row hidden, never a fake
+ * "unknown vessel" readout).
+ *
+ * @param {number|null|undefined} code
+ * @returns {string|null}
+ */
+export function aisShipTypeName(code) {
+  if (!Number.isFinite(code)) return null;
+  const exact = {
+    30: "Fishing",
+    31: "Towing",
+    32: "Towing (large)",
+    33: "Dredging",
+    34: "Diving ops",
+    35: "Military",
+    36: "Sailing",
+    37: "Pleasure craft",
+    50: "Pilot",
+    51: "Search & rescue",
+    52: "Tug",
+    53: "Port tender",
+    54: "Anti-pollution",
+    55: "Law enforcement",
+    58: "Medical transport",
+  };
+  if (exact[code]) return exact[code];
+  const family = Math.floor(code / 10);
+  const ranges = {
+    2: "Wing in ground",
+    4: "High-speed craft",
+    6: "Passenger",
+    7: "Cargo",
+    8: "Tanker",
+    9: "Other",
+  };
+  return ranges[family] ?? null;
+}
+
+/**
+ * Flag emoji + code for a `registrations.country` value (Freeboard-SK
+ * shows the flag state on the target panel — the emoji is algorithmic
+ * from the ISO 3166-1 alpha-2 code, so no lookup table is needed).
+ *
+ * @param {string|null|undefined} code - ISO 3166-1 alpha-2, e.g. "FI"
+ * @returns {string|null} "🇫🇮 FI" — null when the code isn't a 2-letter
+ *   country code (degrades to nothing rather than a wrong flag)
+ */
+export function flagForCountry(code) {
+  if (typeof code !== "string" || !/^[a-zA-Z]{2}$/.test(code)) return null;
+  const base = 0x1f1e6; // regional indicator symbol letter A
+  const emoji = String.fromCodePoint(
+    ...code
+      .toUpperCase()
+      .split("")
+      .map((c) => base + c.charCodeAt(0) - 65),
+  );
+  return `${emoji} ${code.toUpperCase()}`;
+}
+
+/** Unwraps a REST leaf or delta value that may be a plain scalar or a
+ * `{value}`-shaped object (providers differ). Structured objects that
+ * carry no `value` key (e.g. the design.length measurement keystore)
+ * pass through whole for the caller to dig into. */
+function scalarValue(v) {
+  if (v == null || typeof v !== "object") return v;
+  return "value" in v ? v.value : v;
+}
+
+/** Parses an ETA in any provider shape — epoch ms number, ISO string —
+ * to epoch ms. Returns null for anything unparsable. */
+function etaToMs(v) {
+  if (v == null) return null;
+  if (Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? t : null;
+  }
+  if (typeof v === "object") {
+    const inner = v.value ?? v.ms ?? v.timestamp;
+    return inner == null ? null : etaToMs(inner);
+  }
+  return null;
+}
+
+/**
+ * CPA / TCPA between two moving vessels (work doc #30): closest point
+ * of approach distance and time to it, computed in the local ENU
+ * plane (valid at the tens-of-nm ranges AIS is used at). Both own-ship
+ * references are evaluated by the caller — the DR ship (DR course +
+ * DR speed) and the GPS ship (COG + SOG).
+ *
+ * @param {[number, number]} ownPos - [lat, lon]
+ * @param {number|null|undefined} ownCourseDeg
+ * @param {number|null|undefined} ownSpeedKn
+ * @param {[number, number]} targetPos - [lat, lon]
+ * @param {number|null|undefined} targetCourseDeg
+ * @param {number|null|undefined} targetSpeedKn
+ * @returns {{cpaNm: number, tcpaMin: number|null}|null} `tcpaMin` is
+ *   null when the pair is already diverging (CPA is "now") or either
+ *   vessel's motion is unknown; `cpaNm` then equals the present range.
+ *   null when no usable position pair is given.
+ */
+export function cpaTcpa(
+  ownPos,
+  ownCourseDeg,
+  ownSpeedKn,
+  targetPos,
+  targetCourseDeg,
+  targetSpeedKn,
+) {
+  if (!ownPos || !targetPos) return null;
+  const cpaNow = () => ({
+    cpaNm: distanceNm(ownPos, targetPos),
+    tcpaMin: null,
+  });
+  const hasMotion = (c, s) => Number.isFinite(c) && Number.isFinite(s) && s > 0;
+  if (
+    !hasMotion(ownCourseDeg, ownSpeedKn) &&
+    !hasMotion(targetCourseDeg, targetSpeedKn)
+  ) {
+    return cpaNow();
+  }
+  // Local ENU frame anchored at own position (nm): north = +y, east = +x.
+  const φ = ownPos[0] * RAD;
+  const enu = ([lat, lon]) => [
+    (lon - ownPos[1]) * RAD * EARTH_RADIUS_NM * Math.cos(φ),
+    (lat - ownPos[0]) * RAD * EARTH_RADIUS_NM,
+  ];
+  const vel = (courseDeg, speedKn) => {
+    const c = courseDeg * RAD;
+    // Nautical "nm per hour" = knots: velocity components in nm/min.
+    return [(Math.sin(c) * speedKn) / 60, (Math.cos(c) * speedKn) / 60];
+  };
+  const r = enu(targetPos);
+  const vO = hasMotion(ownCourseDeg, ownSpeedKn)
+    ? vel(ownCourseDeg, ownSpeedKn)
+    : [0, 0];
+  const vT = hasMotion(targetCourseDeg, targetSpeedKn)
+    ? vel(targetCourseDeg, targetSpeedKn)
+    : [0, 0];
+  const vR = [vT[0] - vO[0], vT[1] - vO[1]];
+  const v2 = vR[0] * vR[0] + vR[1] * vR[1];
+  if (v2 <= 1e-12) return cpaNow();
+  // Time of closest approach: minimize |r + vR·t| → t = -(r·vR)/|vR|².
+  const tMin = -(r[0] * vR[0] + r[1] * vR[1]) / v2;
+  if (tMin <= 0) return cpaNow(); // already opening — CPA is now
+  const cpaNm = Math.hypot(r[0] + vR[0] * tMin, r[1] + vR[1] * tMin);
+  return { cpaNm, tcpaMin: tMin };
+}
+
+/** CPA watch limits (work doc #30): a target breaching BOTH limits is
+ * closing on us inside the watch horizon — glyph + panel cue. Pure
+ * constants; the operator's watchkeeping practice sets them. */
+export const CPA_ALARM_NM = 0.5;
+export const CPA_ALARM_TCPA_MIN = 20;
+/** Targets below this CPA show the figure in their map tooltip too. */
+export const CPA_TOOLTIP_NM = 2;
+
+/**
+ * Own-ship bearing & distance rows for a picked point (work doc #30,
+ * "the single most-wanted helm readout"): true bearing and distance
+ * from EACH own-ship reference — the DR position and the GPS position
+ * — shaped for the pick menu. A source without a position is omitted
+ * (never a fabricated row).
+ *
+ * @param {{dr?: [number, number]|null, gps?: [number, number]|null}} own
+ * @param {[number, number]} target - [lat, lon]
+ * @returns {Array<{source: "DR"|"GPS", bearingDeg: number, distNm: number}>}
+ */
+export function ownBearingRows(own, target) {
+  const rows = [];
+  if (!target) return rows;
+  for (const source of ["dr", "gps"]) {
+    const pos = own?.[source];
+    if (!pos) continue;
+    rows.push({
+      source: source.toUpperCase(),
+      bearingDeg: bearingBetween(pos, target),
+      distNm: distanceNm(pos, target),
+    });
+  }
+  return rows;
+}
+
+/**
+ * ETA label for the AIS target panel (work doc #30): Zulu always —
+ * "14:30Z" same-day, "18.9. 14:30Z" otherwise. Invalid/absent → "".
+ *
+ * @param {number|null|undefined} ms - epoch ms
+ * @param {number} [nowMs=Date.now()]
+ * @returns {string}
+ */
+export function etaLabel(ms, nowMs = Date.now()) {
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms);
+  const n = new Date(nowMs);
+  const time = `${clockTextZ(ms)}Z`;
+  // A different UTC calendar day carries its date — future ETAs
+  // especially (a negative age must not read as "today").
+  const sameDay =
+    d.getUTCFullYear() === n.getUTCFullYear() &&
+    d.getUTCMonth() === n.getUTCMonth() &&
+    d.getUTCDate() === n.getUTCDate();
+  return sameDay ? time : `${d.getUTCDate()}.${d.getUTCMonth() + 1}. ${time}`;
+}
+
+/**
+ * Wind layline geometry (work doc #30): the two courses symmetric
+ * about the true wind direction that the boat can actually steer on
+ * this point of sail — TWD ± beatAngle when the wind is forward of
+ * the beam (close-hauled), TWD ± gybeAngle when it is aft (running).
+ * Drawn from the DR vessel only: wind and tacking are water-
+ * referenced, so laylines hung off the GPS position would be
+ * current-sheared.
+ *
+ * Tack assignment follows the navigation-light convention: the course
+ * on the port side of the wind (TWD + angle) is the PORT tack (red),
+ * TWD − angle the STARBOARD tack (green).
+ *
+ * Gating is honest: any missing input (true wind, the angle this point
+ * of sail needs) → null and the layer simply doesn't render — no fake
+ * defaults. A missing heading falls back to beat angles (the racing
+ * default: upwind positions dominate a passage).
+ *
+ * @param {[number, number]} position - the DR position rays run from
+ * @param {{twdDeg: number|null, beatAngleDeg: number|null,
+ *   gybeAngleDeg: number|null, headingDeg?: number|null, lengthNm: number}} o
+ * @returns {{mode: "beat"|"gybe", angleDeg: number, rays: Array<{
+ *   courseDeg: number, tack: "port"|"starboard", to: [number, number],
+ *   color: string}>}|null}
+ */
+export function laylineSpec(position, o) {
+  if (!position) return null;
+  const { twdDeg, beatAngleDeg, gybeAngleDeg } = o ?? {};
+  if (!Number.isFinite(twdDeg)) return null;
+  const awa = o?.headingDeg == null ? 0 : angleDiffDeg(o.headingDeg, twdDeg);
+  const beating = awa < 90; // wind forward of the beam
+  const angleDeg = beating ? beatAngleDeg : gybeAngleDeg;
+  if (!Number.isFinite(angleDeg) || angleDeg <= 0 || angleDeg >= 180) {
+    return null;
+  }
+  const ray = (courseDeg, tack, color) => ({
+    courseDeg,
+    tack,
+    color,
+    to: destinationPoint(position, courseDeg, o.lengthNm),
+  });
+  return {
+    mode: beating ? "beat" : "gybe",
+    angleDeg,
+    rays: [
+      ray(norm360(twdDeg - angleDeg), "starboard", STYLE.laylineStbd),
+      ray(norm360(twdDeg + angleDeg), "port", STYLE.laylinePort),
+    ],
+  };
+}
+
+/** Smallest signed angle difference a−b, in (−180, 180]. */
+export function angleDiffDeg(a, b) {
+  let d = (a - b) % 360;
+  if (d > 180) d -= 360;
+  if (d <= -180) d += 360;
+  return d;
+}
+
+/** Normalizes an angle to [0, 360). */
+export function norm360(a) {
+  return ((a % 360) + 360) % 360;
+}
+
+/**
+ * Shapes a Signal K v2 resources collection (`GET /resources/notes`)
+ * into map render specs (work doc #30). Entries without a position
+ * (region-only notes) are skipped for now — the chart plots points.
+ *
+ * @param {object|null|undefined} collection - `{ [id]: note }` map
+ * @returns {Array<{id: string, position: [number, number], title: string}>}
+ */
+export function notesRenderSpecs(collection) {
+  if (!collection || typeof collection !== "object") return [];
+  const specs = [];
+  for (const [id, note] of Object.entries(collection)) {
+    if (!note || typeof note !== "object") continue;
+    const p = note.position;
+    if (typeof p?.latitude !== "number" || typeof p?.longitude !== "number") {
+      continue;
+    }
+    specs.push({
+      id,
+      position: [p.latitude, p.longitude],
+      title: typeof note.title === "string" && note.title ? note.title : "Note",
+    });
+  }
+  return specs;
+}
+
+/**
+ * Builds the resource body for POST/PUT to `/resources/notes` from the
+ * creation/edit form (work doc #30): title, body, mimeType and the
+ * picked position. The server assigns ids on POST.
+ *
+ * @param {{title: string, body: string, mimeType?: string|null,
+ *   position: [number, number]}} form
+ * @returns {object} the note resource
+ */
+export function noteResourceFromForm(form) {
+  const resource = {
+    title: String(form.title ?? "").trim() || "Note",
+    body: String(form.body ?? ""),
+    position: { latitude: form.position[0], longitude: form.position[1] },
+  };
+  if (form.mimeType) resource.mimeType = form.mimeType;
+  return resource;
+}
+
+/** Escapes a string for safe interpolation into HTML. */
+function escapeHtml(s) {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
+ * Renders a note's body per its `mimeType` (work doc #30, Freeboard-SK's
+ * rule: honor the declared type, default plain). Plain text renders as
+ * pre-wrap text — whitespace is content on a written chart annotation.
+ * Markdown gets a minimal safe renderer (headings, bold/italic, inline
+ * code, links, lists) — enough for helm notes, never raw HTML (all
+ * input escaped first; the note body is OTHER PEOPLE's input too —
+ * notes sync through the Signal K server from any client).
+ *
+ * @param {string|null|undefined} body
+ * @param {string|null|undefined} mimeType
+ * @returns {string} HTML for the detail popover
+ */
+export function renderNoteBody(body, mimeType) {
+  if (body == null) return "";
+  const text = String(body);
+  if ((mimeType ?? "text/plain") !== "text/markdown") {
+    return `<p class="dr-note-plain">${escapeHtml(text)}</p>`;
+  }
+  // Markdown: escape everything first, then layer minimal structure.
+  const lines = escapeHtml(text).split(/\r?\n/);
+  const out = [];
+  let inList = false;
+  const closeList = () => {
+    if (inList) {
+      out.push("</ul>");
+      inList = false;
+    }
+  };
+  for (const raw of lines) {
+    const line = raw.trim();
+    const heading = /^#{1,3}\s+(.*)$/.exec(line);
+    const item = /^[-*]\s+(.*)$/.exec(line);
+    if (item) {
+      if (!inList) {
+        out.push("<ul>");
+        inList = true;
+      }
+      out.push(`<li>${inlineMd(item[1])}</li>`);
+      continue;
+    }
+    closeList();
+    if (!line) {
+      out.push("");
+      continue;
+    }
+    if (heading) {
+      out.push(`<strong>${inlineMd(heading[1])}</strong>`);
+      continue;
+    }
+    out.push(`<p>${inlineMd(line)}</p>`);
+  }
+  closeList();
+  return out.join("\n");
+}
+
+/** Minimal inline markdown — bold, italic, code, links — on top of
+ * pre-escaped text. */
+function inlineMd(s) {
+  return s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener">$1</a>',
+    );
 }

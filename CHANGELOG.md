@@ -7,28 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Hosted plotter widgets showed as empty black squares with no
-  data** (sea trial 2026-09-21). Two independent bugs, both in the
-  widget host, both reproducible with a locally served webapp against
-  a stub Signal K server:
-  - The bus port captured the widget iframe's `contentWindow` at
-    context creation — but a browser replaces that Window object when
-    the frame navigates from `about:blank` to its `src` (and the
-    frame is still detached, window `null`, when the context is
-    created). Every message from the loaded widget was silently
-    dropped: the handshake never completed and the tile sat on its
-    placeholder grid. The port now resolves the live window per
-    message (`liveWindowPort`).
-  - A placement restored from layout storage (page reload) rendered
-    an empty dark cell forever: the area element renders its cells
-    before discovery has created the widget contexts, and the iframe
-    was only adopted at cell creation. Adoption is now idempotent —
-    every render adopts a context's iframe into its cell unless it's
-    already home (never re-parenting a live iframe, which would
-    reload it).
-
 ### Added
+- **Chartplotter UX (work doc #30, north-up phase):** the DR webapp
+  navigates like a plotter, not a map viewer:
+  - **Own-ship boat glyphs** replace the GPS dot and the bare DR X —
+    a pointed-hull vessel shape rotated to COG (GPS) and to the DR
+    course (DR), the navigator's X kept as a small detail inside the
+    DR hull. Dot/X fallbacks when course is unknown.
+  - **10-minute predictor vectors** (layers control, "Vectors"): a
+    dashed COG×SOG line from the GPS position and a DR-course×DR-speed
+    line from the DR position, with tick marks at 2-minute intervals;
+    the AIS velocity leader extends from the 6-minute to the same
+    10-minute convention so every predictor on the chart reads as one
+    family.
+  - **Nautical scale bar** (bottom-left): a custom control snapped to
+    a 0.1–1000 NM ladder (80–200 px band), metric fallback at deep
+    zooms; no `1:x` numeric readout.
+  - **Range rings** (layers control, "Range rings"): three
+    concentric rings centered on the GPS position, spacing derived
+    from the zoom ladder, re-spaced on zoom.
+  - **Wind laylines** (layers control, "Laylines"): two rays from the
+    DR vessel at TWD ± beat/gybe angle (the polar performance plugin's
+    angles — the established feed), port tack red / starboard green
+    per the navigation-light convention, fixed screen-relative length.
+    Gated honestly: renders only while `navigation.state` is
+    `sailing`, and only when true wind and the angle this point of
+    sail needs are actually published.
+  - **Pick menu is now the target surface:** every pick shows bearing
+    & distance from BOTH own-ship references (DR and GPS — the
+    most-wanted helm readout, absent-source rows hidden); AIS picks
+    add the target details panel (type, flag, dimensions, destination
+    & ETA — Freeboard-SK's field set, new static paths in the AIS
+    subscription folded into the store) plus **CPA/TCPA for both
+    references** (DR-based = conservative, GPS-based = conventional);
+    a target closing inside the CPA watch limits (0.5 nm / 20 min)
+    turns its glyph red and carries the CPA figure in its tooltip.
+  - **Measure tool** ("Measure from here…" in the pick menu): tap
+    points, get true bearing + distance leg by leg with a running
+    total in a floating readout; double-click / right-click / Esc ends.
+  - **Signal K notes on the chart**: positioned notes from the v2
+    resources API render as orange pin markers on a toggleable
+    "Notes" layer; clicking/right-clicking opens the detail surface
+    (title, body rendered per mimeType with a minimal safe markdown
+    renderer, timestamp, DR/GPS bearings, all pick actions). The pick
+    menu gains "New note at…" — a one-handed hazard-marking form
+    (Hazard preset, position pre-seeded) that POSTs to the v2
+    resources API, with edit/delete from the note's menu and refetch
+    on stream reconnect. Failed writes surface in the form, never
+    silently.
+
 - **Fixes over a day old carry their date on the chart** —
   "Fix 18.9. 02:36Z" instead of the ambiguous "Fix 02:36Z". With the
   new 7-day history window most fixes on the chart aren't from
@@ -66,6 +93,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   glance figure is distance-since-departure; the cumulative total
   rides along as the figure's hover tooltip. Falls back to the
   cumulative log until a first trip boundary is ever observed.
+
+### Fixed
+- **Hosted plotter widgets showed as empty black squares with no
+  data** (sea trial 2026-09-21). Two independent bugs, both in the
+  widget host, both reproducible with a locally served webapp against
+  a stub Signal K server:
+  - The bus port captured the widget iframe's `contentWindow` at
+    context creation — but a browser replaces that Window object when
+    the frame navigates from `about:blank` to its `src` (and the
+    frame is still detached, window `null`, when the context is
+    created). Every message from the loaded widget was silently
+    dropped: the handshake never completed and the tile sat on its
+    placeholder grid. The port now resolves the live window per
+    message (`liveWindowPort`).
+  - A placement restored from layout storage (page reload) rendered
+    an empty dark cell forever: the area element renders its cells
+    before discovery has created the widget contexts, and the iframe
+    was only adopted at cell creation. Adoption is now idempotent —
+    every render adopts a context's iframe into its cell unless it's
+    already home (never re-parenting a live iframe, which would
+    reload it).
 
 ## [0.11.2] - 2026-09-21
 

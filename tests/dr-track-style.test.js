@@ -63,15 +63,16 @@ test("dr-map-view: casing polyline renders below the heavier ghost track", () =>
   );
 });
 
-test("dr-map-view: DR marker is the navigator's X, in marker white", () => {
+test("dr-map-view: DR marker is the navigator's mark, X kept in the glyph", () => {
   // Traditional chartwork: a dead reckoned position plots as an X,
-  // deliberately NOT a fix symbol. The X stays in the marker white
-  // for contrast over the teal track it rides.
-  assert.match(mapSrc, /_drIcon\(\)/);
+  // deliberately NOT a fix symbol. Work doc #30 turns the mark into a
+  // boat glyph when the DR course is known, with the X kept as a small
+  // detail inside the hull (and the bare X as the no-course fallback).
   const drIcon = mapSrc.slice(
-    mapSrc.indexOf("_drIcon() {"),
-    mapSrc.indexOf("renderArrows(arrows, color, layer)"),
+    mapSrc.indexOf("_drIcon(courseDeg) {"),
+    mapSrc.indexOf("renderVectors(snap) {"),
   );
-  assert.match(drIcon, /M2 2 L12 12 M12 2 L2 12/, "crossed-strokes X glyph");
+  assert.match(drIcon, /M2 2 L12 12 M12 2 L2 12/, "crossed-strokes X fallback");
   assert.match(drIcon, /vm\.STYLE\.drMarker/, "white from the view-model");
+  assert.match(mapSrc, /opts\.x/, "boat glyph carries the X detail");
 });

@@ -42,6 +42,7 @@ import { THEME_CSS } from "./dr-theme.js";
 import * as vm from "./dr-viewmodel.js";
 import "./dr-map-view.js";
 import "./dr-current-panel.js";
+import "./dr-note-panel.js";
 import "./dr-sight-panel.js";
 import "./dr-fix-panel.js";
 import "./dr-pending-list.js";
@@ -487,6 +488,10 @@ template.innerHTML = /* html */ `
   <dialog id="detail-dialog">
     <dr-detail-popover id="dr-detail"></dr-detail-popover>
   </dialog>
+
+  <dialog id="note-dialog">
+    <dr-note-panel id="dr-note"></dr-note-panel>
+  </dialog>
 `;
 
 class DrApp extends HTMLElement {
@@ -648,6 +653,31 @@ class DrApp extends HTMLElement {
     /** @type {import("./dr-detail-popover.js").default|null} */
     this.detail = root.querySelector("#dr-detail");
     this.detail?.addEventListener("dr-close", () => this.detailDialog?.close());
+    // Signal K notes (work doc #30): the pick menu's "New note at…"
+    // opens the creation form at the picked position; a note marker's
+    // menu offers edit/delete on the same detail surface. dr-app owns
+    // the v2 resources REST side; the panel owns the form.
+    this.noteDialog = root.querySelector("#note-dialog");
+    this.notePanel = root.querySelector("#dr-note");
+    this.notePanel?.addEventListener("dr-close", () =>
+      this.noteDialog?.close(),
+    );
+    this.notePanel?.addEventListener("dr-note-save", (e) =>
+      this.saveNote(e.detail),
+    );
+    this.map?.addEventListener("dr-note-new", (e) => {
+      this.notePanel?.open({ position: [e.detail.lat, e.detail.lng] });
+      this.noteDialog?.showModal();
+    });
+    this.map?.addEventListener("dr-note-edit", (e) => {
+      const resource = this.notesById?.get(e.detail.id);
+      if (!resource) return;
+      this.notePanel?.open({ note: { ...resource, id: e.detail.id } });
+      this.noteDialog?.showModal();
+    });
+    this.map?.addEventListener("dr-note-delete", (e) =>
+      this.deleteNote(e.detail.id),
+    );
     this.map?.addEventListener("dr-inspect", (e) => {
       const { kind, id } = e.detail;
       const row =
@@ -737,6 +767,10 @@ class DrApp extends HTMLElement {
     this.routeCache = new Map();
     /** Cache-buster key of the route spec currently on the map. */
     this.routeRenderedKey = null;
+    /** Signal K notes cache (work doc #30): id → note resource. The
+     * source of truth is the server's v2 resources API; the cache lets
+     * saves update markers without a full refetch. */
+    this.notesById = new Map();
     /** Route ids with a fetch in progress — the 1 Hz course stream
      * would otherwise re-issue the request until it lands.
      * @type {Set<string>|null} */
@@ -775,6 +809,7 @@ class DrApp extends HTMLElement {
     // an open pending sheet hides the stack entirely (see below).
     // Desktop keeps 0: the readout is right-docked, no collision.
     const readout = root.querySelector(".dr-readout");
+    const topBand = root.querySelector(".dr-top");
     if (readout && typeof ResizeObserver !== "undefined") {
       const mq = window.matchMedia("(max-width: 600px)");
       const syncMapOffset = () => {
@@ -794,10 +829,20 @@ class DrApp extends HTMLElement {
             ) + 8;
         }
         this.map?.style.setProperty("--dr-map-bottom-offset", `${off}px`);
+        // Top band height (work doc #30): the map-side floating
+        // readouts (measure tool) position below the top panels — the
+        // overlay layer paints above the map, so a top-center readout
+        // would otherwise sit UNDER the GPS status panel and become
+        // unreadable.
+        const topOff = topBand
+          ? Math.ceil(topBand.getBoundingClientRect().height) + 8
+          : 0;
+        this.map?.style.setProperty("--dr-map-top-offset", `${topOff}px`);
       };
       const ro = new ResizeObserver(syncMapOffset);
       ro.observe(readout);
       if (this.drawer) ro.observe(this.drawer);
+      if (topBand) ro.observe(topBand);
       mq.addEventListener?.("change", syncMapOffset);
       this._syncMapOffset = syncMapOffset;
       syncMapOffset();
@@ -816,6 +861,9 @@ class DrApp extends HTMLElement {
         this.refreshOverlays();
         this.refreshTrackHistory();
         this.bootstrapAis();
+        // Notes ride the same boot sequence — and refetch on stream
+        // reconnect (the route/seed pattern).
+        this.fetchNotes();
       })
       .catch(() => {});
     // Slow REST refresh for persisted overlays; stream drives the live parts.
@@ -864,6 +912,10 @@ class DrApp extends HTMLElement {
       "navigation.deadReckoning.elapsedSinceFix",
       "navigation.state",
       "navigation.position",
+      // Own-ship motion for the predictor vectors (work doc #30): the
+      // GPS reference projects along COG at SOG.
+      "navigation.courseOverGroundTrue",
+      "navigation.speedOverGround",
       "navigation.gnss.type",
       "navigation.gnss.method",
       "navigation.gnss.satellites",
@@ -873,6 +925,12 @@ class DrApp extends HTMLElement {
       "environment.mode",
       "environment.current.setTrue",
       "environment.current.drift",
+      // Wind laylines (work doc #30): true wind direction + the polar
+      // performance plugin's beat/gybe angles (the same feed as
+      // performance.polarSpeed — source and staleness established).
+      "environment.wind.directionTrue",
+      "performance.beatAngle",
+      "performance.gybeAngle",
       // Active route (Freeboard-SK's discovery pattern): the course
       // provider publishes the whole activeRoute object — href, name,
       // pointIndex, pointTotal — as ONE delta value at this path (not
@@ -893,6 +951,16 @@ class DrApp extends HTMLElement {
       "navigation.courseOverGroundTrue",
       "navigation.speedOverGround",
       "navigation.headingTrue",
+      // Static target details (work doc #30): dimensions, flag state,
+      // vessel type, destination & ETA. Providers publish subsets —
+      // the panel hides what never arrives.
+      "design.length",
+      "design.length.overall",
+      "design.beam",
+      "registrations.country",
+      "aisShipType",
+      "type",
+      "navigation.destination",
       "name",
       "mmsi",
       "",
@@ -995,6 +1063,29 @@ class DrApp extends HTMLElement {
           hdop: pick("horizontalDilution"),
         });
       }
+      // Own-ship motion seed (work doc #30) — the predictor vectors
+      // render from the REST snapshot before the first delta arrives.
+      const cog = nav?.navigation?.courseOverGroundTrue;
+      const cogVal = cog?.value ?? cog;
+      if (Number.isFinite(cogVal)) this.snap.gpsCogDeg = vm.radToDeg(cogVal);
+      const sog = nav?.navigation?.speedOverGround;
+      const sogVal = sog?.value ?? sog;
+      if (Number.isFinite(sogVal)) this.snap.gpsSogKn = vm.msToKn(sogVal);
+      // Layline inputs (work doc #30) from the REST snapshot: true wind
+      // direction and the polar performance angles, when published.
+      const twd = nav?.environment?.wind?.directionTrue;
+      const twdVal = twd?.value ?? twd;
+      if (Number.isFinite(twdVal)) this.snap.twdDeg = vm.radToDeg(twdVal);
+      const beat = nav?.performance?.beatAngle;
+      const beatVal = beat?.value ?? beat;
+      if (Number.isFinite(beatVal)) {
+        this.snap.beatAngleDeg = vm.radToDeg(beatVal);
+      }
+      const gybe = nav?.performance?.gybeAngle;
+      const gybeVal = gybe?.value ?? gybe;
+      if (Number.isFinite(gybeVal)) {
+        this.snap.gybeAngleDeg = vm.radToDeg(gybeVal);
+      }
       // Active route seed (Freeboard-SK pattern): the REST self snapshot
       // carries the full course subtree, so a route activated before the
       // page loaded shows immediately without waiting for a delta.
@@ -1091,11 +1182,112 @@ class DrApp extends HTMLElement {
   renderAis() {
     const nowMs = Date.now();
     vm.pruneAisStore(this.aisStore, nowMs);
+    // Own reference prefers DR (the chart's own-boat reference); the
+    // CPA for the glyph cue is computed against the same reference's
+    // motion — the target panel carries BOTH references (work doc #30).
     const own = this.snap.drPosition ?? this.snap.gpsPosition;
+    const ownCourseDeg = this.snap.drPosition
+      ? this.snap.drCourse?.courseDeg
+      : this.snap.gpsCogDeg;
+    const ownSpeedKn = this.snap.drPosition
+      ? this.snap.drCourse?.speedKn
+      : this.snap.gpsSogKn;
     this.map?.renderAis(
-      vm.aisTargetsForRender(this.aisStore, nowMs, own),
+      vm.aisTargetsForRender(this.aisStore, nowMs, own, {
+        ownCourseDeg,
+        ownSpeedKn,
+      }),
       nowMs,
     );
+  }
+
+  /**
+   * Fetches and renders the Signal K notes collection (work doc #30)
+   * from the v2 resources API — the same API version and fetch/cache
+   * pattern as the active route. Notes without a position are skipped
+   * by the viewmodel shaping (region-only notes don't plot).
+   *
+   * @returns {Promise<void>}
+   */
+  async fetchNotes() {
+    try {
+      const res = await fetch("/signalk/v2/api/resources/notes");
+      if (!res.ok) return;
+      const collection = await res.json();
+      this.notesById = new Map(Object.entries(collection ?? {}));
+      this.renderNotes();
+    } catch {
+      /* REST unavailable — retry on the next reconnect */
+    }
+  }
+
+  /** @returns {void} */
+  renderNotes() {
+    const collection = Object.fromEntries(this.notesById);
+    this.map?.renderNotes(vm.notesRenderSpecs(collection), this.notesById);
+  }
+
+  /**
+   * Saves a note (create POST / edit PUT, server-assigned ids on
+   * create). A successful save updates the cache and re-renders the
+   * marker immediately — no full refetch. A failed write (read-only
+   * session, resource-provider backend) surfaces in the form, never
+   * silently.
+   *
+   * @param {{id: string|null, resource: object}} detail
+   * @returns {Promise<void>}
+   */
+  async saveNote(detail) {
+    const { id, resource } = detail;
+    try {
+      const res = await fetch(
+        id
+          ? `/signalk/v2/api/resources/notes/${encodeURIComponent(id)}`
+          : "/signalk/v2/api/resources/notes",
+        {
+          method: id ? "PUT" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(resource),
+        },
+      );
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body?.message ?? `HTTP ${res.status}`);
+      }
+      const newId = id ?? body?.id ?? body?.resourceId ?? null;
+      if (newId) {
+        this.notesById.set(newId, resource);
+      }
+      this.renderNotes();
+      this.noteDialog?.close();
+    } catch (err) {
+      this.notePanel?.showError(`Save failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Deletes a note after confirmation — best-effort like every write;
+   * the confirm dialog reports the failure when the server rejects.
+   *
+   * @param {string} id
+   * @returns {Promise<void>}
+   */
+  async deleteNote(id) {
+    if (!id || !window.confirm("Delete this note?")) return;
+    try {
+      const res = await fetch(
+        `/signalk/v2/api/resources/notes/${encodeURIComponent(id)}`,
+        { method: "DELETE" },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.message ?? `HTTP ${res.status}`);
+      }
+      this.notesById.delete(id);
+      this.renderNotes();
+    } catch (err) {
+      window.alert(`Delete failed: ${err.message}`);
+    }
   }
 
   /**
@@ -1207,6 +1399,10 @@ class DrApp extends HTMLElement {
         break;
       case "navigation.state":
         this.vesselNavState = typeof value === "string" ? value : null;
+        // Laylines (work doc #30) are a sail-maker's tool: they render
+        // only when actually sailing — motoring to windward is not a
+        // beat angle question.
+        this.snap.sailing = value === "sailing";
         // Re-render the DR status line — its wording depends on the
         // vessel state ("DR warm — moored").
         if (this.drStateValue) this.renderDrState(this.drStateValue);
@@ -1228,6 +1424,14 @@ class DrApp extends HTMLElement {
         }
         break;
       }
+      case "navigation.courseOverGroundTrue":
+        // Bus value is radians; the snap carries degrees.
+        if (Number.isFinite(value)) this.snap.gpsCogDeg = vm.radToDeg(value);
+        break;
+      case "navigation.speedOverGround":
+        // Bus value is m/s; the snap carries knots.
+        if (Number.isFinite(value)) this.snap.gpsSogKn = vm.msToKn(value);
+        break;
       case "navigation.gnss.type":
         this.applyGnss({ type: value });
         break;
@@ -1275,6 +1479,16 @@ class DrApp extends HTMLElement {
         this.refreshActiveRoute();
         break;
       }
+      case "environment.wind.directionTrue":
+        // Bus value is radians; the snap carries degrees.
+        if (Number.isFinite(value)) this.snap.twdDeg = vm.radToDeg(value);
+        break;
+      case "performance.beatAngle":
+        if (Number.isFinite(value)) this.snap.beatAngleDeg = vm.radToDeg(value);
+        break;
+      case "performance.gybeAngle":
+        if (Number.isFinite(value)) this.snap.gybeAngleDeg = vm.radToDeg(value);
+        break;
       case "environment.current.setTrue":
       case "environment.current.setTrue":
         // Bus value is radians; the snap (and /status) carry degrees.
@@ -1691,6 +1905,10 @@ class DrApp extends HTMLElement {
       // Re-seed AIS static data on (re)connect (work doc #23) — names
       // and MMSIs don't ride position deltas.
       this.bootstrapAis();
+      // Notes refetch on reconnect (work doc #30) — the established
+      // route/seed pattern: resources written by other clients (or
+      // while offline) reappear without a page reload.
+      this.fetchNotes();
     }
     // "open" — let the DR state panel take over once data flows.
   }

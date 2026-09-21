@@ -115,6 +115,82 @@ class DrMapView extends HTMLElement {
         padding: 0 0.75rem;
         background: transparent;
       }
+      /* Target info panel rows (work doc #30): Freeboard-SK's field
+         set, in the tactical readout style — muted keys, main values. */
+      .dr-target-info {
+        display: flex;
+        flex-direction: column;
+        gap: 0.15rem;
+        padding-right: 0.25rem;
+      }
+      .dr-target-info div {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+      .dr-target-key {
+        color: var(--text-muted, #888899);
+      }
+      /* Helm readouts (bearing/CPA rows) — emphasized: these are the
+         numbers the watchkeeper opened the menu for. */
+      .dr-pick-readout {
+        color: var(--text-main, #ffffff);
+        border-top: 1px solid rgba(255, 255, 255, 0.15);
+        padding-top: 0.15rem;
+      }
+      /* Measure tool floating readout (work doc #30): per-leg
+         bearing/distance lines + running total, top-center so it never
+         collides with the corner control stacks. --dr-map-top-offset
+         (set by dr-app, measured from the top control band) pushes it
+         below the floating panels — the overlay layer paints above the
+         map, so a naive top: 8px would slide the readout UNDER the GPS
+         status panel and make both unreadable. */
+      .dr-measure {
+        position: absolute;
+        top: calc(8px + var(--dr-map-top-offset, 0px));
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 1000;
+        background-color: rgba(17, 20, 20, 0.8);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        padding: 0.4rem 0.6rem;
+        font-family: ui-monospace, "Fira Code", monospace;
+        font-size: 0.8rem;
+        color: var(--text-main, #ffffff);
+        pointer-events: none;
+      }
+      .dr-measure-total {
+        color: var(--color-teal, #4b8b99);
+        border-top: 1px solid rgba(255, 255, 255, 0.15);
+        margin-top: 0.15rem;
+        padding-top: 0.15rem;
+      }
+      /* Note details (work doc #30): the body renders as content —
+         pre-wrap for plain text, minimal markdown — capped so a long
+         note doesn't take the whole chart. */
+      .dr-note-info {
+        max-width: 16rem;
+      }
+      .dr-note-body {
+        max-height: 10rem;
+        overflow-y: auto;
+        color: var(--text-main, #ffffff);
+      }
+      .dr-note-body p {
+        margin: 0 0 0.25rem 0;
+        white-space: pre-wrap;
+      }
+      .dr-note-body ul {
+        margin: 0.15rem 0 0.25rem 1rem;
+        padding: 0;
+      }
+      .dr-note-body code {
+        font-family: ui-monospace, "Fira Code", monospace;
+      }
+      .dr-note-actions {
+        display: flex;
+        gap: 0.25rem;
+      }
       /* Leaflet chrome → tactical: dark, flat, teal */
       .leaflet-bar,
       .leaflet-control-layers {
@@ -276,7 +352,22 @@ class DrMapView extends HTMLElement {
       advancements: null,
       ais: null,
       route: null,
+      // Predictor vectors + range rings (work doc #30): created but
+      // NOT added to the map — they mount through the layers control
+      // (decluttering toggles), which adds/removes the group itself.
+      vectors: null,
+      rings: null,
+      // Wind laylines (work doc #30) — layers-control toggle like the
+      // other overlays.
+      laylines: null,
+      // Signal K notes (work doc #30) — layers-control toggle.
+      notes: null,
+      // Measure tool geometry (work doc #30) — transient, always on.
+      measure: null,
     };
+    /** Layer keys that mount through the layers control instead of
+     * always-on (work doc #30). */
+    this.toggleableLayers = new Set(["vectors", "rings", "laylines", "notes"]);
     this.tileLayers = {};
     this.follow = true;
     /**
@@ -324,12 +415,31 @@ class DrMapView extends HTMLElement {
     });
     L.control.zoom({ position: "bottomleft" }).addTo(this.map);
     for (const key of Object.keys(this.layers)) {
-      this.layers[key] = L.layerGroup().addTo(this.map);
+      this.layers[key] = L.layerGroup();
+      if (!this.toggleableLayers.has(key)) this.layers[key].addTo(this.map);
     }
+    // Nautical scale bar (work doc #30): a custom control — Leaflet's
+    // stock L.control.scale only does metric/imperial, and the helm
+    // wants NM. Updates on every zoom/pan (mpp depends on latitude).
+    this._scaleCtrl = new NauticalScaleControl();
+    this._scaleCtrl.addTo(this.map);
+    // Range rings re-space with zoom (their spacing derives from the
+    // current scale); the scale bar re-reads it too.
+    this.map.on("zoomend moveend", () => {
+      this._scaleCtrl.update(this.map);
+      this.renderRangeRings();
+      this.renderLaylines();
+    });
     this.map.on("dragstart", () => {
       this.follow = false;
       this.recenterBtn?.classList.remove("engaged");
       this.recenterBtn?.setAttribute("aria-pressed", "false");
+    });
+    // Measure tool (work doc #30): double-click ends and clears. The
+    // duplicate-click guard in _addMeasureLeg catches the two clicks
+    // of the double-click first; this is the explicit gesture.
+    this.map.on("dblclick", () => {
+      if (this._measurePts) this.endMeasure();
     });
     // Chart pick: right-click / long-press opens a small context menu
     // to pre-seed a sight form with the picked object position (and the
@@ -338,16 +448,26 @@ class DrMapView extends HTMLElement {
     // its *predicted* position seeds the bearing, with the sight time
     // anchored to the prediction instant.
     this.map.on("contextmenu", (e) => {
+      // Measuring: right-click ends the measure tool instead of picking
+      // (work doc #30 — the same gesture that opened the menu closes
+      // the measurement).
+      if (this._measurePts) {
+        this.endMeasure();
+        return;
+      }
       const target = this._aisTargetAt(e.containerPoint);
       if (target) {
         // An AIS target is a vessel, not a chart feature — pre-seed the
         // bearing object as "Vessel {name}" so logbook entries and the
         // pending-LOP label read unambiguously (a bare name could be a
         // buoy, a cape, another boat…). The map glyph itself keeps the
-        // bare label (aisMarkerSpec.label).
+        // bare label (aisMarkerSpec.label). The full target spec rides
+        // along: the pick menu doubles as the plotter target panel
+        // (work doc #30) — details, DR/GPS bearings, CPA/TCPA.
         this.showPickMenu(target.position, e.containerPoint, {
           label: target.label ? `Vessel ${target.label}` : null,
           tMs: this._aisRenderNowMs ?? Date.now(),
+          target,
         });
         return;
       }
@@ -472,13 +592,19 @@ class DrMapView extends HTMLElement {
         // overlay (work doc #23) needs its checkbox so the chart can be
         // de-cluttered, and the active Signal K route too (a route
         // crossing the leg being sailed shouldn't be forced on top of
-        // the chartwork).
+        // the chartwork). Work doc #30 adds the plotter overlays:
+        // predictor vectors and range rings (off by default — declutter
+        // first, enable on demand).
         L.control
           .layers(
             bases,
             {
               "AIS traffic": this.layers.ais,
               "Active route": this.layers.route,
+              Vectors: this.layers.vectors,
+              "Range rings": this.layers.rings,
+              Laylines: this.layers.laylines,
+              Notes: this.layers.notes,
             },
             { collapsed: true, position: "bottomleft" },
           )
@@ -660,20 +786,24 @@ class DrMapView extends HTMLElement {
   areaAt = null;
 
   /**
-   * Shows a small context menu at a chart point offering to pre-seed a
-   * sight form with that position as the object. Dispatches
-   * `dr-pick-position` (composed, bubbles) with `{ lat, lng, mode,
-   * label, tMs }` — `label` carries the picked symbol's charted name
-   * (or an AIS target's name, work doc #23), `tMs` the pick instant the
-   * position is valid for (an AIS target's predicted position is
-   * anchored to it). When the pick lands on a hosted widget-area
-   * footprint (`areaAt`), the menu also offers widget placement via a
-   * `dr-open-ext-picker` event.
+   * Shows a small context menu at a chart point. Work doc #30 turns it
+   * into the plotter's target surface: every pick shows bearing &
+   * distance from BOTH own-ship references (DR and GPS — hide the row
+   * whose source is absent); an AIS pick adds the target details panel
+   * (name/MMSI, type, flag, dimensions, destination & ETA — Freeboard-SK's
+   * field set) plus CPA/TCPA for both references; and every menu offers
+   * the measure tool start. Dispatches `dr-pick-position` (composed,
+   * bubbles) with `{ lat, lng, mode, label, tMs }` — `label` carries the
+   * picked symbol's charted name (or an AIS target's name, work doc #23),
+   * `tMs` the pick instant the position is valid for (an AIS target's
+   * predicted position is anchored to it). When the pick lands on a
+   * hosted widget-area footprint (`areaAt`), the menu also offers widget
+   * placement via a `dr-open-ext-picker` event.
    *
    * @param {L.LatLng|[number, number]} latlng
    * @param {L.Point|null|undefined} [containerPoint]
-   * @param {{label?: string|null, tMs?: number}|null} [preset] - AIS
-   *   picks resolve label/time here instead of the chart query
+   * @param {{label?: string|null, tMs?: number, target?: object}|null} [preset]
+   *   AIS picks resolve label/time/target here instead of the chart query
    * @returns {void}
    */
   showPickMenu(latlng, containerPoint, preset = null) {
@@ -681,26 +811,197 @@ class DrMapView extends HTMLElement {
     this.hidePickMenu();
     const label = preset?.label ?? this.pickSymbolName(containerPoint);
     const tMs = Number.isFinite(preset?.tMs) ? preset.tMs : Date.now();
+    const picked = [
+      Array.isArray(latlng) ? latlng[0] : latlng.lat,
+      Array.isArray(latlng) ? latlng[1] : latlng.lng,
+    ];
     const menu = document.createElement("div");
     menu.className = "dr-pick-menu";
     const what = label ?? "this point";
     menu.textContent = `Add observation at ${what}…`;
+    // Target details (AIS picks, work doc #30): Freeboard-SK's field
+    // set — type, flag, dimensions, destination & ETA. Rows hide when
+    // the data never arrived; nothing fabricates.
+    const t = preset?.target;
+    if (t) {
+      const info = document.createElement("div");
+      info.className = "dr-target-info";
+      const rows = [];
+      const typeName = vm.aisShipTypeName(t.shipType) ?? t.typeName ?? null;
+      if (typeName) rows.push(["Type", typeName]);
+      const flag = vm.flagForCountry(t.country);
+      if (flag) rows.push(["Flag", flag]);
+      if (t.lengthM != null && t.beamM != null) {
+        rows.push([
+          "Dimensions",
+          `${t.lengthM.toFixed(0)} × ${t.beamM.toFixed(0)} m`,
+        ]);
+      } else if (t.lengthM != null) {
+        rows.push(["Length", `${t.lengthM.toFixed(0)} m`]);
+      }
+      if (t.destination) rows.push(["Destination", t.destination]);
+      const eta = vm.etaLabel(t.destinationEtaMs);
+      if (eta) rows.push(["ETA", eta]);
+      if (rows.length > 0) {
+        for (const [k, v] of rows) {
+          const row = document.createElement("div");
+          const key = document.createElement("span");
+          key.className = "dr-target-key";
+          key.textContent = k;
+          const val = document.createElement("span");
+          val.textContent = v;
+          row.appendChild(key);
+          row.appendChild(val);
+          info.appendChild(row);
+        }
+        menu.appendChild(info);
+      }
+    }
+    // Note details (work doc #30): the same detail surface as other
+    // chart objects — title, body rendered per mimeType, timestamp —
+    // plus Edit/Delete affordances riding the dr-detail-popover
+    // pattern. dr-app owns the REST side.
+    const note = preset?.note;
+    if (note) {
+      const info = document.createElement("div");
+      info.className = "dr-target-info dr-note-info";
+      const title = document.createElement("strong");
+      title.textContent = note.title;
+      info.appendChild(title);
+      const body = document.createElement("div");
+      body.className = "dr-note-body";
+      // renderNoteBody escapes all input before any markup — the body
+      // is other clients' content, synced through the server.
+      body.innerHTML = vm.renderNoteBody(note.body, note.mimeType);
+      info.appendChild(body);
+      if (note.timestamp) {
+        const when = document.createElement("span");
+        when.className = "dr-target-key";
+        when.textContent = vm.fixTimeLabel(note.timestamp) || "";
+        info.appendChild(when);
+      }
+      menu.appendChild(info);
+      const actions = document.createElement("div");
+      actions.className = "dr-note-actions";
+      for (const [label, event] of [
+        ["Edit note", "dr-note-edit"],
+        ["Delete note", "dr-note-delete"],
+      ]) {
+        const btn = document.createElement("button");
+        btn.textContent = ` ${label}`;
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this.hidePickMenu();
+          this.dispatchEvent(
+            new CustomEvent(event, {
+              bubbles: true,
+              composed: true,
+              detail: { id: note.id },
+            }),
+          );
+        });
+        actions.appendChild(btn);
+      }
+      menu.appendChild(actions);
+    }
+    // The helm readout (work doc #30): bearing & distance from BOTH
+    // own-ship references. Computed at menu-open from the last known
+    // positions — hidden per source when that reference is absent.
+    const own = {
+      dr: this._lastSnap?.drPosition ?? null,
+      gps: this._lastSnap?.gpsPosition ?? null,
+    };
+    for (const row of vm.ownBearingRows(own, picked)) {
+      const div = document.createElement("div");
+      div.className = "dr-pick-readout";
+      div.textContent = `${row.source} ${String(Math.round(row.bearingDeg)).padStart(3, "0")}° ${row.distNm.toFixed(2)} nm`;
+      menu.appendChild(div);
+    }
+    // CPA/TCPA for both references (work doc #30): the DR-based figure
+    // is the navigator's conservative view, the GPS-based one the
+    // conventional plotter number. Shown on AIS picks when both sides
+    // of the pair carry motion.
+    if (t) {
+      const cogDeg = t.cogDeg;
+      const sogKn = t.sogKn;
+      const refs = [];
+      if (own.dr && this._lastSnap?.drCourse?.speedKn) {
+        refs.push([
+          "DR",
+          vm.cpaTcpa(
+            own.dr,
+            this._lastSnap.drCourse.courseDeg,
+            this._lastSnap.drCourse.speedKn,
+            picked,
+            cogDeg,
+            sogKn,
+          ),
+        ]);
+      }
+      if (own.gps && this._lastSnap?.gpsSogKn) {
+        refs.push([
+          "GPS",
+          vm.cpaTcpa(
+            own.gps,
+            this._lastSnap.gpsCogDeg,
+            this._lastSnap.gpsSogKn,
+            picked,
+            cogDeg,
+            sogKn,
+          ),
+        ]);
+      }
+      for (const [source, cpa] of refs) {
+        if (!cpa) continue;
+        const div = document.createElement("div");
+        div.className = "dr-pick-readout";
+        div.textContent =
+          `CPA (${source}) ${cpa.cpaNm.toFixed(2)} nm` +
+          (cpa.tcpaMin != null ? ` / ${Math.round(cpa.tcpaMin)} min` : "");
+        menu.appendChild(div);
+      }
+    }
     const items = [
       { label: ` Bearing to ${what}`, mode: "bearing" },
       { label: ` Distance CPL at ${what}`, mode: "vertical" },
+      { label: " Measure from here…", mode: "_measure" },
+      // Hazard marking at the helm (work doc #30): every pick can
+      // become a Signal K note, pre-seeded with the picked position.
+      { label: " New note at…", mode: "_note" },
     ];
     for (const it of items) {
       const btn = document.createElement("button");
       btn.textContent = it.label;
-      btn.addEventListener("click", () => {
+      // stopPropagation: the menu lives inside the map container, so
+      // the activating click would otherwise ALSO reach Leaflet's
+      // container click handler — a measure start would immediately
+      // add a phantom second vertex at the menu position (a tiny
+      // un-movable segment), and every other action left a stray map
+      // click behind.
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
         this.hidePickMenu();
+        if (it.mode === "_measure") {
+          this.startMeasure(picked);
+          return;
+        }
+        if (it.mode === "_note") {
+          this.dispatchEvent(
+            new CustomEvent("dr-note-new", {
+              bubbles: true,
+              composed: true,
+              detail: { lat: picked[0], lng: picked[1] },
+            }),
+          );
+          return;
+        }
         this.dispatchEvent(
           new CustomEvent("dr-pick-position", {
             bubbles: true,
             composed: true,
             detail: {
-              lat: Array.isArray(latlng) ? latlng[0] : latlng.lat,
-              lng: Array.isArray(latlng) ? latlng[1] : latlng.lng,
+              lat: picked[0],
+              lng: picked[1],
               mode: it.mode,
               tMs,
               ...(label ? { label } : {}),
@@ -722,7 +1023,8 @@ class DrMapView extends HTMLElement {
       if (anchor) {
         const btn = document.createElement("button");
         btn.textContent = ` Plotter widgets (${anchor})…`;
-        btn.addEventListener("click", () => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
           this.hidePickMenu();
           this.dispatchEvent(
             new CustomEvent("dr-open-ext-picker", {
@@ -752,6 +1054,154 @@ class DrMapView extends HTMLElement {
   hidePickMenu() {
     this._pickMenu?.remove();
     this._pickMenu = null;
+  }
+
+  /**
+   * Measure tool (work doc #30): tap points on the chart, get true
+   * bearing + distance leg by leg with a running total. Started from
+   * the pick menu ("Measure from here…"); each map click adds a leg;
+   * double-click / right-click / Esc ends and clears. Pure geometry
+   * (bearingBetween/distanceNm) — pure chartwork, no persistence.
+   *
+   * @param {[number, number]} first - picked starting point
+   * @returns {void}
+   */
+  startMeasure(first) {
+    this.endMeasure();
+    this._measurePts = [first];
+    this._measureReadout = document.createElement("div");
+    this._measureReadout.className = "dr-measure";
+    this.mapEl.appendChild(this._measureReadout);
+    this.mapEl.style.cursor = "crosshair";
+    this._measureClick = (e) =>
+      this._addMeasureLeg([e.latlng.lat, e.latlng.lng]);
+    this.map.on("click", this._measureClick);
+    // Rubber band: the working leg follows the cursor from the last
+    // fixed vertex — the chartplotter measure convention. Touch
+    // devices skip it (no hover); taps fix vertices directly.
+    this._measureMove = (e) => {
+      if (!this._measurePts) return;
+      this._renderMeasure([e.latlng.lat, e.latlng.lng]);
+    };
+    this.map.on("mousemove", this._measureMove);
+    // Esc ends and clears — the keyboard is the helm's third hand.
+    this._measureKey = (e) => {
+      if (e.key === "Escape") this.endMeasure();
+    };
+    document.addEventListener("keydown", this._measureKey);
+    this._renderMeasure();
+  }
+
+  /**
+   * Adds a leg vertex; a click within a hair of the previous vertex
+   * (the second click of a double-click) ends the tool instead of
+   * stacking a zero-length leg.
+   *
+   * @param {[number, number]} pt
+   * @returns {void}
+   */
+  _addMeasureLeg(pt) {
+    const pts = this._measurePts;
+    if (!pts) return;
+    const last = pts[pts.length - 1];
+    if (last && vm.distanceNm(last, pt) < 1e-7) {
+      this.endMeasure();
+      return;
+    }
+    pts.push(pt);
+    this._renderMeasure();
+  }
+
+  /** @returns {void} */
+  _renderMeasure(preview = null) {
+    this.layers.measure?.clearLayers();
+    const pts = this._measurePts;
+    if (!pts || !this._measureReadout) return;
+    // Legs: dashed line over a dark casing, vertex dots, like the
+    // chartwork symbology but neutral (a measurement, not data).
+    if (pts.length >= 2) {
+      L.polyline(pts, {
+        color: vm.STYLE.track.casingColor,
+        weight: 4,
+        opacity: 0.6,
+        interactive: false,
+      }).addTo(this.layers.measure);
+      L.polyline(pts, {
+        color: "#ffffff",
+        weight: 1.5,
+        opacity: 0.9,
+        dashArray: "4 4",
+        interactive: false,
+      }).addTo(this.layers.measure);
+    }
+    for (const pt of pts) {
+      L.circleMarker(pt, {
+        radius: 3,
+        color: "#ffffff",
+        fillColor: "#ffffff",
+        fillOpacity: 0.9,
+        weight: 1,
+        interactive: false,
+      }).addTo(this.layers.measure);
+    }
+    // Rubber-band preview: the un-committed leg to the cursor, drawn
+    // fainter so the fixed chartwork reads through it.
+    if (preview && pts.length > 0) {
+      L.polyline([pts[pts.length - 1], preview], {
+        color: "#ffffff",
+        weight: 1,
+        opacity: 0.5,
+        dashArray: "2 6",
+        interactive: false,
+      }).addTo(this.layers.measure);
+    }
+    // Readout: per-leg bearing/distance + cumulative distance.
+    // The in-progress (rubber-band) leg reads live at the end of the
+    // list; it disappears un-committed when the tool ends.
+    const measured = preview ? [...pts, preview] : pts;
+    let total = 0;
+    const lines = [];
+    for (let i = 1; i < measured.length; i++) {
+      const brg = vm.bearingBetween(measured[i - 1], measured[i]);
+      const dist = vm.distanceNm(measured[i - 1], measured[i]);
+      total += dist;
+      lines.push(
+        `${String(Math.round(brg)).padStart(3, "0")}° ${dist.toFixed(2)} nm`,
+      );
+    }
+    this._measureReadout.innerHTML = "";
+    for (const line of lines) {
+      const div = document.createElement("div");
+      div.textContent = line;
+      this._measureReadout.appendChild(div);
+    }
+    if (lines.length > 1) {
+      const totalDiv = document.createElement("div");
+      totalDiv.className = "dr-measure-total";
+      totalDiv.textContent = `Σ ${total.toFixed(2)} nm`;
+      this._measureReadout.appendChild(totalDiv);
+    }
+  }
+
+  /** @returns {void} */
+  endMeasure() {
+    if (this._measurePts && this.map && this._measureClick) {
+      this.map.off("click", this._measureClick);
+    }
+    if (this._measureMove) {
+      this.map.off("mousemove", this._measureMove);
+    }
+    if (this._measureKey) {
+      document.removeEventListener("keydown", this._measureKey);
+    }
+    this._measureClick = null;
+    this._measureMove = null;
+    this._measureKey = null;
+    this._measurePts = null;
+    this._measureReadout?.remove();
+    this._measureReadout = null;
+    this.layers.measure?.clearLayers();
+    this.mapEl.style.cursor = "";
   }
 
   /**
@@ -785,13 +1235,13 @@ class DrMapView extends HTMLElement {
 
     // GPS boat marker — drawn whenever we have a fix, even moored with no
     // DR. SPEC §14.1 shows both the live vessel and the ghost track.
+    // Work doc #30: a boat-shaped glyph rotated to COG (dot fallback when
+    // COG is unknown), sized constant on screen like the AIS glyphs.
     this.layers.gpsMarker?.clearLayers();
     if (snap.gpsPosition) {
-      L.circleMarker(snap.gpsPosition, {
-        radius: 5,
-        color: vm.STYLE.gpsTrack,
-        fillOpacity: 0.9,
-        weight: 2,
+      L.marker(snap.gpsPosition, {
+        icon: this._gpsIcon(snap.gpsCogDeg ?? null),
+        keyboard: false,
       })
         .bindTooltip("GPS", { direction: "top" })
         .addTo(this.layers.gpsMarker);
@@ -809,11 +1259,17 @@ class DrMapView extends HTMLElement {
       this.lastDrPosition = snap.drPosition;
       if (this.follow) this.map.panTo(snap.drPosition, { animate: true });
       this.layers.drMarker.clearLayers();
-      // The DR position plots as the navigator's X (traditional
-      // chartwork: X = dead reckoned position, distinct from any fix
-      // symbol), labeled with its time — always Z.
+      // The DR position plots as the navigator's mark: a boat glyph
+      // rotated to the DR course (work doc #30), with the traditional
+      // X kept as a small detail inside the hull — X = dead reckoned
+      // position, distinct from any fix symbol. Without a course
+      // (moored, no DR movement yet) the bare X remains. Labeled with
+      // its time — always Z.
       const drLabel = vm.drTimeLabel(snap.drTimeMs);
-      L.marker(snap.drPosition, { icon: this._drIcon(), keyboard: false })
+      L.marker(snap.drPosition, {
+        icon: this._drIcon(snap.drCourse?.courseDeg ?? null),
+        keyboard: false,
+      })
         .bindTooltip(drLabel || "DR", {
           direction: "right",
           permanent: true,
@@ -849,6 +1305,13 @@ class DrMapView extends HTMLElement {
     this.renderSnaps(snap.corrections ?? [], vm);
     this.renderCandidate(snap.candidate);
     this.renderAdvancements(snap.candidate?.advancements ?? null, snap);
+    // Plotter predictors (work doc #30): 10-minute vectors for both
+    // own-ship references, range rings re-spaced for the zoom, and
+    // wind laylines from the DR vessel (re-lengthed on zoom — the
+    // zoomend handler re-renders rings and laylines together).
+    this.renderVectors(snap);
+    this.renderRangeRings(snap);
+    this.renderLaylines(snap);
   }
 
   /**
@@ -1173,20 +1636,242 @@ class DrMapView extends HTMLElement {
   }
 
   /**
-   * Builds the divIcon for the DR position: the navigator's X
-   * (traditional chartwork — a dead reckoned position, deliberately
-   * NOT a fix symbol), in the marker white for maximal contrast over
-   * the teal ghost track it rides.
+   * Builds the divIcon for an own-ship boat glyph (work doc #30): a
+   * pointed-hull vessel shape rotated to its course (north-up SVG,
+   * rotate transform — same trick as the AIS glyphs). Screen-constant
+   * size. The DR variant carries the navigator's X inside the hull —
+   * the traditional chartwork symbol for a dead reckoned position,
+   * kept as a subtle detail so the two-ship picture stays honest.
    *
+   * @param {number|null|undefined} rotationDeg - true course the boat
+   *   points (null → glyph upright, caller falls back to a bare mark)
+   * @param {string} color - hull stroke/fill family color
+   * @param {{x?: boolean, size?: number}} [opts] - `x` draws the DR
+   *   X detail; `size` overrides the on-screen px size
    * @returns {object} Leaflet divIcon
    */
-  _drIcon() {
+  _boatIcon(rotationDeg, color, opts = {}) {
+    const size = opts.size ?? 20;
+    const rot =
+      rotationDeg != null
+        ? `transform:rotate(${Math.round(rotationDeg)}deg);`
+        : "";
+    // Pointed hull pointing up (north): bow at top, stern at bottom,
+    // slightly rounded bilge — reads as a vessel at 20 px without
+    // covering the chart.
+    const hull =
+      `<path d="M10 1.5 C14 5.5 16 11 16 17 L10 14.2 L4 17 " ` +
+      `C4 11 6 5.5 10 1.5 Z" fill="${color}" fill-opacity="0.35" ` +
+      `stroke="${color}" stroke-width="1.4" stroke-linejoin="round"/>`;
+    // The navigator's X — small, centered in the hull, in the marker
+    // white so it reads on the tinted hull over any tileset.
+    const x = opts.x
+      ? `<path d="M7.6 8 L12.4 11.8 M12.4 8 L7.6 11.8" ` +
+        `stroke="${vm.STYLE.drMarker}" stroke-width="1.1" fill="none"/>`
+      : "";
     return L.divIcon({
-      className: "dr-fix",
-      iconSize: [14, 14],
-      iconAnchor: [7, 7],
-      html: `<svg width="14" height="14" viewBox="0 0 14 14" xmlns="http://www.w3.org/2000/svg"><path d="M2 2 L12 12 M12 2 L2 12" stroke="${vm.STYLE.drMarker}" stroke-width="2.2" fill="none" /></svg>`,
+      className: "dr-ais-marker",
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+      html:
+        `<div class="dr-ais-glyph" style="${rot}">` +
+        `<svg width="${size}" height="${size}" viewBox="0 0 20 20" ` +
+        `xmlns="http://www.w3.org/2000/svg">${hull}${x}</svg></div>`,
     });
+  }
+
+  /**
+   * GPS own-ship glyph (work doc #30): the boat rotated to COG, in the
+   * GPS track color; falls back to the plain dot when COG is unknown
+   * (the old marker — an honest mark beats a lying heading).
+   *
+   * @param {number|null|undefined} cogDeg
+   * @returns {object} Leaflet divIcon
+   */
+  _gpsIcon(cogDeg) {
+    if (!Number.isFinite(cogDeg)) {
+      return L.divIcon({
+        className: "dr-ais-marker",
+        iconSize: [10, 10],
+        iconAnchor: [5, 5],
+        html:
+          `<svg width="10" height="10" viewBox="0 0 10 10" ` +
+          `xmlns="http://www.w3.org/2000/svg">` +
+          `<circle cx="5" cy="5" r="4" fill="${vm.STYLE.gpsTrack}" ` +
+          `fill-opacity="0.9"/></svg>`,
+      });
+    }
+    return this._boatIcon(cogDeg, vm.STYLE.gpsTrack);
+  }
+
+  /**
+   * DR own-ship glyph (work doc #30): the boat rotated to the DR
+   * course with the navigator's X in the hull; falls back to the bare
+   * traditional X when no DR course is known (moored / no movement).
+   *
+   * @param {number|null|undefined} courseDeg
+   * @returns {object} Leaflet divIcon
+   */
+  _drIcon(courseDeg) {
+    if (!Number.isFinite(courseDeg)) {
+      return L.divIcon({
+        className: "dr-fix",
+        iconSize: [14, 14],
+        iconAnchor: [7, 7],
+        html:
+          `<svg width="14" height="14" viewBox="0 0 14 14" ` +
+          `xmlns="http://www.w3.org/2000/svg">` +
+          `<path d="M2 2 L12 12 M12 2 L2 12" stroke="${vm.STYLE.drMarker}" ` +
+          `stroke-width="2.2" fill="none"/></svg>`,
+      });
+    }
+    return this._boatIcon(courseDeg, vm.STYLE.drMarker, { x: true });
+  }
+
+  /**
+   * Renders the chartplotter predictor vectors (work doc #30): the
+   * 10-minute line for each own-ship reference — GPS along COG at SOG
+   * (dashed, tick marks every 2 minutes), DR along the DR course at DR
+   * speed. Each draws in its track's family color so the vector reads
+   * as an extension of the track it belongs to. Ticks are small
+   * cross-marks on the line, non-interactive like the line itself.
+   *
+   * @param {object} snap - needs gpsPosition/gpsCogDeg/gpsSogKn and
+   *   drPosition/drCourse
+   * @returns {void}
+   */
+  renderVectors(snap) {
+    const layer = this.layers.vectors;
+    if (!layer) return;
+    layer.clearLayers();
+    const refs = [
+      {
+        position: snap.gpsPosition,
+        courseDeg: snap.gpsCogDeg,
+        speedKn: snap.gpsSogKn,
+        color: vm.STYLE.vector.gps,
+      },
+      {
+        position: snap.drPosition,
+        courseDeg: snap.drCourse?.courseDeg,
+        speedKn: snap.drCourse?.speedKn,
+        color: vm.STYLE.vector.dr,
+      },
+    ];
+    for (const ref of refs) {
+      if (!ref.position) continue;
+      const v = vm.predictorVector(ref.position, ref.courseDeg, ref.speedKn);
+      if (!v) continue;
+      L.polyline([v.from, v.to], {
+        color: ref.color,
+        weight: 1.5,
+        opacity: 0.8,
+        dashArray: "4 4",
+        interactive: false,
+      }).addTo(layer);
+      // Tick marks at 2/4/6/8 minutes — short cross-marks ON the line
+      // (the endpoint itself is the 10-minute mark; a tick there would
+      // be redundant). Screen-constant: tiny polylines perpendicular
+      // to the course drawn in screen terms need screen coords, so the
+      // tick is a small circleMarker — reads as a gradation dot.
+      for (const tick of v.ticks) {
+        L.circleMarker(tick.at, {
+          radius: 1.5,
+          color: ref.color,
+          fillOpacity: 0.9,
+          weight: 1,
+          interactive: false,
+        }).addTo(layer);
+      }
+    }
+  }
+
+  /**
+   * Renders wind laylines (work doc #30): two rays from the DR vessel
+   * at the beat/gybe courses for the current point of sail, fixed
+   * screen-relative length (re-lengthed on zoom). Red = port tack,
+   * green = starboard (navigation-light convention). Inputs absent →
+   * the layer just doesn't render — no fake defaults.
+   *
+   * @param {object} [snap] - render snapshot; omitted when re-rendering
+   *   after a zoom (the last snap's inputs are reused)
+   * @returns {void}
+   */
+  renderLaylines(snap) {
+    if (snap) this._lastSnap = snap;
+    const layer = this.layers.laylines;
+    if (!layer || !this.map) return;
+    layer.clearLayers();
+    const s = this._lastSnap;
+    const dr = s?.drPosition;
+    if (!dr) return;
+    // Laylines render only when SAILING (navigation.state) — under
+    // power the beat/gybe angles answer a question nobody is asking.
+    if (!s.sailing) return;
+    // Fixed screen-relative length: ~18% of the viewport height, in NM
+    // at the current zoom — geometry rides the view, not the chart.
+    const size = this.map.getSize();
+    const mpp = vm.metersPerPixel(this.map.getZoom(), dr[0]);
+    const lengthNm = (size.y * 0.18 * mpp) / vm.METRES_PER_NM;
+    const spec = vm.laylineSpec(dr, {
+      twdDeg: s.twdDeg,
+      beatAngleDeg: s.beatAngleDeg,
+      gybeAngleDeg: s.gybeAngleDeg,
+      headingDeg: s.drCourse?.courseDeg ?? null,
+      lengthNm,
+    });
+    if (!spec) return;
+    for (const ray of spec.rays) {
+      L.polyline([dr, ray.to], {
+        color: ray.color,
+        weight: 1.5,
+        opacity: 0.8,
+      })
+        .bindTooltip(
+          `${ray.tack} tack · ${String(Math.round(ray.courseDeg)).padStart(3, "0")}° (${spec.mode})`,
+          { direction: "top" },
+        )
+        .addTo(layer);
+    }
+  }
+
+  /**
+   * Renders range rings (work doc #30): three concentric rings at the
+   * zoom-derived ladder spacing, centered on the GPS position (the
+   * helm's quick bearing/distance reference; rings around the ghost
+   * would read as DR data). Re-spaced on zoom — the layer is cleared
+   * and re-drawn from the last known snap.
+   *
+   * @param {object} [snap] - render snapshot; omitted when re-rendering
+   *   after a zoom (the last snap's GPS position is reused)
+   * @returns {void}
+   */
+  renderRangeRings(snap) {
+    if (snap) this._lastSnap = snap;
+    const layer = this.layers.rings;
+    if (!layer || !this.map) return;
+    layer.clearLayers();
+    const center = this._lastSnap?.gpsPosition;
+    if (!center) return;
+    const mpp = vm.metersPerPixel(this.map.getZoom(), center[0]);
+    const spacingNm = vm.rangeRingSpacingNm(mpp);
+    if (spacingNm == null) return;
+    for (let i = 1; i <= 3; i++) {
+      L.circle(center, {
+        radius: spacingNm * i * vm.METRES_PER_NM,
+        color: vm.STYLE.ring,
+        fill: false,
+        weight: 1,
+        opacity: 0.4,
+        dashArray: "2 6",
+        interactive: true,
+      })
+        .bindTooltip(`${(spacingNm * i).toFixed(spacingNm < 1 ? 2 : 1)} nm`, {
+          direction: "right",
+          permanent: false,
+        })
+        .addTo(layer);
+    }
   }
 
   /**
@@ -1284,6 +1969,80 @@ class DrMapView extends HTMLElement {
         .bindTooltip(target ? `${label} — next` : label, { direction: "top" })
         .addTo(layer);
     }
+  }
+
+  /**
+   * Renders the Signal K notes collection (work doc #30): one marker
+   * per positioned note on the toggleable "Notes" layer. Clicking or
+   * right-clicking a marker opens the pick menu at the note's position
+   * with the note detail block (title/body/timestamp + Edit/Delete),
+   * the DR/GPS bearing rows and all the usual pick actions working on
+   * the note's position. Markers are rebuilt each render (notes change
+   * rarely; the collection is small).
+   *
+   * @param {Array<{id: string, position: [number, number], title: string}>} specs
+   * @param {Map<string, object>} [resourcesById] - full note resources
+   *   by id (dr-app's cache) — the detail surface reads title/body/
+   *   mimeType/timestamp from it
+   * @returns {void}
+   */
+  renderNotes(specs, resourcesById) {
+    this.notesById = resourcesById ?? new Map();
+    const layer = this.layers.notes;
+    if (!layer) return;
+    layer.clearLayers();
+    for (const spec of specs ?? []) {
+      L.marker(spec.position, { icon: this._noteIcon() })
+        .bindTooltip(spec.title, { direction: "top" })
+        .addEventListener("click", () => this.openNoteDetail(spec))
+        // Right-click opens the same surface (work doc #30) — the
+        // pick menu is the detail surface, from either gesture.
+        .addEventListener("contextmenu", () => this.openNoteDetail(spec))
+        .addTo(layer);
+    }
+  }
+
+  /**
+   * Opens the note detail surface: the pick menu at the note position
+   * with the full note resource attached. Also used by right-clicks on
+   * the marker (same surface, work doc #30).
+   *
+   * @param {{id: string, position: [number, number], title: string}} spec
+   * @returns {void}
+   */
+  openNoteDetail(spec) {
+    const note = this.notesById?.get(spec.id) ?? null;
+    this.showPickMenu(spec.position, null, {
+      label: spec.title,
+      note: note
+        ? { ...note, id: spec.id }
+        : { id: spec.id, title: spec.title },
+    });
+  }
+
+  /**
+   * Builds the divIcon for a Signal K note marker (work doc #30): a
+   * small note/pin glyph in our own symbology language — a chart
+   * annotation, not app chrome.
+   *
+   * @returns {object} Leaflet divIcon
+   */
+  _noteIcon() {
+    return L.divIcon({
+      className: "dr-fix",
+      iconSize: [20, 20],
+      iconAnchor: [10, 18],
+      html:
+        `<svg width="20" height="20" viewBox="0 0 20 20" ` +
+        `xmlns="http://www.w3.org/2000/svg">` +
+        // Pin: a pointed drop with a note-line mark inside.
+        `<path d="M10 19 C10 19 4 11.5 4 7 A6 6 0 0 1 16 7 "` +
+        `C16 11.5 10 19 10 19 Z" fill="#080a0c" ` +
+        `stroke="var(--color-orange, #c77b28)" stroke-width="1.5"/>` +
+        `<path d="M7 6.5 H13 M7 9.5 H11" ` +
+        `stroke="var(--color-orange, #c77b28)" stroke-width="1.3"/>` +
+        `</svg>`,
+    });
   }
 
   /**
@@ -1437,3 +2196,61 @@ class DrMapView extends HTMLElement {
 }
 
 customElements.define("dr-map-view", DrMapView);
+
+/**
+ * Nautical scale bar (work doc #30): a Leaflet control showing a bar
+ * + NM label (metric fallback at deep zooms), snapped to the nautical
+ * ladder from dr-viewmodel so the figure is always a "reasonable unit"
+ * (0.1, 0.25, 0.5, 1, 2, 3, 5, 10 NM…). No `1:x` numeric readout — the
+ * bar itself is the scale. Re-measures on every update() call, which
+ * the map wires to zoomend/moveend (mpp depends on latitude too).
+ */
+class NauticalScaleControl extends L.Control {
+  constructor() {
+    super({ position: "bottomleft" });
+  }
+
+  onAdd(map) {
+    const div = L.DomUtil.create(
+      "div",
+      "dr-scalebar leaflet-control-attribution-style-none",
+    );
+    div.style.cssText =
+      "margin-bottom:2px;font:11px ui-monospace,'Fira Code',monospace;" +
+      "color:var(--text-main,#fff);text-shadow:0 0 3px #080a0c,0 0 3px #080a0c;" +
+      "white-space:nowrap;";
+    this._div = div;
+    this.update(map);
+    return div;
+  }
+
+  /**
+   * Re-measures the bar for the current view. Exposed for the map's
+   * zoom/move handlers (Leaflet's own scale control re-adds itself on
+   * zoom; ours is told explicitly).
+   *
+   * @param {object} map
+   * @returns {void}
+   */
+  update(map) {
+    if (!this._div) return;
+    const zoom = map.getZoom();
+    const center = map.getCenter();
+    const mpp = vm.metersPerPixel(zoom, center?.lat ?? 0);
+    const spec = vm.scaleBarSpec(mpp);
+    if (!spec) {
+      this._div.textContent = "";
+      this._div.style.width = "0";
+      return;
+    }
+    // Bar: a solid line with end ticks, the label to the right — the
+    // plotter convention, readable over any tileset.
+    this._div.innerHTML =
+      `<span style="display:inline-block;vertical-align:middle;` +
+      `width:${Math.round(spec.px)}px;height:0;` +
+      `border-bottom:2px solid var(--text-main,#fff);` +
+      `border-left:2px solid var(--text-main,#fff);` +
+      `border-right:2px solid var(--text-main,#fff);"></span> ` +
+      `<span>${spec.label}</span>`;
+  }
+}
