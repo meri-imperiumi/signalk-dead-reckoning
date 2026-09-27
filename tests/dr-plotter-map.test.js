@@ -75,6 +75,25 @@ test("layers control: vectors and range rings are toggleable overlays", () => {
   assert.match(mapSrc, /toggleableLayers\.has\(key\)/);
 });
 
+test("notes: plot by default, removable through the layers control", () => {
+  // Notes are chart annotations and often navigational warnings —
+  // they must not hide behind a toggle. The layer mounts with the
+  // always-on group (not listed in toggleableLayers) while keeping
+  // its layers-control checkbox, so decluttering still works and a
+  // persisted "off" pick removes it.
+  assert.match(
+    mapSrc,
+    /toggleableLayers = new Set\(\["vectors", "rings", "laylines"\]\)/,
+    "notes not a start-detached toggle",
+  );
+  const controlStart = mapSrc.indexOf("const overlays = {");
+  const control = mapSrc.slice(
+    controlStart,
+    mapSrc.indexOf(".addTo(this.map);", mapSrc.indexOf(".layers(")),
+  );
+  assert.match(control, /notes: \["Notes", this\.layers\.notes\]/);
+});
+
 test("nautical scale bar: custom control, ladder from the view-model", () => {
   assert.match(mapSrc, /class NauticalScaleControl extends L\.Control/);
   assert.match(mapSrc, /vm\.scaleBarSpec\(/);

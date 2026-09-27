@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Notes plot by default.** The Notes overlay started detached — the
+  markers were fetched and cached, but the layer only mounted when the
+  layers-control checkbox was flipped, so chart annotations (often
+  navigational warnings, e.g. METAREA gale warnings delivered by
+  signalk-passage-briefing) never showed until manually enabled.
+  Notes now mount with the map like AIS traffic and the active route;
+  the checkbox remains for decluttering, and a previously stored
+  "off" pick is still honored.
+- **Own-ship boat glyphs are bigger and bolder.** The GPS and DR boats
+  grew from 20 to 26 px, the hull fill is near-solid (0.92 opacity, was
+  0.35) under a heavier stroke, and the hull rides on a dark casing
+  outline — the same cartographic trick as the ghost track — so own
+  ship stays legible over light raster charts and chart clutter. The
+  navigator's X inside the DR hull got a matching weight bump.
+
 ### Fixed
 - **Notes now load for the area being viewed.** The webapp fetched the
   notes collection exactly once (boot and stream reconnect) with no

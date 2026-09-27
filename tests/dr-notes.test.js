@@ -214,9 +214,14 @@ test("notesRefetchNeeded: first fetch, margin containment, pan/zoom out", async 
 });
 
 test("notes wiring: v2 resources API, layers-control toggle, pick menu integration", () => {
-  // Layer toggle.
+  // Layer wiring: notes has a layers-control entry, but mounts by
+  // default (not in the start-detached toggleableLayers set) —
+  // navigational warnings must not hide behind a toggle.
   assert.match(mapSrc, /notes: \["Notes", this\.layers\.notes\]/);
-  assert.match(mapSrc, /"notes"/);
+  assert.match(
+    mapSrc,
+    /toggleableLayers = new Set\(\["vectors", "rings", "laylines"\]\)/,
+  );
   // Markers + detail surface.
   assert.match(mapSrc, /renderNotes\(specs, resourcesById\) \{/);
   assert.match(mapSrc, /_noteIcon\(\)/);

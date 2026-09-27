@@ -360,14 +360,19 @@ class DrMapView extends HTMLElement {
       // Wind laylines (work doc #30) — layers-control toggle like the
       // other overlays.
       laylines: null,
-      // Signal K notes (work doc #30) — layers-control toggle.
+      // Signal K notes (work doc #30) — mounted by default: notes are
+      // chart annotations and often navigational warnings (METAREA
+      // gale warnings etc.), so they must not hide behind a toggle.
+      // Still removable through the layers control when decluttering.
       notes: null,
       // Measure tool geometry (work doc #30) — transient, always on.
       measure: null,
     };
     /** Layer keys that mount through the layers control instead of
-     * always-on (work doc #30). */
-    this.toggleableLayers = new Set(["vectors", "rings", "laylines", "notes"]);
+     * always-on (work doc #30). Notes stay always-on by default —
+     * they carry navigational warnings — but remain removable
+     * through the control. */
+    this.toggleableLayers = new Set(["vectors", "rings", "laylines"]);
     this.tileLayers = {};
     this.follow = true;
     /**
@@ -614,8 +619,9 @@ class DrMapView extends HTMLElement {
         // crossing the leg being sailed shouldn't be forced on top of
         // the chartwork). Work doc #30 adds the plotter overlays:
         // predictor vectors and range rings (off by default — declutter
-        // first, enable on demand). Keyed by layer id so the persisted
-        // prefs survive label renames.
+        // first, enable on demand) and notes (on by default — they are
+        // chart annotations, often navigational warnings). Keyed by
+        // layer id so the persisted prefs survive label renames.
         const overlays = {
           ais: ["AIS traffic", this.layers.ais],
           route: ["Active route", this.layers.route],
@@ -1736,23 +1742,33 @@ class DrMapView extends HTMLElement {
    * @returns {object} Leaflet divIcon
    */
   _boatIcon(rotationDeg, color, opts = {}) {
-    const size = opts.size ?? 20;
+    const size = opts.size ?? 26;
     const rot =
       rotationDeg != null
         ? `transform:rotate(${Math.round(rotationDeg)}deg);`
         : "";
     // Pointed hull pointing up (north): bow at top, stern at bottom,
-    // slightly rounded bilge — reads as a vessel at 20 px without
+    // slightly rounded bilge — reads as a vessel at 26 px without
     // covering the chart.
+    const hullPath =
+      "M10 1.5 C14 5.5 16 11 16 17 L10 14.2 L4 17 C4 11 6 5.5 10 1.5 Z";
+    // Cartographic casing (same trick as the ghost track): a dark
+    // hull-shaped outline under the colored hull keeps the boat legible
+    // over light raster charts and chart clutter alike.
+    const casing =
+      `<path d="${hullPath}" fill="none" ` +
+      `stroke="${vm.STYLE.track.casingColor}" stroke-width="4.2" ` +
+      `stroke-linejoin="round"/>`;
+    // Near-solid fill and a heavy stroke — own ship must dominate the
+    // marks drawn around it, not whisper from underneath them.
     const hull =
-      `<path d="M10 1.5 C14 5.5 16 11 16 17 L10 14.2 L4 17 " ` +
-      `C4 11 6 5.5 10 1.5 Z" fill="${color}" fill-opacity="0.35" ` +
-      `stroke="${color}" stroke-width="1.4" stroke-linejoin="round"/>`;
-    // The navigator's X — small, centered in the hull, in the marker
-    // white so it reads on the tinted hull over any tileset.
+      `<path d="${hullPath}" fill="${color}" fill-opacity="0.92" ` +
+      `stroke="${color}" stroke-width="2" stroke-linejoin="round"/>`;
+    // The navigator's X — centered in the hull, in the marker white so
+    // it reads on the tinted hull over any tileset.
     const x = opts.x
-      ? `<path d="M7.6 8 L12.4 11.8 M12.4 8 L7.6 11.8" ` +
-        `stroke="${vm.STYLE.drMarker}" stroke-width="1.1" fill="none"/>`
+      ? `<path d="M7.2 7.4 L12.8 12.2 M12.8 7.4 L7.2 12.2" ` +
+        `stroke="${vm.STYLE.drMarker}" stroke-width="1.8" fill="none"/>`
       : "";
     return L.divIcon({
       className: "dr-ais-marker",
@@ -1761,7 +1777,7 @@ class DrMapView extends HTMLElement {
       html:
         `<div class="dr-ais-glyph" style="${rot}">` +
         `<svg width="${size}" height="${size}" viewBox="0 0 20 20" ` +
-        `xmlns="http://www.w3.org/2000/svg">${hull}${x}</svg></div>`,
+        `xmlns="http://www.w3.org/2000/svg">${casing}${hull}${x}</svg></div>`,
     });
   }
 
