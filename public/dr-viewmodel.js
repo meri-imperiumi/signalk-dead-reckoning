@@ -2801,6 +2801,85 @@ export function notesRenderSpecs(collection) {
 }
 
 /**
+ * Formats the viewport-scoped notes query the v2 resources API accepts
+ * — the same parameters Freeboard-SK sends (observed on a live server):
+ * `position=[lon,lat]&distance=<meters>`. The position is the view
+ * center in GeoJSON coordinate order (longitude first — Freeboard's
+ * wire format, server- and provider-established), and the distance is
+ * a covering radius from the center to the view corner, so the whole
+ * visible area comes back. Center and corner clamp to the valid
+ * lat/lon range: at low zooms Leaflet reports out-of-range edges and
+ * resource providers filter on raw coordinates.
+ *
+ * @param {{west: number, south: number, east: number, north: number}} bounds
+ * @returns {string} e.g. "position=[-175.15,-21.15]&distance=37985"
+ */
+export function notesViewQuery(bounds) {
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const lat = clamp((Number(bounds.north) + Number(bounds.south)) / 2, -90, 90);
+  const lon = clamp((Number(bounds.east) + Number(bounds.west)) / 2, -180, 180);
+  const cornerLat = clamp(Number(bounds.north), -90, 90);
+  const cornerLon = clamp(Number(bounds.west), -180, 180);
+  const radiusM = Math.max(
+    1,
+    Math.ceil(distanceNm([cornerLat, cornerLon], [lat, lon]) * 1852),
+  );
+  return `position=[${lon},${lat}]&distance=${radiusM}`;
+}
+
+/**
+ * Whether a moved chart view needs a fresh in-view notes fetch: yes
+ * when nothing has been fetched yet, or the view now reaches beyond
+ * the last fetched area with a 25% margin (panned into unseen water,
+ * or zoomed out past it). Follow-mode re-centers land inside the
+ * margin, so tracking the boat doesn't re-issue the request.
+ *
+ * @param {{west: number, south: number, east: number, north: number}} bounds
+ * @param {{west: number, south: number, east: number, north: number}|null} last
+ *   bounds the last fetch covered
+ * @returns {boolean}
+ */
+export function notesRefetchNeeded(bounds, last) {
+  if (!last) return true;
+  const latPad = (last.north - last.south) * 0.25;
+  const lonPad = (last.east - last.west) * 0.25;
+  return (
+    bounds.west < last.west - lonPad ||
+    bounds.east > last.east + lonPad ||
+    bounds.south < last.south - latPad ||
+    bounds.north > last.north + latPad
+  );
+}
+
+/**
+ * Parses the persisted layers-control preference (localStorage JSON):
+ * a base-layer key plus per-overlay enabled booleans. Storage data is
+ * not gospel — malformed or wrongly-typed entries are dropped, so the
+ * caller can fall back to the built-in defaults per key.
+ *
+ * @param {string|null} raw
+ * @returns {{base: string|null, overlays: Record<string, boolean>}}
+ */
+export function parseLayerPrefs(raw) {
+  const prefs = { base: null, overlays: {} };
+  if (!raw) return prefs;
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return prefs;
+  }
+  if (!data || typeof data !== "object") return prefs;
+  if (typeof data.base === "string" && data.base) prefs.base = data.base;
+  if (data.overlays && typeof data.overlays === "object") {
+    for (const [key, value] of Object.entries(data.overlays)) {
+      if (typeof value === "boolean") prefs.overlays[key] = value;
+    }
+  }
+  return prefs;
+}
+
+/**
  * Builds the resource body for POST/PUT to `/resources/notes` from the
  * creation/edit form (work doc #30): title, body, mimeType and the
  * picked position. The server assigns ids on POST.

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Notes now load for the area being viewed.** The webapp fetched the
+  notes collection exactly once (boot and stream reconnect) with no
+  viewport information; resource-provider backends filter the
+  collection themselves, so the answer could be limited to the
+  provider's default area — zooming out showed no notes at all. The
+  chart now re-fetches notes for the visible area whenever the view
+  moves beyond the already-fetched region: Freeboard-SK's wire format
+  (`GET /signalk/v2/api/resources/notes?position=[lon,lat]&distance=<m>`
+  — view center plus a covering radius to the view corner), debounced,
+  with follow-mode re-centers not re-issuing the request. Scoped
+  responses merge into the notes cache, so notes from previously
+  viewed areas stay on the chart.
+
+### Added
+- **The layers control remembers your choices.** Base chart and
+  overlay toggles (AIS traffic, active route, vectors, range rings,
+  laylines, notes) persist in localStorage (`dr-layers`) and are
+  restored on the next session — remembered picks that still mount
+  outrank the defaults; un-flipped toggles keep their built-in state.
+
 ## [0.12.0] - 2026-09-21
 
 ### Added

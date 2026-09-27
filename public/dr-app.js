@@ -524,6 +524,12 @@ class DrApp extends HTMLElement {
       openSight();
       this.sight?.seedObjectPosition(lat, lng, mode, label, tMs);
     });
+    // Chart view moved/zoomed: re-fetch notes for the visible area
+    // (work doc #30). Debounced + margin-guarded in fetchNotesInView —
+    // follow-mode re-centers must not turn into a request per GPS fix.
+    this.map?.addEventListener("dr-view-changed", (e) =>
+      this.fetchNotesInView(e.detail),
+    );
     // Hosted plotter-widget areas (work doc #27) carry no buttons: the
     // chart context menu offers placement when the pick lands on a
     // reserved area footprint. dr-app owns the hit test (the areas
@@ -771,6 +777,12 @@ class DrApp extends HTMLElement {
      * source of truth is the server's v2 resources API; the cache lets
      * saves update markers without a full refetch. */
     this.notesById = new Map();
+    /** Bounds the last in-view notes fetch covered (fetchNotesInView
+     * margin guard) — null until the first view-driven fetch.
+     * @type {{west: number, south: number, east: number, north: number}|null} */
+    this._notesBoundsFetched = null;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    this._notesViewTimer = null;
     /** Route ids with a fetch in progress — the 1 Hz course stream
      * would otherwise re-issue the request until it lands.
      * @type {Set<string>|null} */
@@ -1207,18 +1219,62 @@ class DrApp extends HTMLElement {
    * pattern as the active route. Notes without a position are skipped
    * by the viewmodel shaping (region-only notes don't plot).
    *
+   * With a `view` the request is viewport-scoped — the Freeboard-SK
+   * wire format `?position=[lon,lat]&distance=<meters>`: the view
+   * center plus a covering radius to the view corner. (The Resources
+   * API docs' `distance` alone is vessel-anchored, which can't express
+   * "the area I'm looking at"; `position` re-anchors it to the map
+   * view.) The result MERGES into the cache: a scoped response only
+   * covers the fetched area, replacing the cache would drop notes
+   * outside the current view. Without a view (boot, reconnect) the
+   * response is the whole collection and replaces the cache. View-
+   * scoped fetches matter because resource-provider backends filter
+   * the collection themselves — an area-less query can legitimately
+   * come back limited to the provider's default area.
+   *
+   * @param {{west: number, south: number, east: number,
+   *   north: number}} [view]
    * @returns {Promise<void>}
    */
-  async fetchNotes() {
+  async fetchNotes(view) {
     try {
-      const res = await fetch("/signalk/v2/api/resources/notes");
+      const query = view ? `?${vm.notesViewQuery(view)}` : "";
+      const res = await fetch(`/signalk/v2/api/resources/notes${query}`);
       if (!res.ok) return;
       const collection = await res.json();
-      this.notesById = new Map(Object.entries(collection ?? {}));
+      if (view) {
+        for (const [id, note] of Object.entries(collection ?? {})) {
+          this.notesById.set(id, note);
+        }
+      } else {
+        this.notesById = new Map(Object.entries(collection ?? {}));
+      }
       this.renderNotes();
     } catch {
       /* REST unavailable — retry on the next reconnect */
     }
+  }
+
+  /**
+   * Schedules an in-view notes fetch after a chart move/zoom
+   * (dr-view-changed from the map). Debounced, and skipped entirely
+   * while the view stays within the last fetched area plus a 25%
+   * margin — follow-mode re-centers track the boat without re-issuing
+   * the request; panning into unseen water or zooming out re-fetches.
+   *
+   * @param {{west: number, south: number, east: number,
+   *   north: number}} bounds
+   * @returns {void}
+   */
+  fetchNotesInView(bounds) {
+    if (!bounds || !vm.notesRefetchNeeded(bounds, this._notesBoundsFetched)) {
+      return;
+    }
+    clearTimeout(this._notesViewTimer ?? undefined);
+    this._notesViewTimer = setTimeout(() => {
+      this._notesBoundsFetched = bounds;
+      this.fetchNotes(bounds);
+    }, 500);
   }
 
   /** @returns {void} */

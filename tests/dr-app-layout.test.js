@@ -224,7 +224,7 @@ test("dr-map-view: Leaflet controls relocated to the bottom-left stack", () => {
   assert.match(mapSrc, /L\.control\.zoom\(\{ position: "bottomleft" \}\)/);
   assert.match(
     mapSrc,
-    /\{ collapsed: true, position: "bottomleft" \}/,
+    /collapsed: true,\s*\n\s*position: "bottomleft"/,
     "layers control bottom-left",
   );
   // The control container must clear the (non-Leaflet) re-center

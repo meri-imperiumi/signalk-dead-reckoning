@@ -117,9 +117,105 @@ test("renderNoteBody: markdown gets minimal structure, still escaped", async () 
   );
 });
 
+test("parseLayerPrefs: malformed storage data falls back per key", async () => {
+  const vm = await loadVm();
+  assert.deepEqual(vm.parseLayerPrefs(null), { base: null, overlays: {} });
+  assert.deepEqual(vm.parseLayerPrefs(""), { base: null, overlays: {} });
+  assert.deepEqual(vm.parseLayerPrefs("not json"), {
+    base: null,
+    overlays: {},
+  });
+  assert.deepEqual(vm.parseLayerPrefs("42"), { base: null, overlays: {} });
+  // Wrong-typed entries dropped individually, valid ones kept.
+  assert.deepEqual(
+    vm.parseLayerPrefs(
+      JSON.stringify({
+        base: "__chart_mirror__",
+        overlays: { notes: true, ais: "yes", rings: 1, vectors: false },
+      }),
+    ),
+    { base: "__chart_mirror__", overlays: { notes: true, vectors: false } },
+  );
+  assert.deepEqual(vm.parseLayerPrefs(JSON.stringify({ base: 7 })), {
+    base: null,
+    overlays: {},
+  });
+});
+
+test("layer prefs: remembered base + overlay toggles across sessions", () => {
+  // Storage key follows the dr-* convention; reads and writes are
+  // guarded (localStorage can throw in private modes).
+  assert.match(mapSrc, /LAYERS_KEY\(\) \{[\s\S]*?return "dr-layers";/);
+  assert.match(mapSrc, /_loadLayerPrefs\(\) \{/);
+  assert.match(mapSrc, /_saveLayerPrefs\(prefs\) \{/);
+  // Restore: parsed prefs select the base (only when still mounted)
+  // and apply per-overlay toggles without disturbing un-flipped keys.
+  assert.match(mapSrc, /vm\.parseLayerPrefs\(this\._loadLayerPrefs\(\)\)/);
+  assert.match(
+    mapSrc,
+    /this\.tileLayers\[prefs\.base \?\? ""\] \?\? defaultBase/,
+  );
+  assert.match(mapSrc, /prefs\.overlays\[key\];/);
+  assert.match(mapSrc, /if \(want === undefined\) continue;/);
+  // Persist on the layers-control's own events — base picks and
+  // overlay add/remove both land in storage.
+  assert.match(mapSrc, /this\.map\.on\("baselayerchange"/);
+  assert.match(mapSrc, /this\.map\.on\("overlayadd overlayremove"/);
+  assert.match(mapSrc, /this\._saveLayerPrefs\(prefs\)/);
+});
+
+test("notesViewQuery: Freeboard wire format position=[lon,lat]&distance=m", async () => {
+  const vm = await loadVm();
+  // A Tonga-area view: position is the view center in [lon, lat]
+  // (GeoJSON) order, distance a whole-meter covering radius from the
+  // center to the view corner — the request Freeboard-SK sends.
+  const view = { west: -175.4, south: -21.4, east: -174.9, north: -20.9 };
+  const expectedM = Math.ceil(
+    vm.distanceNm([-20.9, -175.4], [-21.15, -175.15]) * 1852,
+  );
+  assert.equal(
+    vm.notesViewQuery(view),
+    `position=[-175.15,-21.15]&distance=${expectedM}`,
+  );
+  // Low-zoom Leaflet views report out-of-range edges; center and
+  // corner clamp so the query stays in the valid lat/lon range.
+  const wideM = Math.ceil(vm.distanceNm([-90, -180], [0, 0]) * 1852);
+  assert.equal(
+    vm.notesViewQuery({ west: -260, south: -95, east: 260, north: 95 }),
+    `position=[0,0]&distance=${wideM}`,
+  );
+});
+
+test("notesRefetchNeeded: first fetch, margin containment, pan/zoom out", async () => {
+  const vm = await loadVm();
+  const view = { west: 24, south: 60, east: 25, north: 60.5 };
+  assert.equal(vm.notesRefetchNeeded(view, null), true, "nothing fetched yet");
+  // Inside the fetched area (or its 25% margin) — no refetch.
+  assert.equal(vm.notesRefetchNeeded(view, view), false);
+  assert.equal(
+    vm.notesRefetchNeeded(
+      { west: 24.2, south: 60.5 - 0.125 - 0.01, east: 24.8, north: 60.5 },
+      view,
+    ),
+    false,
+    "slight pan stays within the margin",
+  );
+  // Panning into unseen water, or zooming out past the fetched area.
+  assert.equal(
+    vm.notesRefetchNeeded({ ...view, east: 25.5 }, view),
+    true,
+    "pan past the margin",
+  );
+  assert.equal(
+    vm.notesRefetchNeeded({ west: 10, south: 59, east: 40, north: 62 }, view),
+    true,
+    "zoomed-out view exceeds the fetched area",
+  );
+});
+
 test("notes wiring: v2 resources API, layers-control toggle, pick menu integration", () => {
   // Layer toggle.
-  assert.match(mapSrc, /Notes: this\.layers\.notes/);
+  assert.match(mapSrc, /notes: \["Notes", this\.layers\.notes\]/);
   assert.match(mapSrc, /"notes"/);
   // Markers + detail surface.
   assert.match(mapSrc, /renderNotes\(specs, resourcesById\) \{/);
@@ -136,6 +232,17 @@ test("notes wiring: v2 resources API, layers-control toggle, pick menu integrati
     appSrc,
     /renderLinkStatus\(status\) \{[\s\S]*this\.fetchNotes\(\);/,
   );
+  // Viewport-aware fetching: the map reports view changes, dr-app
+  // re-fetches the visible area with Freeboard's position+distance
+  // query and merges the result into the cache (providers answer the
+  // bare collection query with a provider-shaped area — wider views
+  // must fetch for themselves).
+  assert.match(mapSrc, /dr-view-changed/);
+  assert.match(mapSrc, /getBounds\(\)/);
+  assert.match(appSrc, /addEventListener\("dr-view-changed"/);
+  assert.match(appSrc, /notesViewQuery\(/);
+  assert.match(appSrc, /notesRefetchNeeded\(/);
+  assert.match(appSrc, /this\.notesById\.set\(id, note\)/);
   // Panel: quick hazard preset, error surfacing, save dispatch.
   assert.match(panelSrc, /dr-note-hazard/);
   assert.match(panelSrc, /showError\(message\)/);

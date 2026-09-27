@@ -63,13 +63,13 @@ test("predictor vectors: separate layer, both references, tick marks", () => {
 });
 
 test("layers control: vectors and range rings are toggleable overlays", () => {
-  const controlStart = mapSrc.indexOf(".layers(");
+  const controlStart = mapSrc.indexOf("const overlays = {");
   const control = mapSrc.slice(
     controlStart,
-    mapSrc.indexOf(".addTo(this.map);", controlStart),
+    mapSrc.indexOf(".addTo(this.map);", mapSrc.indexOf(".layers(")),
   );
-  assert.match(control, /Vectors: this\.layers\.vectors/);
-  assert.match(control, /"Range rings": this\.layers\.rings/);
+  assert.match(control, /vectors: \["Vectors", this\.layers\.vectors\]/);
+  assert.match(control, /rings: \["Range rings", this\.layers\.rings\]/);
   // Toggleable layers start detached (unchecked) — not in the
   // always-on addTo loop.
   assert.match(mapSrc, /toggleableLayers\.has\(key\)/);
@@ -136,10 +136,11 @@ test("measure tool: pick-menu start, click legs, Esc/dblclick/right-click end", 
 
 test("laylines: toggleable layer, DR origin, sailing-gated, zoom-relative", () => {
   const control = mapSrc.slice(
-    mapSrc.indexOf(".layers("),
+    mapSrc.indexOf("const overlays = {"),
     mapSrc.indexOf(".addTo(this.map);", mapSrc.indexOf(".layers(")),
   );
-  assert.match(control, /Laylines: this\.layers\.laylines/);
+  assert.match(control, /laylines: \["Laylines", this\.layers\.laylines\]/);
+  assert.match(control, /L\.control\s*\n?\s*\.layers\(bases, controlOverlays/);
   assert.match(mapSrc, /"laylines"/, "toggleable registration");
   const render = mapSrc.slice(
     mapSrc.indexOf("renderLaylines(snap) {"),
@@ -155,7 +156,7 @@ test("laylines: toggleable layer, DR origin, sailing-gated, zoom-relative", () =
   assert.match(render, /metersPerPixel\(/);
   assert.match(
     mapSrc,
-    /this\.renderLaylines\(\);\s*\n\s*\}\);/,
+    /zoomend moveend", \(\) => \{[\s\S]*?this\.renderLaylines\(\);/,
     "zoomend re-render",
   );
   // Tack colors follow the navigation-light convention.

@@ -424,11 +424,27 @@ class DrMapView extends HTMLElement {
     this._scaleCtrl = new NauticalScaleControl();
     this._scaleCtrl.addTo(this.map);
     // Range rings re-space with zoom (their spacing derives from the
-    // current scale); the scale bar re-reads it too.
+    // current scale); the scale bar re-reads it too. dr-app listens
+    // for the view change to re-fetch notes for the visible area
+    // (work doc #30): resource-provider backends answer the bare
+    // collection query with a provider-shaped area, so view-scoped
+    // fetches (position + covering radius, Freeboard's wire format)
+    // are the only honest way to cover a zoomed-out view.
     this.map.on("zoomend moveend", () => {
       this._scaleCtrl.update(this.map);
       this.renderRangeRings();
       this.renderLaylines();
+      const b = this.map.getBounds();
+      this.dispatchEvent(
+        new CustomEvent("dr-view-changed", {
+          detail: {
+            west: b.getWest(),
+            south: b.getSouth(),
+            east: b.getEast(),
+            north: b.getNorth(),
+          },
+        }),
+      );
     });
     this.map.on("dragstart", () => {
       this.follow = false;
@@ -582,33 +598,72 @@ class DrMapView extends HTMLElement {
           addBase(c.name, layer);
         }
         // Default: the mirrored/composed vector chart when present, else
-        // the first configured provider (list is name-sorted).
-        const first =
+        // the first configured provider (list is name-sorted). A
+        // remembered base choice (localStorage "dr-layers") outranks
+        // the default when it still mounts.
+        const defaultBase =
           this.tileLayers.__chart_mirror__ ??
           this.tileLayers[charts[0].identifier] ??
           ordered[0];
-        first?.addTo(this.map);
+        const prefs = vm.parseLayerPrefs(this._loadLayerPrefs());
+        const base = this.tileLayers[prefs.base ?? ""] ?? defaultBase;
+        base?.addTo(this.map);
         // Always mounted (even single-chart installs): the AIS traffic
         // overlay (work doc #23) needs its checkbox so the chart can be
         // de-cluttered, and the active Signal K route too (a route
         // crossing the leg being sailed shouldn't be forced on top of
         // the chartwork). Work doc #30 adds the plotter overlays:
         // predictor vectors and range rings (off by default — declutter
-        // first, enable on demand).
+        // first, enable on demand). Keyed by layer id so the persisted
+        // prefs survive label renames.
+        const overlays = {
+          ais: ["AIS traffic", this.layers.ais],
+          route: ["Active route", this.layers.route],
+          vectors: ["Vectors", this.layers.vectors],
+          rings: ["Range rings", this.layers.rings],
+          laylines: ["Laylines", this.layers.laylines],
+          notes: ["Notes", this.layers.notes],
+        };
+        const controlOverlays = {};
+        for (const [label, layer] of Object.values(overlays)) {
+          controlOverlays[label] = layer;
+        }
         L.control
-          .layers(
-            bases,
-            {
-              "AIS traffic": this.layers.ais,
-              "Active route": this.layers.route,
-              Vectors: this.layers.vectors,
-              "Range rings": this.layers.rings,
-              Laylines: this.layers.laylines,
-              Notes: this.layers.notes,
-            },
-            { collapsed: true, position: "bottomleft" },
-          )
+          .layers(bases, controlOverlays, {
+            collapsed: true,
+            position: "bottomleft",
+          })
           .addTo(this.map);
+        // Restore remembered overlay toggles — only keys the user has
+        // actually flipped are applied; the rest keep their built-in
+        // defaults (AIS/route on, declutter toggles off).
+        for (const [key, [, layer]] of Object.entries(overlays)) {
+          const want = prefs.overlays[key];
+          if (want === undefined) continue;
+          if (want && !this.map.hasLayer(layer)) layer.addTo(this.map);
+          if (!want && this.map.hasLayer(layer)) this.map.removeLayer(layer);
+        }
+        // Remember the user's layer choices (base chart + overlays)
+        // across sessions. Restoring above re-fires these events for the
+        // restored layers, which just re-writes the same values.
+        this.map.on("baselayerchange", (e) => {
+          const key = Object.keys(this.tileLayers).find(
+            (k) => this.tileLayers[k] === e.layer,
+          );
+          if (key) {
+            prefs.base = key;
+            this._saveLayerPrefs(prefs);
+          }
+        });
+        this.map.on("overlayadd overlayremove", (e) => {
+          const key = Object.keys(overlays).find(
+            (k) => overlays[k][1] === e.layer,
+          );
+          if (key) {
+            prefs.overlays[key] = e.type === "overlayadd";
+            this._saveLayerPrefs(prefs);
+          }
+        });
       })
       .catch((e) => {
         // Offline stays tile-less by design, but a chart that fails to
@@ -616,6 +671,36 @@ class DrMapView extends HTMLElement {
         // silently — that reads as "charts don't render" with no trace.
         console.warn("chart layers not mounted:", e?.message || e);
       });
+  }
+
+  /** localStorage key for the layers-control preferences (base chart
+   * + overlay toggles) — same "dr-*" convention as the sight panel's
+   * timezone and bearing-reference keys. */
+  static get LAYERS_KEY() {
+    return "dr-layers";
+  }
+
+  /**
+   * @returns {string|null} raw stored JSON, null when unavailable
+   */
+  _loadLayerPrefs() {
+    try {
+      return localStorage.getItem(DrMapView.LAYERS_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * @param {{base: string|null, overlays: Record<string, boolean>}} prefs
+   * @returns {void}
+   */
+  _saveLayerPrefs(prefs) {
+    try {
+      localStorage.setItem(DrMapView.LAYERS_KEY, JSON.stringify(prefs));
+    } catch {
+      /* storage unavailable — keep the session values */
+    }
   }
 
   /**
