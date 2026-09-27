@@ -135,7 +135,10 @@ class DrNotePanel extends HTMLElement {
     this.position = seed.position ?? null;
     this.editId = seed.note?.id ?? null;
     this.titleEl.value = (seed.note ? seed.note.title : "") ?? "";
-    this.bodyEl.value = (seed.note ? seed.note.body : "") ?? "";
+    // The text falls back to `description` — provider-shaped notes
+    // (metarea warnings) carry it there, so editing doesn't start from
+    // an empty form.
+    this.bodyEl.value = seed.note ? vm.noteBodyText(seed.note) : "";
     this.heading.childNodes[0].textContent = this.editId
       ? "Edit note "
       : "New note ";

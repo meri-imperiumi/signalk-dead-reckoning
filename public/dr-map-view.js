@@ -962,8 +962,11 @@ class DrMapView extends HTMLElement {
       const body = document.createElement("div");
       body.className = "dr-note-body";
       // renderNoteBody escapes all input before any markup — the body
-      // is other clients' content, synced through the server.
-      body.innerHTML = vm.renderNoteBody(note.body, note.mimeType);
+      // is other clients' content, synced through the server. The text
+      // itself falls back to `description`: provider-shaped notes
+      // (metarea warnings) carry the full text there — the title is
+      // truncated by the source.
+      body.innerHTML = vm.renderNoteBody(vm.noteBodyText(note), note.mimeType);
       info.appendChild(body);
       if (note.timestamp) {
         const when = document.createElement("span");
@@ -1128,11 +1131,23 @@ class DrMapView extends HTMLElement {
         menu.appendChild(btn);
       }
     }
-    // Position the menu at the screen point of the click.
+    // Position the menu at the screen point of the pick — mounted
+    // first (its size isn't known until it's in the DOM), then placed
+    // via the viewmodel: flipped up/left near the container edges and
+    // clamped inside, so picks near the bottom or right stay on screen
+    // instead of opening outside the viewport.
     const point = this.map.latLngToContainerPoint(latlng);
-    menu.style.left = `${point.x}px`;
-    menu.style.top = `${point.y}px`;
     this.mapEl.appendChild(menu);
+    const place = vm.menuPlacement(
+      { x: point.x, y: point.y },
+      { w: menu.offsetWidth, h: menu.offsetHeight },
+      {
+        width: this.mapEl.clientWidth,
+        height: this.mapEl.clientHeight,
+      },
+    );
+    menu.style.left = `${place.left}px`;
+    menu.style.top = `${place.top}px`;
     this._pickMenu = menu;
     // Dismiss on the next map click / pan / zoom.
     const dismiss = () => this.hidePickMenu();

@@ -57,6 +57,28 @@ test("notesRenderSpecs: positioned notes shape, position-less skipped", async ()
   assert.equal(untitled[0].title, "Note");
 });
 
+test("noteBodyText: body preferred, description fallback (provider notes)", async () => {
+  const vm = await loadVm();
+  assert.equal(
+    vm.noteBodyText({ body: "v2 body", description: "desc" }),
+    "v2 body",
+  );
+  // Metarea/passage-briefing shape: text in description, title
+  // truncated by the source.
+  assert.equal(
+    vm.noteBodyText({
+      title: "IN THE AREA SOUTH OF 10S AND WEST OF 165W,…",
+      description:
+        "IN THE AREA SOUTH OF 10S AND WEST OF 165W, EXPECT SOUTHEAST WINDS 20\nTO 30 KNOTS.",
+    }),
+    "IN THE AREA SOUTH OF 10S AND WEST OF 165W, EXPECT SOUTHEAST WINDS 20\nTO 30 KNOTS.",
+  );
+  assert.equal(vm.noteBodyText({ title: "only" }), "");
+  assert.equal(vm.noteBodyText(null), "");
+  // Non-string junk is ignored, not stringified.
+  assert.equal(vm.noteBodyText({ body: 5, description: {} }), "");
+});
+
 test("noteResourceFromForm: trims title, defaults, position object", async () => {
   const vm = await loadVm();
   const r = vm.noteResourceFromForm({
@@ -225,6 +247,8 @@ test("notes wiring: v2 resources API, layers-control toggle, pick menu integrati
   // Markers + detail surface.
   assert.match(mapSrc, /renderNotes\(specs, resourcesById\) \{/);
   assert.match(mapSrc, /_noteIcon\(\)/);
+  // Full note text: the surface shapes body → description fallback.
+  assert.match(mapSrc, /renderNoteBody\(vm\.noteBodyText\(note\)/);
   assert.match(mapSrc, /vm\.renderNoteBody\(/);
   assert.match(mapSrc, /"dr-note-new"/);
   assert.match(mapSrc, /"dr-note-edit"/);
@@ -253,4 +277,9 @@ test("notes wiring: v2 resources API, layers-control toggle, pick menu integrati
   assert.match(panelSrc, /showError\(message\)/);
   assert.match(panelSrc, /vm\.noteResourceFromForm\(/);
   assert.match(panelSrc, /No position/);
+  // Edit form seeds from the shaped text (description fallback) and
+  // dr-app's save merges the stored resource so provider metadata
+  // (properties, url, description) survives the PUT.
+  assert.match(panelSrc, /vm\.noteBodyText\(seed\.note\)/);
+  assert.match(appSrc, /\{ \.\.\.stored, \.\.\.formResource \}/);
 });

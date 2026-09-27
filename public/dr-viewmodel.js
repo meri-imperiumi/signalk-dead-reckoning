@@ -2880,6 +2880,58 @@ export function parseLayerPrefs(raw) {
 }
 
 /**
+ * Placement for a floating context menu anchored at a screen point:
+ * opens down-right of the anchor, flips up / left near the container
+ * edges, and clamps inside with a kept-clear margin — a pick near the
+ * bottom of the screen must not open the menu outside the viewport.
+ * A menu bigger than the container pins to the margin.
+ *
+ * @param {{x: number, y: number}} point - anchor in container px
+ * @param {{w: number, h: number}} size - menu size in px
+ * @param {{width: number, height: number}} bounds - container size in px
+ * @param {number} [margin=8] - gap kept clear at the container edges
+ * @returns {{left: number, top: number}} menu position in container px
+ */
+export function menuPlacement(point, size, bounds, margin = 8) {
+  let left = point.x;
+  let top = point.y;
+  // Flip up near the bottom edge (the common miss: picks low on the
+  // chart), left near the right edge.
+  if (point.y + size.h + margin > bounds.height) {
+    top = point.y - size.h - margin;
+  }
+  if (point.x + size.w + margin > bounds.width) {
+    left = point.x - size.w - margin;
+  }
+  // Clamp inside — covers anchors near the top/left and menus taller
+  // or wider than the flip space.
+  const maxTop = Math.max(margin, bounds.height - size.h - margin);
+  const maxLeft = Math.max(margin, bounds.width - size.w - margin);
+  return {
+    left: Math.min(Math.max(left, margin), maxLeft),
+    top: Math.min(Math.max(top, margin), maxTop),
+  };
+}
+
+/**
+ * The displayable text of a note resource: the v2 notes `body` when
+ * present, else the `description` field — provider-shaped notes
+ * (metarea warnings via signalk-passage-briefing, Freeboard-SK's
+ * resource shape) carry their text there, with the title truncated by
+ * the source. Empty string when neither exists.
+ *
+ * @param {object|null|undefined} note
+ * @returns {string}
+ */
+export function noteBodyText(note) {
+  if (typeof note?.body === "string" && note.body) return note.body;
+  if (typeof note?.description === "string" && note.description) {
+    return note.description;
+  }
+  return "";
+}
+
+/**
  * Builds the resource body for POST/PUT to `/resources/notes` from the
  * creation/edit form (work doc #30): title, body, mimeType and the
  * picked position. The server assigns ids on POST.

@@ -1294,7 +1294,13 @@ class DrApp extends HTMLElement {
    * @returns {Promise<void>}
    */
   async saveNote(detail) {
-    const { id, resource } = detail;
+    const { id, resource: formResource } = detail;
+    // An edit rides on the stored resource: fields the form doesn't
+    // own (provider metadata — properties, url, description) must
+    // survive the PUT, or editing a provider-shaped note would strip
+    // e.g. its synoptic-chart link.
+    const stored = id ? this.notesById.get(id) : null;
+    const resource = stored ? { ...stored, ...formResource } : formResource;
     try {
       const res = await fetch(
         id

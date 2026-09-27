@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   navigator's X inside the DR hull got a matching weight bump.
 
 ### Fixed
+- **Notes show their full text.** The note detail surface (and the
+  edit form) read only the v2 notes `body` field — provider-shaped
+  notes (metarea warnings via signalk-passage-briefing) carry their
+  text in `description`, with the title truncated by the source, so
+  they opened with a "…" headline and no text at all. The text now
+  falls back to `description`. Editing such a note seeds the form with
+  the real text, and a save merges the stored resource so provider
+  metadata (properties, synoptic-chart `url`) survives the PUT.
 - **Notes now load for the area being viewed.** The webapp fetched the
   notes collection exactly once (boot and stream reconnect) with no
   viewport information; resource-provider backends filter the

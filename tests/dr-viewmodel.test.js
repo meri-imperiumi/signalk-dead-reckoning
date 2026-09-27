@@ -939,3 +939,66 @@ test("relativeTimeText: watchkeeper-granularity ages", async () => {
     "3d ago",
   );
 });
+
+test("menuPlacement: opens down-right, flips up at the bottom edge", async () => {
+  const vm = await loadVm();
+  // Room below: menu opens at the anchor, down-right.
+  assert.deepEqual(
+    vm.menuPlacement(
+      { x: 400, y: 300 },
+      { w: 200, h: 150 },
+      { width: 1000, height: 800 },
+    ),
+    { left: 400, top: 300 },
+  );
+  // The reported miss: pick near the bottom — the menu flips above the
+  // anchor with the kept-clear margin instead of leaving the viewport.
+  assert.deepEqual(
+    vm.menuPlacement(
+      { x: 400, y: 700 },
+      { w: 200, h: 150 },
+      { width: 1000, height: 800 },
+    ),
+    { left: 400, top: 542 },
+  );
+});
+
+test("menuPlacement: flips left at the right edge, clamps top/left", async () => {
+  const vm = await loadVm();
+  // Near the right edge: opens to the left of the anchor.
+  assert.deepEqual(
+    vm.menuPlacement(
+      { x: 900, y: 300 },
+      { w: 200, h: 150 },
+      { width: 1000, height: 800 },
+    ),
+    { left: 692, top: 300 },
+  );
+  // Bottom-right corner: flips both ways.
+  assert.deepEqual(
+    vm.menuPlacement(
+      { x: 950, y: 750 },
+      { w: 200, h: 150 },
+      { width: 1000, height: 800 },
+    ),
+    { left: 742, top: 592 },
+  );
+  // Anchor near the top/left: clamped to the margin, never negative.
+  assert.deepEqual(
+    vm.menuPlacement(
+      { x: 2, y: 3 },
+      { w: 200, h: 150 },
+      { width: 1000, height: 800 },
+    ),
+    { left: 8, top: 8 },
+  );
+  // A menu taller/wider than the container pins to the margin.
+  assert.deepEqual(
+    vm.menuPlacement(
+      { x: 500, y: 400 },
+      { w: 1200, h: 2000 },
+      { width: 1000, height: 800 },
+    ),
+    { left: 8, top: 8 },
+  );
+});
