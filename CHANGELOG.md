@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-28
+
 ### Changed
 - **Notes plot by default.** The Notes overlay started detached — the
   markers were fetched and cached, but the layer only mounted when the
