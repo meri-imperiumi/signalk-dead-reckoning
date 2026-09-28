@@ -27,7 +27,7 @@
   "signalk-plugin-enabled-by-default": false,
   "signalk": {
     "displayName": "Dead Reckoning",
-    "appIcon": "./icon.png",
+    "appIcon": "./icon-256.png",
     "requires": [
       "@meri-imperiumi/signalk-internet"
     ],
