@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-09-28
+
 ### Fixed
 - **The top-right plotter-extension area now behaves as a top-right
   anchor.** Two defects made it read as "top left of the GPS status
