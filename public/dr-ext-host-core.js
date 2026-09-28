@@ -152,6 +152,38 @@ export function occupiedCells(placements) {
 }
 
 /**
+ * Do placements in this anchor mirror their column axis? Right-hand
+ * anchors render mirrored: logical col 0 is the viewport corner (the
+ * RIGHT edge), so widgets pack corner-inward — symmetric with left
+ * anchors, where col 0 is the left edge. Without the mirror the first
+ * placed widget lands in the cell farthest from the corner and the
+ * free space sits between it and the edge.
+ *
+ * @param {string} anchor
+ * @returns {boolean}
+ */
+export function isMirroredAnchor(anchor) {
+  return typeof anchor === "string" && anchor.endsWith("-right");
+}
+
+/**
+ * CSS grid column line (1-based, physical left→right) where a
+ * placement's left edge renders for the given anchor. Mirrored
+ * (right-hand) anchors flip the column axis: a placement at logical
+ * column `col` spans lines `GRID_COLS - col - cols + 1 ..
+ * GRID_COLS - col`.
+ *
+ * @param {string} anchor
+ * @param {number} col - 0-based logical column (0 = the anchor corner)
+ * @param {number} cols - placement column span
+ * @returns {number} 1-based CSS grid column line
+ */
+export function gridColLine(anchor, col, cols) {
+  if (isMirroredAnchor(anchor)) return GRID_COLS - col - cols + 1;
+  return col + 1;
+}
+
+/**
  * First position (packing from the grid origin, row-major) where a
  * widget of this size fits without overlapping existing placements.
  *

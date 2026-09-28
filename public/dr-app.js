@@ -256,7 +256,13 @@ template.innerHTML = /* html */ `
       gap: 0.5rem;
       align-items: flex-start;
     }
-    .dr-top-col > .dr-gps {
+    /* The right column is as wide as its widest child (usually the GPS
+       panel), so without this both the panel and the top-right widget
+       area would need explicit right edges: the panel rides the right
+       edge, and the top-right area must follow it — left-aligned it
+       would park under the panel's left half, reading as "top left". */
+    .dr-top-col > .dr-gps,
+    .dr-top-col > dr-ext-widget-area[anchor="top-right"] {
       align-self: flex-end;
     }
     /* Water-track readout: bottom-right panel — figures + the manual

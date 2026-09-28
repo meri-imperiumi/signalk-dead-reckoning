@@ -101,6 +101,23 @@ test("firstFreeSlot: packs row-major, skips overlaps", () => {
   assert.equal(core.firstFreeSlot(full, "1x1"), null);
 });
 
+test("gridColLine: right-hand anchors mirror the column axis", () => {
+  // Left anchor: col 0 is the leftmost CSS column (the corner).
+  assert.equal(core.isMirroredAnchor("top-left"), false);
+  assert.equal(core.gridColLine("top-left", 0, 1), 1);
+  assert.equal(core.gridColLine("top-left", 1, 1), 2);
+  // Right anchor: col 0 is the RIGHTMOST CSS column (the corner), so
+  // the first placed widget hugs the viewport edge and free space
+  // extends inward.
+  assert.equal(core.isMirroredAnchor("top-right"), true);
+  assert.equal(core.gridColLine("top-right", 0, 1), 2);
+  assert.equal(core.gridColLine("top-right", 1, 1), 1);
+  // Full-width spans cover both columns either way; a 1x2 in the
+  // corner column stays on the right edge for both rows.
+  assert.equal(core.gridColLine("top-right", 0, 2), 1);
+  assert.equal(core.gridColLine("top-right", 0, 1), core.GRID_COLS);
+});
+
 test("layoutFromJSON: validates shape, ignores unknown anchors", () => {
   const good = core.layoutFromJSON({
     version: 1,

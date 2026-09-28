@@ -355,6 +355,16 @@ test("dr-app: widget areas sit below the app's own top panels", () => {
   assert.match(appSrc, /\.dr-top-col \{[^}]*flex-direction: column/s);
   assert.match(
     appSrc,
+    /\.dr-top-col > \.dr-gps,\s*\.dr-top-col > dr-ext-widget-area\[anchor="top-right"\]\s*\{\s*align-self: flex-end;/s,
+    "top-right area right-aligns with the GPS panel in its column",
+  );
+  assert.match(
+    hostSrc,
+    /core\.gridColLine\(this\.anchor, p\.col, size\.cols\)/,
+    "cell columns route through the anchor-aware mirroring helper",
+  );
+  assert.match(
+    appSrc,
     /new PlotterExtHost\(\{\s*stream: window\.drSignalkStream,\s*mount: root,/s,
   );
 });

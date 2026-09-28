@@ -1032,7 +1032,11 @@ export class DrExtWidgetArea extends AreaBase {
         const size = core.parseSize(p.size) ?? { cols: 1, rows: 1 };
         cell = document.createElement("div");
         cell.className = "cell";
-        cell.style.gridArea = `${p.row + 1} / ${p.col + 1} / span ${size.rows} / span ${size.cols}`;
+        // Column line via core.gridColLine: right-hand anchors mirror
+        // the column axis so col 0 renders at the viewport corner.
+        cell.style.gridArea =
+          `${p.row + 1} / ${core.gridColLine(this.anchor, p.col, size.cols)} ` +
+          `/ span ${size.rows} / span ${size.cols}`;
         this.grid.appendChild(cell);
         this.cells.set(p.instanceId, cell);
       }

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The top-right plotter-extension area now behaves as a top-right
+  anchor.** Two defects made it read as "top left of the GPS status
+  bar": the area rode its column's left edge instead of the GPS
+  panel's right edge (it now shares the panel's right alignment), and
+  the widget grid rendered logical col 0 at the physical left for
+  every anchor — so the first placed widget sat farthest from the
+  viewport corner with the free slots between it and the edge.
+  Right-hand anchors now mirror the column axis: col 0 hugs the
+  right-hand corner and widgets pack corner-inward, symmetric with
+  the top-left area.
+
 ## [0.12.1] - 2026-09-28
 
 ### Changed
