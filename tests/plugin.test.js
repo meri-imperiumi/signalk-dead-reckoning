@@ -3854,12 +3854,18 @@ test("tick integrates the Weather API current into the DR solution (tier 3)", as
   const app = new FakeSignalKApp();
   app.dataPath = dir;
   // In-process Weather API (the same object signalk-energy-predictor
-  // calls): 1 m/s due east → set 90° true, drift ≈ 1.944 kn.
+  // calls): 1 m/s due east → set 90° true, drift ≈ 1.944 kn. The
+  // response uses the Signal K WeatherData shape (currents under
+  // `water`, as spec-conformant providers like
+  // signalk-weather-router-plus serve them).
   app.weatherApi = {
     getForecasts: async () => [
       {
         date: new Date().toISOString(),
-        current: { set: Math.PI / 2, drift: 1 },
+        water: {
+          surfaceCurrentDirection: Math.PI / 2,
+          surfaceCurrentSpeed: 1,
+        },
       },
     ],
   };

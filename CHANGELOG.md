@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Tier-3 weather current now parses the fields providers actually
+  serve.** `parseWeatherCurrent` read the REST docs' shape
+  (`current.set` rad / `current.drift` m/s), but the Weather API server
+  transforms nothing — both the JS API (`app.weatherApi.getForecasts`)
+  and REST return the registered provider's data as-is — and the
+  providers on this install never emit that shape: the default GRIB
+  provider carries no currents at all, and signalk-weather-router-plus
+  answers `water.surfaceCurrentDirection` (rad, the set, towards) /
+  `water.surfaceCurrentSpeed` (m/s), the shape of `@signalk/server-api`'s
+  TS `WeatherData` interface (which contradicts the docs' TypeBox
+  `WeatherDataModel`). Every poll therefore died with "forecast carries
+  no current data" and DR silently ran on derived/zero current. The
+  parser now accepts both shapes (water.* preferred), verified against
+  the live server; wind-only entries without current coverage are
+  skipped so interpolation brackets between the entries that carry
+  current.
+
 ## [0.12.2] - 2026-09-28
 
 ### Fixed

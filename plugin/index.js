@@ -830,7 +830,7 @@ module.exports = (app) => {
           type: "boolean",
           title: "Use Signal K Weather API current (set/drift) for DR",
           description:
-            "Polls the server's weather provider (typically a GRIB another process downloaded) for the point-forecast current at the vessel position and integrates it into the DR solution (SPEC §6.2 tier 3). Falls back to the zero vector when unavailable.",
+            "Polls the server's weather provider (e.g. signalk-weather-router-plus, serving ECMWF wind and Copernicus SMOC currents) for the point-forecast current at the vessel position and integrates it into the DR solution (SPEC §6.2 tier 3). Falls back to the zero vector when unavailable.",
           default: DEFAULT_CONFIG.weatherCurrent.enabled,
         },
         "weatherCurrent.intervalMs": {
@@ -958,8 +958,9 @@ module.exports = (app) => {
           : seedTs;
 
       // §6.2 tier 3: poll the Signal K Weather API for the point-forecast
-      // current at the vessel position (typically a GRIB another process
-      // downloaded). Off the 1 Hz hot path: slow interval, cached read.
+      // current at the vessel position (a current-capable provider such as
+      // signalk-weather-router-plus). Off the 1 Hz hot path: slow interval,
+      // cached read.
       if (config.weatherCurrent.enabled) {
         // In-process Weather API (mirrors signalk-energy-predictor):
         // `app.weatherApi` is the same instance the REST routes wrap,

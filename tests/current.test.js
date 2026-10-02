@@ -16,11 +16,11 @@ const {
 
 const NOW = Date.UTC(2026, 6, 15, 12, 0, 0);
 
-/** forecast entry helper: set rad toward, drift m/s */
+/** forecast entry helper: set rad toward, drift m/s (SK Weather API shape) */
 function entry(offsetMin, setRad, driftMs) {
   return {
     date: new Date(NOW + offsetMin * 60000).toISOString(),
-    current: { set: setRad, drift: driftMs },
+    water: { surfaceCurrentDirection: setRad, surfaceCurrentSpeed: driftMs },
   };
 }
 
@@ -74,6 +74,47 @@ test("parseWeatherCurrent: null when no entry carries current data", () => {
     null,
   );
   assert.strictEqual(parseWeatherCurrent(null, NOW), null);
+});
+
+test("parseWeatherCurrent: entries without current data are skipped, not fatal", () => {
+  // Real providers emit wind-only entries too (e.g. ECMWF steps outside
+  // SMOC coverage, or points the current sources do not reach). Those
+  // entries must be skipped so interpolation still brackets `nowMs`
+  // between the entries that carry current.
+  const r = parseWeatherCurrent(
+    [
+      {
+        date: new Date(NOW - 60 * 60000).toISOString(),
+        wind: { speedTrue: 5 },
+      },
+      entry(0, 0, 1),
+      entry(60, Math.PI / 2, 1),
+    ],
+    NOW + 30 * 60000,
+  );
+  assert.ok(r);
+  assert.ok(r.setTrue > 0 && r.setTrue < 90, `setTrue ${r?.setTrue}`);
+});
+
+test("parseWeatherCurrent: accepts the REST docs' current.set/drift shape too", () => {
+  // @signalk/server-api ships two conflicting models: the TypeBox
+  // WeatherDataModel behind the REST docs (top-level current.set/drift)
+  // and the TS WeatherData interface (water.surfaceCurrent*). The server
+  // serves provider data untransformed, so both must parse identically.
+  const docShape = (offsetMin, setRad, driftMs) => ({
+    date: new Date(NOW + offsetMin * 60000).toISOString(),
+    current: { set: setRad, drift: driftMs },
+  });
+  const fromWater = parseWeatherCurrent(
+    [entry(-60, 0, 1), entry(60, Math.PI / 2, 1)],
+    NOW,
+  );
+  const fromDoc = parseWeatherCurrent(
+    [docShape(-60, 0, 1), docShape(60, Math.PI / 2, 1)],
+    NOW,
+  );
+  assert.ok(fromDoc);
+  assert.deepStrictEqual(fromDoc, fromWater);
 });
 
 // --------------------------------------------------------------- resolver

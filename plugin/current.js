@@ -13,11 +13,17 @@
  *     observation outranks model products (sea trial 2026-08-30→09-05:
  *     ~11 nm DR error over 622 nm vs 47 nm for tier 3).
  *  3. **Signal K Weather API** (`/signalk/v2/api/weather/forecasts/point`)
- *     — a provider (e.g. a GRIB another process already downloaded)
- *     serves point forecasts carrying `current: {set (rad), drift (m/s)}`.
- *     The client polls it at the vessel position on a slow interval and
- *     caches the time-interpolated vector; the 1 Hz tick never touches
- *     the network.
+ *     — a weather provider carrying currents (e.g. signalk-weather-router-
+ *     plus: Copernicus SMOC) answers point forecasts; the client polls it
+ *     at the vessel position on a slow interval and caches the
+ *     time-interpolated vector; the 1 Hz tick never touches the network.
+ *     Current fields follow the provider: the REST docs' TypeBox model
+ *     defines top-level `current.set` (rad, towards) / `current.drift`
+ *     (m/s), while `@signalk/server-api`'s TS WeatherData and the real
+ *     providers use `water.surfaceCurrentDirection` /
+ *     `water.surfaceCurrentSpeed`. The server transforms nothing — the
+ *     JS API and REST both return provider data as-is — so the parser
+ *     accepts both shapes.
  *  4. Offline pilot charts (`offline_pilot_currents`) — table exists in
  *     the schema; the lookup hook is reserved.
  *  5. **Zero vector** — pure inertial water track.
@@ -44,8 +50,11 @@ function normalizeDeg360(deg) {
 
 /**
  * Parses a Weather API forecast series into the current vector valid at
- * `nowMs`. Entries carrying `current.set` (rad, direction the current
- * flows *toward*) and `current.drift` (m/s) are interpolated as u/v
+ * `nowMs`. Entries carrying current data — `water.surfaceCurrentDirection`
+ * (rad, the direction the current flows *toward*) and
+ * `water.surfaceCurrentSpeed` (m/s), or the REST docs' top-level
+ * `current.set` / `current.drift` (same units, same semantics) — are
+ * interpolated as u/v
  * components between the entries bracketing `nowMs`; outside the series
  * the nearest endpoint is used (the client's TTL bounds staleness).
  *
@@ -59,8 +68,13 @@ function parseWeatherCurrent(points, nowMs) {
   const entries = [];
   for (const p of points) {
     const t = Date.parse(p?.date ?? "");
-    const set = p?.current?.set;
-    const drift = p?.current?.drift;
+    // Two shapes exist in the wild: the REST docs' TypeBox model (top-
+    // level current.set/drift) and the server-api TS WeatherData interface
+    // plus real providers (water.surfaceCurrent*). The server serves
+    // provider data untransformed on both the JS API and REST, so accept
+    // either; prefer the water.* fields.
+    const set = p?.water?.surfaceCurrentDirection ?? p?.current?.set;
+    const drift = p?.water?.surfaceCurrentSpeed ?? p?.current?.drift;
     if (!Number.isFinite(t)) continue;
     if (!Number.isFinite(set) || !Number.isFinite(drift)) continue;
     entries.push({ t, set, drift });
@@ -184,8 +198,14 @@ function resolveCurrent(input = {}) {
  * `/signalk/...` path. On servers without the Weather API the client
  * stays idle and the §6.2 resolver never sees tier 3.
  *
- * The response is a WeatherDataModel array; `current.set` is radians
- * and `current.drift` m/s (converted here to deg/kn).
+ * The response is a WeatherData array (the Signal K Weather API model).
+ * Currents appear either as `water.surfaceCurrentDirection` (rad, the
+ * set, towards) / `water.surfaceCurrentSpeed` (m/s) — what real
+ * providers like signalk-weather-router-plus serve — or as the REST
+ * docs' `current.set` / `current.drift` (same units); both are
+ * converted here to deg/kn. Entries without current coverage (e.g.
+ * wind-only steps, or points outside the provider's current sources)
+ * simply lack the fields and are skipped.
  */
 class WeatherCurrentClient {
   /**
