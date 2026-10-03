@@ -909,7 +909,14 @@ class DrMapView extends HTMLElement {
     const menu = document.createElement("div");
     menu.className = "dr-pick-menu";
     const what = label ?? "this point";
-    menu.textContent = `Add observation at ${what}…`;
+    // Note picks (work doc #30) are an information surface, not an
+    // observation target: the note's own detail block carries the
+    // title, so the "Add observation at …" headline would be both a
+    // duplicate and a lie — no observation is being taken on it.
+    const note = preset?.note;
+    if (!note) {
+      menu.textContent = `Add observation at ${what}…`;
+    }
     // Target details (AIS picks, work doc #30): Freeboard-SK's field
     // set — type, flag, dimensions, destination & ETA. Rows hide when
     // the data never arrived; nothing fabricates.
@@ -952,7 +959,6 @@ class DrMapView extends HTMLElement {
     // chart objects — title, body rendered per mimeType, timestamp —
     // plus Edit/Delete affordances riding the dr-detail-popover
     // pattern. dr-app owns the REST side.
-    const note = preset?.note;
     if (note) {
       const info = document.createElement("div");
       info.className = "dr-target-info dr-note-info";
@@ -968,7 +974,19 @@ class DrMapView extends HTMLElement {
       // truncated by the source.
       body.innerHTML = vm.renderNoteBody(vm.noteBodyText(note), note.mimeType);
       info.appendChild(body);
-      if (note.timestamp) {
+      // Provenance (who published, when): stamped into `properties` by
+      // signalk-passage-briefing (metarea notes) and by this webapp's
+      // own note form. Renders "Published on … by …" — the bare
+      // timestamp below stays only as the fallback for notes with
+      // neither provenance nor a parsable stamp.
+      const provText = vm.noteProvenanceText(note);
+      if (provText) {
+        const prov = document.createElement("span");
+        prov.className = "dr-target-key";
+        prov.textContent = provText;
+        info.appendChild(prov);
+      }
+      if (note.timestamp && !provText) {
         const when = document.createElement("span");
         when.className = "dr-target-key";
         when.textContent = vm.fixTimeLabel(note.timestamp) || "";
@@ -1055,14 +1073,24 @@ class DrMapView extends HTMLElement {
         menu.appendChild(div);
       }
     }
-    const items = [
-      { label: ` Bearing to ${what}`, mode: "bearing" },
-      { label: ` Distance CPL at ${what}`, mode: "vertical" },
-      { label: " Measure from here…", mode: "_measure" },
-      // Hazard marking at the helm (work doc #30): every pick can
-      // become a Signal K note, pre-seeded with the picked position.
-      { label: " New note at…", mode: "_note" },
-    ];
+    // Bearing & distance CPL entries are observation actions against
+    // a sightable charted object. A note is an annotation — its
+    // position marks a warning area or a remark, not something to
+    // sight — and its menu already shows bearing & distance from both
+    // own-ship references, so the two entries would be noise.
+    const items = note
+      ? [
+          { label: " Measure from here…", mode: "_measure" },
+          // Hazard marking at the helm (work doc #30): every pick can
+          // become a Signal K note, pre-seeded with the picked position.
+          { label: " New note at…", mode: "_note" },
+        ]
+      : [
+          { label: ` Bearing to ${what}`, mode: "bearing" },
+          { label: ` Distance CPL at ${what}`, mode: "vertical" },
+          { label: " Measure from here…", mode: "_measure" },
+          { label: " New note at…", mode: "_note" },
+        ];
     for (const it of items) {
       const btn = document.createElement("button");
       btn.textContent = it.label;

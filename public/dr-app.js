@@ -1290,6 +1290,36 @@ class DrApp extends HTMLElement {
   }
 
   /**
+   * The Signal K username of the current session, for note provenance:
+   * notes this webapp publishes carry who published and when in the
+   * resource's `properties` (the same fields metarea notes carry).
+   * Asked once per session — `/skServer/loginStatus` is the same
+   * endpoint Freeboard-SK uses (with the bare path as fallback).
+   * Sessions without a login (security off) publish as "anonymous".
+   *
+   * @returns {Promise<string|null>} username, null when anonymous
+   */
+  async currentUserName() {
+    if (this._userNameFetched) return this._userName;
+    this._userNameFetched = true;
+    for (const url of ["/skServer/loginStatus", "/loginStatus"]) {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) continue;
+        const body = await res.json().catch(() => ({}));
+        const name = typeof body?.name === "string" ? body.name : "";
+        if (body?.status === "loggedIn" && name) {
+          this._userName = name;
+          break;
+        }
+      } catch {
+        // Endpoint absent/unreachable — anonymous.
+      }
+    }
+    return this._userName ?? null;
+  }
+
+  /**
    * Saves a note (create POST / edit PUT, server-assigned ids on
    * create). A successful save updates the cache and re-renders the
    * marker immediately — no full refetch. A failed write (read-only
@@ -1306,7 +1336,16 @@ class DrApp extends HTMLElement {
     // survive the PUT, or editing a provider-shaped note would strip
     // e.g. its synoptic-chart link.
     const stored = id ? this.notesById.get(id) : null;
-    const resource = stored ? { ...stored, ...formResource } : formResource;
+    let resource = stored ? { ...stored, ...formResource } : formResource;
+    // Provenance: who published, when (the same `properties` fields
+    // the metarea notes carry). Create stamps the original
+    // publication; edit preserves it and records the latest edit.
+    resource = vm.stampNoteProvenance(
+      resource,
+      await this.currentUserName(),
+      new Date().toISOString(),
+      Boolean(id),
+    );
     try {
       const res = await fetch(
         id

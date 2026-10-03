@@ -139,6 +139,96 @@ test("renderNoteBody: markdown gets minimal structure, still escaped", async () 
   );
 });
 
+test("stampNoteProvenance: create stamps publication, edit preserves it", async () => {
+  const vm = await loadVm();
+  // Create: who published, when — inside the schema's properties.
+  const created = vm.stampNoteProvenance(
+    { title: "Hazard", body: "Rocks", position: { latitude: 1, longitude: 2 } },
+    "bergie",
+    "2026-10-03T09:30:00.000Z",
+    false,
+  );
+  assert.deepEqual(created.properties, {
+    publishedBy: "bergie",
+    publishedAt: "2026-10-03T09:30:00.000Z",
+  });
+  // Sessions without a login publish as anonymous.
+  const anonymous = vm.stampNoteProvenance(
+    { title: "T", body: "", position: { latitude: 1, longitude: 2 } },
+    null,
+    "2026-10-03T09:30:00.000Z",
+    false,
+  );
+  assert.equal(anonymous.properties.publishedBy, "anonymous");
+  // Edit: the original publication is history, not metadata to
+  // overwrite — preserved, and the latest edit recorded beside it.
+  const edited = vm.stampNoteProvenance(
+    {
+      title: "Hazard",
+      properties: {
+        publishedBy: "bergie",
+        publishedAt: "2026-10-03T09:30:00.000Z",
+        category: "hazard",
+      },
+    },
+    "crew2",
+    "2026-10-04T08:00:00.000Z",
+    true,
+  );
+  assert.deepEqual(edited.properties, {
+    publishedBy: "bergie",
+    publishedAt: "2026-10-03T09:30:00.000Z",
+    category: "hazard",
+    updatedBy: "crew2",
+    updatedAt: "2026-10-04T08:00:00.000Z",
+  });
+});
+
+test("noteProvenanceText: publication and edit lines, fallbacks", async () => {
+  const vm = await loadVm();
+  // Metarea note served by signalk-passage-briefing: issuer parsed
+  // from the bulletin header rides in properties.
+  assert.equal(
+    vm.noteProvenanceText({
+      properties: {
+        publishedBy: "FIJI METEOROLOGICAL SERVICE",
+        publishedAt: "2026-10-03T12:00:00.000Z",
+      },
+    }),
+    "Published on 10-03 12:00Z by FIJI METEOROLOGICAL SERVICE",
+  );
+  // Notes this webapp published itself, later edited by someone else.
+  assert.equal(
+    vm.noteProvenanceText({
+      properties: {
+        publishedBy: "bergie",
+        publishedAt: "2026-10-03T09:30:00.000Z",
+        updatedBy: "crew2",
+        updatedAt: "2026-10-04T08:15:00.000Z",
+      },
+    }),
+    "Published on 10-03 09:30Z by bergie · edited on 10-04 08:15Z by crew2",
+  );
+  // Provider-shaped notes without provenance fall back to the bare
+  // resource timestamp (when it parses).
+  assert.equal(
+    vm.noteProvenanceText({ timestamp: "2026-10-03T12:00:00.000Z" }),
+    "Published on 10-03 12:00Z",
+  );
+  // Malformed or absent provenance: empty — no fake data.
+  assert.equal(
+    vm.noteProvenanceText({ properties: { publishedAt: "junk" } }),
+    "",
+  );
+  assert.equal(vm.noteProvenanceText({}), "");
+  assert.equal(vm.noteProvenanceText(null), "");
+  // Non-string junk in properties is ignored, not stringified.
+  assert.equal(
+    vm.noteProvenanceText({ properties: { publishedBy: 5, publishedAt: {} } }),
+    "",
+  );
+});
+
 test("parseLayerPrefs: malformed storage data falls back per key", async () => {
   const vm = await loadVm();
   assert.deepEqual(vm.parseLayerPrefs(null), { base: null, overlays: {} });
@@ -282,4 +372,15 @@ test("notes wiring: v2 resources API, layers-control toggle, pick menu integrati
   // (properties, url, description) survives the PUT.
   assert.match(panelSrc, /vm\.noteBodyText\(seed\.note\)/);
   assert.match(appSrc, /\{ \.\.\.stored, \.\.\.formResource \}/);
+  // Provenance: saves stamp who published / when (session user via
+  // loginStatus), and the note detail surface renders the line.
+  assert.match(appSrc, /vm\.stampNoteProvenance\(/);
+  assert.match(appSrc, /currentUserName\(\)/);
+  assert.match(appSrc, /skServer\/loginStatus/);
+  assert.match(mapSrc, /vm\.noteProvenanceText\(note\)/);
+  // A note pick is an annotation, not an observation target: no
+  // "Bearing to" / "Distance CPL" entries, no "Add observation at…"
+  // headline — measure and hazard marking stay.
+  assert.match(mapSrc, /const items = note\s*\?\s*\[/);
+  assert.match(mapSrc, /if \(!note\) \{\s*menu\.textContent/);
 });

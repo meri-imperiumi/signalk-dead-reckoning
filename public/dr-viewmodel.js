@@ -2950,6 +2950,113 @@ export function noteResourceFromForm(form) {
   return resource;
 }
 
+/**
+ * Stamps publication provenance onto a note resource before it is sent
+ * to the resources API (work doc #30): who published it and when, held
+ * in the note schema's `properties` extension object (the standard
+ * place for user-defined note metadata). Create (POST) stamps the
+ * original publication; edit (PUT) leaves it untouched — a note's
+ * origin is history, not metadata to overwrite — and records the
+ * latest edit alongside it. Sessions without a Signal K login
+ * (security off) publish as "anonymous".
+ *
+ * @param {object} resource - the note resource about to be sent (for
+ *   edits: the stored resource merged under the form fields, so its
+ *   existing properties survive)
+ * @param {string|null} user - Signal K username of the current session
+ * @param {string} now - ISO timestamp of this save
+ * @param {boolean} isEdit - true when the resource already exists (PUT)
+ * @returns {object} the resource with provenance properties stamped
+ */
+export function stampNoteProvenance(resource, user, now, isEdit) {
+  const publisher = typeof user === "string" && user ? user : "anonymous";
+  const props = { ...(resource.properties ?? {}) };
+  if (isEdit) {
+    props.updatedBy = publisher;
+    props.updatedAt = now;
+  } else {
+    props.publishedBy = publisher;
+    props.publishedAt = now;
+  }
+  return { ...resource, properties: props };
+}
+
+/**
+ * Reads a note's provenance from its `properties` extension object
+ * (stamped by {@link stampNoteProvenance} on every note this webapp
+ * publishes). Only well-typed non-empty strings are surfaced —
+ * provider-shaped notes may carry no provenance at all, and properties
+ * are other clients' input. Null when nothing is there.
+ *
+ * @param {object|null|undefined} note
+ * @returns {{publisher: string|null, published: string|null,
+ *   editor: string|null, updated: string|null}|null}
+ */
+export function noteProvenance(note) {
+  const p = note?.properties;
+  if (!p || typeof p !== "object") return null;
+  const read = (k) => (typeof p[k] === "string" && p[k] ? p[k] : null);
+  const out = {
+    publisher: read("publishedBy"),
+    published: read("publishedAt"),
+    editor: read("updatedBy"),
+    updated: read("updatedAt"),
+  };
+  if (!out.publisher && !out.published && !out.editor && !out.updated) {
+    return null;
+  }
+  return out;
+}
+
+/**
+ * The provenance line of a note's detail surface:
+ * "Published on 10-03 12:00Z by FIJI METEOROLOGICAL SERVICE" — who
+ * issued/published the note and when, with the publication stamp
+ * (properties, e.g. metarea notes served by signalk-passage-briefing)
+ * preferred over the bare resource timestamp. A later edit rides
+ * after a middot: "· edited on 10-04 08:00Z by alice". Times are UTC
+ * (MM-DD HH:MM). Empty string when the note carries neither.
+ *
+ * @param {object|null|undefined} note
+ * @returns {string}
+ */
+export function noteProvenanceText(note) {
+  const p =
+    noteProvenance(note) ??
+    (typeof note?.timestamp === "string" && note.timestamp
+      ? {
+          publisher: null,
+          published: note.timestamp,
+          editor: null,
+          updated: null,
+        }
+      : null);
+  if (!p) return "";
+  const stamp = (iso) => {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const d = new Date(t);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${clockTextZ(t)}Z`;
+  };
+  const parts = [];
+  if (p.published) {
+    const published = stamp(p.published);
+    if (published) {
+      parts.push(
+        `Published on ${published}${p.publisher ? ` by ${p.publisher}` : ""}`,
+      );
+    }
+  }
+  if (p.updated) {
+    const updated = stamp(p.updated);
+    if (updated) {
+      parts.push(`edited on ${updated}${p.editor ? ` by ${p.editor}` : ""}`);
+    }
+  }
+  return parts.join(" · ");
+}
+
 /** Escapes a string for safe interpolation into HTML. */
 function escapeHtml(s) {
   return s
