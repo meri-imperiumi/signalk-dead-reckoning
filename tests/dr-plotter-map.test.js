@@ -20,6 +20,23 @@ const appSrc = readFileSync(
   { encoding: "utf8" },
 );
 
+test("AIS glyph: cased and stroked like the own boat, a notch lighter", () => {
+  const icon = mapSrc.slice(
+    mapSrc.indexOf("_aisIcon(spec) {"),
+    mapSrc.indexOf("renderAis(specs, nowMs) {"),
+  );
+  // The own-boat casing trick — a dark outline under the arrow — so
+  // targets stay legible over any tileset (they used to vanish at
+  // rest, visible only while a zoom animation scaled the pane up).
+  assert.match(icon, /casingColor/, "dark casing under the arrow");
+  assert.match(icon, /fill-opacity="0.9"/, "near-solid fill");
+  assert.match(icon, /stroke-width="1.1"/, "a real stroke, not a hairline");
+  // A deliberate notch below the own boat: 20 px vs the hull's 26.
+  assert.match(icon, /iconSize: \[20, 20\]/);
+  // Expiring dimming rides the wrapper, unchanged.
+  assert.match(icon, /opacity:0\.55/);
+});
+
 test("own-ship glyphs: boat shapes rotated to course, screen-constant", () => {
   // GPS glyph rotates to COG, falls back to a dot without one.
   const gpsIcon = mapSrc.slice(

@@ -2236,6 +2236,14 @@ class DrMapView extends HTMLElement {
    * for a finger-ish target without covering the chart. Expiring marks
    * drop opacity — the plotter's "data decaying" cue.
    *
+   * Strength follows the own-boat hull's cartographic trick (sea trial
+   * 2026-10: the bare hairline arrows vanished against the chart —
+   * visible only while a zoom animation scaled the pane up, gone the
+   * moment it snapped back): a dark casing under the arrow, near-solid
+   * fill and a real stroke. A deliberate notch below the own boat
+   * (smaller, thinner casing/stroke) so traffic reads as context,
+   * own ship as the subject.
+   *
    * @param {object} spec - aisMarkerSpec result
    * @returns {object} Leaflet divIcon
    */
@@ -2245,11 +2253,19 @@ class DrMapView extends HTMLElement {
         ? `transform:rotate(${Math.round(spec.rotationDeg)}deg);`
         : "";
     const opacity = spec.expiring ? "opacity:0.55;" : "";
+    const path = "M8 1.5 L13.5 13.5 L8 10.8 L2.5 13.5 Z";
+    const casing =
+      `<path d="${path}" fill="none" ` +
+      `stroke="${vm.STYLE.track.casingColor}" stroke-width="2.6" ` +
+      `stroke-linejoin="round"/>`;
+    const arrow =
+      `<path d="${path}" fill="${spec.color}" fill-opacity="0.9" ` +
+      `stroke="${spec.color}" stroke-width="1.1" stroke-linejoin="round"/>`;
     return L.divIcon({
       className: "dr-ais-marker",
-      iconSize: [16, 16],
-      iconAnchor: [8, 8],
-      html: `<div class="dr-ais-glyph" style="${rot}${opacity}"><svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M8 1.5 L13.5 13.5 L8 10.8 L2.5 13.5 Z" fill="${spec.color}" stroke="${spec.color}" stroke-width="0.6"/></svg></div>`,
+      iconSize: [20, 20],
+      iconAnchor: [10, 10],
+      html: `<div class="dr-ais-glyph" style="${rot}${opacity}"><svg width="20" height="20" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">${casing}${arrow}</svg></div>`,
     });
   }
 
