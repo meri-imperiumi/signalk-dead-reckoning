@@ -160,12 +160,13 @@ const SCHEMA_DDL = [
     severity TEXT NOT NULL
   )`,
 
-  // §9.5: entries awaiting a logbook token (access-request approval
-  // window, or token expiry mid-write). Persisted so a plugin restart
-  // doesn't lose the approval-window entries; bounded by MAX_PENDING.
-  // `fix_id` links a queued fix entry back to its `fixes` row so the
-  // delayed flush can mark it logged (the confirm route's own .then
-  // only fires when the write is immediate, not queued).
+  // §9.5: entries written while the logbook's `logentries` provider is
+  // unavailable (logbook absent, or not yet started — plugin start order
+  // isn't guaranteed). Persisted so a plugin restart doesn't lose them;
+  // bounded by MAX_PENDING. `fix_id` links a queued fix entry back to
+  // its `fixes` row so the delayed flush can mark it logged (the
+  // confirm route's own .then only fires when the write is immediate,
+  // not queued).
   `CREATE TABLE IF NOT EXISTS logbook_pending (
     pending_id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT NOT NULL,
@@ -604,7 +605,7 @@ function markFixLogged(db, fixId, logbookRef) {
   ).run(logbookRef ?? null, fixId);
 }
 
-/** Max queued logbook entries (approval window + retry storms). */
+/** Max queued logbook entries (provider-unavailable window + retry storms). */
 const MAX_PENDING = 200;
 
 /**

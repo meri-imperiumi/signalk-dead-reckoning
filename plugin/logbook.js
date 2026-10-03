@@ -2,37 +2,64 @@
  * Logbook integration: write-through to `signalk-logbook` (SPEC §9.4, §9.5).
  *
  * `fixes` remains the canonical record; logbook entries are formatted
- * exports. Entries are POSTed to the logbook plugin's REST API
- * (`/plugins/signalk-logbook/logs`) from the main thread, always with an
- * explicit `datetime` (confirmations can lag a DR reset by more than the
- * 15-minute `ago` cap).
+ * exports. Entries are written through the Signal K v2 Resources API
+ * (`app.resourcesApi.setResource('logentries', …)`) — the in-process
+ * provider interface the logbook plugin registers. No REST, no tokens:
+ * the server gates in-process plugin access at nothing, so the whole
+ * access-request/token apparatus the v1 plugin routes forced is gone.
+ * Entries always carry an explicit `datetime` (confirmations can lag a
+ * DR reset by more than the enrichment buffer window) and are composed
+ * to the `logentries` resource schema: logbook fields at the top level,
+ * everything addressable as a Signal K path as delta-shaped telemetry
+ * pathvalues in SI units.
  *
- * Verified against the logbook plugin source (v0.2.0):
- *  - With explicit `datetime`, the server auto-captures nothing — the
- *    entry contains exactly the fields POSTed, which is what SPEC §9.5's
- *    mapping assigns this plugin anyway (position, log, speed, heading,
- *    observations all composed here).
- *  - `origin` accepts 'manual' | 'auto' | 'agent'. This plugin writes
- *    'auto' for every entry: 'manual' is reserved for free text a
- *    watchkeeper types into the logbook UI, whereas these entries are
- *    posted through the API (the watchkeeper's name travels in
- *    `author`); 'agent' is left for autonomous agents, and the DR
- *    plugin is routine automation — §9.4 tack detection and §9.5
- *    fix/observation write-through.
- *  - `body.author` overrides the JWT-derived author (delegation), so
- *    `confirmed_by` flows through as the entry author.
- *  - Auth: the server's auth gate reads the Authorization Bearer header;
- *    the logbook plugin reads the author from the JAUTHENTICATION cookie.
- *    Send both (the signalk-dsc pattern).
+ * `origin` semantics per the logentries contract: 'agent' = machine
+ * writing on behalf of a human — confirmed fixes and observations the
+ * watchkeeper entered (SPEC §9.5's intent, previously sent as 'auto');
+ * 'auto' = trigger/automation with no human in the loop — tack/gybe
+ * detection (§9.4).
  *
- * No retries: a failed write is logged and dropped — `logged_to_logbook`
- * stays 0 in `fixes`, visible there (SPEC explicitly avoids retry and
- * idempotency assumptions).
+ * A failed write is queued in the plugin DB and retried with backoff
+ * (index.js); the write path itself never throws — `logged_to_logbook`
+ * stays 0 in `fixes`, visible there.
  *
  * @file logbook.js
  */
 
 const { randomUUID } = require("node:crypto");
+
+/** Signal K SI unit conversions (the logentries contract speaks SI). */
+const NM_TO_M = 1852;
+const KN_TO_MS = 463 / 900; // 1 kn = 1852 m/h exactly
+const DEG_TO_RAD = Math.PI / 180;
+
+/**
+ * WMO correspondence between the Douglas sea state code (what the
+ * logbook watch flow publishes and this plugin's `sea_state` carries)
+ * and the Beaufort force the `environment.water.seaState` resource path
+ * carries — mirrored from the logbook's own resources boundary mapping.
+ */
+const DOUGLAS_TO_BEAUFORT = [0, 1, 2, 3, 5, 6, 8, 9, 10, 12];
+
+/**
+ * Douglas sea state code (0-9) → Beaufort force (0-12), or null when
+ * out of range / non-numeric.
+ *
+ * @param {number|null|undefined} sea_state
+ * @returns {number|null}
+ */
+function seaStateBeaufort(sea_state) {
+  // Number(null) is 0 — reject nullish before coercion ("unknown" is
+  // null here, never a legitimate Douglas 0).
+  if (sea_state == null || sea_state === "") return null;
+  const n = Number(sea_state);
+  if (!Number.isFinite(n)) return null;
+  const code = Math.round(n);
+  if (code < 0 || code >= DOUGLAS_TO_BEAUFORT.length) {
+    return null;
+  }
+  return DOUGLAS_TO_BEAUFORT[code];
+}
 
 /**
  * Human-facing `position.source` string per fix source_type.
@@ -46,48 +73,14 @@ const POSITION_SOURCE = {
 };
 
 /**
- * Formats a single coordinate (lat or lon) in one of the three
- * notations the webapp supports (`public/dr-position-format.js`, SPEC
- * §14.1), so logbook entry text matches what the watchkeeper sees on
- * screen — decimal "60.0000 N", DM "60°00.000' N", DMS "60°00'00.0\" N"
- * (the last being the traditional nautical chart format). Mirrored
- * server-side because the webapp module is ESM and this is CJS.
+ * Builds a delta-shaped telemetry pathvalue for the `telemetry` array.
  *
- * @param {number} deg - signed degrees
- * @param {"lat"|"lon"} kind
- * @param {"decimal"|"dm"|"dms"} format
- * @returns {string}
+ * @param {string} path
+ * @param {unknown} value
+ * @returns {{path: string, value: unknown}}
  */
-function formatCoord(deg, kind, format) {
-  const abs = Math.abs(deg);
-  const hem =
-    deg < 0 ? (kind === "lat" ? "S" : "W") : kind === "lat" ? "N" : "E";
-  if (format === "dms") {
-    const d = Math.floor(abs);
-    const minFull = (abs - d) * 60;
-    const m = Math.floor(minFull);
-    const s = ((minFull - m) * 60).toFixed(1);
-    return `${d}°${String(m).padStart(2, "0")}'${s.padStart(4, "0")}" ${hem}`;
-  }
-  if (format === "dm") {
-    const d = Math.floor(abs);
-    const m = ((abs - d) * 60).toFixed(3);
-    return `${d}°${String(m).padStart(6, "0")}' ${hem}`;
-  }
-  return `${abs.toFixed(4)} ${hem}`;
-}
-
-/**
- * Formats a latitude/longitude pair for entry text, in the same
- * notation as the webapp (see {@link formatCoord}).
- *
- * @param {number} latitude
- * @param {number} longitude
- * @param {"decimal"|"dm"|"dms"} [format="decimal"]
- * @returns {string}
- */
-function formatPosition(latitude, longitude, format = "decimal") {
-  return `${formatCoord(latitude, "lat", format)} ${formatCoord(longitude, "lon", format)}`;
+function pathvalue(path, value) {
+  return { path, value };
 }
 
 /**
@@ -102,12 +95,12 @@ function round(n, places) {
 }
 
 /**
- * Composes the `NewEntry`-shaped body for a confirmed fix (SPEC §9.5
- * mapping). Only schema-defined fields are emitted (`additionalProperties:
- * false` on both NewEntry and Observations). The free-text `text` carries
- * only what the structured fields lack — the fix's *sources* (the
- * observations that resolved into it) and the DR-vs-fix deviation — since
- * `position` already holds the coordinates and `author` the watchkeeper.
+ * Composes a `logentries`-shaped entry body for a confirmed fix (SPEC
+ * §9.5 mapping, resources schema). Structured data rides the SI
+ * telemetry pathvalues; the free-text `text` carries only what those
+ * lack — the fix's *sources* (the observations that resolved into it)
+ * and the DR-vs-fix deviation — since the position pathvalue already
+ * holds the coordinates and `author` the watchkeeper.
  *
  * @param {object} f
  * @param {string} f.datetime - ISO timestamp of the fix
@@ -135,30 +128,50 @@ function round(n, places) {
  * @returns {object} POST /logs body
  */
 function composeFixEntry(f) {
+  const telemetry = [
+    pathvalue("navigation.position", {
+      latitude: f.latitude,
+      longitude: f.longitude,
+      source: POSITION_SOURCE[f.source_type] ?? "DR",
+    }),
+  ];
+  if (Number.isFinite(f.dr_log_nm)) {
+    telemetry.push(pathvalue("navigation.log", f.dr_log_nm * NM_TO_M));
+  }
+  if (Number.isFinite(f.heading_deg)) {
+    telemetry.push(
+      pathvalue("navigation.headingTrue", f.heading_deg * DEG_TO_RAD),
+    );
+  }
+  if (Number.isFinite(f.course_deg)) {
+    telemetry.push(
+      pathvalue("navigation.courseOverGroundTrue", f.course_deg * DEG_TO_RAD),
+    );
+  }
+  if (Number.isFinite(f.stw_kn)) {
+    telemetry.push(
+      pathvalue("navigation.speedThroughWater", f.stw_kn * KN_TO_MS),
+    );
+  }
+  if (Number.isFinite(f.sog_kn)) {
+    telemetry.push(
+      pathvalue("navigation.speedOverGround", f.sog_kn * KN_TO_MS),
+    );
+  }
+  const beaufort = seaStateBeaufort(f.sea_state);
+  if (beaufort != null) {
+    telemetry.push(pathvalue("environment.water.seaState", beaufort));
+  }
   const body = {
     datetime: f.datetime,
     text: composeFixText(f),
     category: "navigation",
-    origin: "auto",
-    position: {
-      latitude: f.latitude,
-      longitude: f.longitude,
-      source: POSITION_SOURCE[f.source_type] ?? "DR",
-    },
+    // Human-confirmed fix the machine writes down (SPEC §9.5): 'agent',
+    // not 'auto' — there was a human judgment in the loop.
+    origin: "agent",
+    telemetry,
   };
   if (f.confirmed_by) body.author = f.confirmed_by;
-  if (Number.isFinite(f.dr_log_nm)) body.log = round(f.dr_log_nm, 1) ?? 0;
-  if (Number.isFinite(f.heading_deg)) body.heading = round(f.heading_deg, 1);
-  if (Number.isFinite(f.course_deg)) body.course = round(f.course_deg, 1);
-  const speed = {};
-  if (Number.isFinite(f.sog_kn)) speed.sog = round(f.sog_kn, 1);
-  if (Number.isFinite(f.stw_kn)) speed.stw = round(f.stw_kn, 1);
-  if (speed.sog != null || speed.stw != null) body.speed = speed;
-  // Observations: schema allows only seaState/cloudCoverage/visibility;
-  // emit the object only when we actually have one.
-  if (Number.isFinite(f.sea_state)) {
-    body.observations = { seaState: Math.round(f.sea_state) };
-  }
   return body;
 }
 
@@ -284,15 +297,16 @@ function deviationClause(f) {
 }
 
 /**
- * Composes the `NewEntry`-shaped body for an auto-detected completed
- * tack/gybe (SPEC §9.4). No confirmation step — written directly.
+ * Composes a `logentries`-shaped entry body for an auto-detected
+ * completed tack/gybe (SPEC §9.4). No confirmation step — written
+ * directly, `origin: 'auto'` (pure automation, no human in the loop).
  *
  * @param {object} t
  * @param {"tack"|"gybe"} t.direction
  * @param {number} t.newHeadingDeg - stabilized post-maneuver heading
  * @param {string} t.datetime - ISO timestamp of the maneuver completion
- * @param {number|null} [t.sea_state] - WMO sea state code 0-9
- * @returns {object} POST /logs body
+ * @param {number|null} [t.sea_state] - Douglas sea state code 0-9
+ * @returns {object} setResource body
  */
 function composeTackEntry(t) {
   const heading = round(t.newHeadingDeg, 0);
@@ -306,8 +320,9 @@ function composeTackEntry(t) {
     category: "navigation",
     origin: "auto",
   };
-  if (Number.isFinite(t.sea_state)) {
-    body.observations = { seaState: Math.round(t.sea_state) };
+  const beaufort = seaStateBeaufort(t.sea_state);
+  if (beaufort != null) {
+    body.telemetry = [pathvalue("environment.water.seaState", beaufort)];
   }
   return body;
 }
@@ -318,9 +333,10 @@ function composeTackEntry(t) {
  * sight. Logged when the observation is recorded — independent of
  * whether it ever resolves into a fix — because taking the sight is
  * itself a navigational event. The vessel's position (DR at the time
- * of the sight) goes in the structured `position` field — the logbook
- * UI renders it separately, so it stays out of `text`; `text` carries
- * only what was observed (object, bearing/radius/reduction).
+ * of the sight) rides the `navigation.position` telemetry pathvalue —
+ * the logbook UI renders it separately, so it stays out of `text`;
+ * `text` carries only what was observed (object, bearing/radius/
+ * reduction).
  *
  * @param {object} o
  * @param {"bearing"|"vertical"|"celestial"} o.kind
@@ -333,8 +349,8 @@ function composeTackEntry(t) {
  * @param {number|null} [o.azimuth_true] - true bearing to the object, deg
  *   (bearing LOPs — the observed angle is the event, it belongs in text)
  * @param {number|null} [o.radius_nm] - CPL radius, nm (vertical-angle CPLs)
- * @param {number|null} [o.sea_state] - WMO sea state code 0-9
- * @returns {object} POST /logs body
+ * @param {number|null} [o.sea_state] - Douglas sea state code 0-9
+ * @returns {object} setResource body
  */
 function composeObservationEntry(o) {
   const hasPosition =
@@ -370,67 +386,58 @@ function composeObservationEntry(o) {
     datetime: o.datetime,
     text,
     category: "navigation",
-    origin: "auto",
+    // Watchkeeper-entered observation the machine writes down: 'agent'.
+    origin: "agent",
   };
-  if (o.confirmed_by) body.author = o.confirmed_by;
+  const telemetry = [];
   if (hasPosition) {
-    body.position = {
-      latitude: o.latitude,
-      longitude: o.longitude,
-      source: o.kind === "celestial" ? "Celestial" : "DR",
-    };
+    telemetry.push(
+      pathvalue("navigation.position", {
+        latitude: o.latitude,
+        longitude: o.longitude,
+        source: o.kind === "celestial" ? "Celestial" : "DR",
+      }),
+    );
   }
-  if (Number.isFinite(o.sea_state)) {
-    body.observations = { seaState: Math.round(o.sea_state) };
+  const beaufort = seaStateBeaufort(o.sea_state);
+  if (beaufort != null) {
+    telemetry.push(pathvalue("environment.water.seaState", beaufort));
   }
+  if (telemetry.length > 0) body.telemetry = telemetry;
+  if (o.confirmed_by) body.author = o.confirmed_by;
   return body;
 }
 
 /**
- * Creates a logbook REST client (the signalk-dsc transport pattern).
+ * Creates a logbook write client over the Signal K v2 Resources API —
+ * the in-process `app.resourcesApi` interface, with the `logentries`
+ * provider registered by signalk-logbook. No REST, no tokens, no auth
+ * of any kind: in-process plugin access passes no security middleware.
  *
  * @param {object} opts
- * @param {string} opts.url - POST endpoint, typically
- *   http://localhost:3000/plugins/signalk-logbook/logs
- * @param {string} [opts.token] - Signal K access token; sent as both the
- *   Authorization Bearer header (server auth gate) and the
- *   JAUTHENTICATION cookie (logbook author read)
- * @param {Function} [opts.fetchImpl] - injectable for tests; defaults to
- *   the global fetch
- * @returns {{createEntry: (body: object) => Promise<string|null>}} the
- *   created entry's datetime key on success, null on failure
+ * @param {object} opts.resourcesApi - the server's resources API
+ * @returns {{createEntry: (body: object) => Promise<{id: string}|null>}}
+ *   the created entry's resource id (a UUID, the entry's stable
+ *   identity) on success, null on provider failure
  */
 function createLogbookClient(opts) {
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  const headers = { "Content-Type": "application/json" };
-  if (opts.token) {
-    headers.Authorization = `Bearer ${opts.token}`;
-    headers.Cookie = `JAUTHENTICATION=${opts.token}`;
-  }
-
+  const resourcesApi = opts.resourcesApi;
   return {
     /**
-     * POSTs an entry. Resolves the entry's datetime key (the logbook's
-     * identity for an entry) on 2xx. Resolves `"unauthorized"` on 401/403
-     * (token expired/revoked — caller should resubmit an access request),
-     * null on any other failure. Never rejects; callers degrade
-     * gracefully.
+     * Writes an entry under a fresh UUID (PUT-style upsert — the
+     * resources API's create path; idempotent per id, unlike POST).
+     * Resolves `{id}` on success, null when the provider rejects (e.g.
+     * the logbook plugin is absent — no `logentries` provider — or a
+     * validation error). Never rejects; callers degrade gracefully.
      *
-     * @param {object} body - NewEntry-shaped
-     * @returns {Promise<string|null|"unauthorized">}
+     * @param {object} body - logentries-shaped entry
+     * @returns {Promise<{id: string}|null>}
      */
     async createEntry(body) {
       try {
-        const res = await fetchImpl(opts.url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-        });
-        if (res.status === 401 || res.status === 403) {
-          return "unauthorized";
-        }
-        if (!res.ok) return null;
-        return body.datetime;
+        const id = randomUUID();
+        await resourcesApi.setResource("logentries", id, body);
+        return { id };
       } catch {
         return null;
       }
@@ -439,105 +446,26 @@ function createLogbookClient(opts) {
 }
 
 /**
- * Creates a Signal K Access Requests client (per the REST API spec):
- * a device (this plugin) asks the server for access, an administrator
- * approves, and the device receives a bearer token. Pure transport —
- * lifecycle state (clientId, stored token, polling cadence) lives with
- * the caller.
+ * Probes for a registered `logentries` resource provider: resolves when
+ * one answers, rejects when the Resources API is unavailable (older
+ * server) or no provider for the type is registered (logbook plugin
+ * absent, or not yet started — start order between plugins isn't
+ * guaranteed). A minimal listing is the cheap, complete-window query
+ * the contract's "no silent windows" rule allows.
  *
- * @param {object} opts
- * @param {string} opts.baseUrl - server origin, e.g. http://localhost:3000
- * @param {Function} [opts.fetchImpl] - injectable for tests
+ * @param {object|undefined} resourcesApi - the server's resources API
+ * @returns {Promise<void>}
  */
-function createAccessRequestClient(opts) {
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  return {
-    /**
-     * Submits a new access request. `permissions` may be requested
-     * explicitly ('readonly' | 'readwrite' | 'admin') — plugin REST routes
-     * (where signalk-logbook lives) are admin-gated by the server, so
-     * logbook writes need 'admin'. The requested level is surfaced to the
-     * approving administrator and granted verbatim on approval.
-     *
-     * Resolves the poll href on acceptance (202). null when the server
-     * has no access-request flow (404 security-not-enabled / 501 not
-     * implemented — an open server accepts tokenless writes).
-     * 'forbidden' when the flow exists but device access requests are
-     * disallowed (403 — verified in signalk-server: requestAccess
-     * completes with statusCode 403 while allowDeviceAccessRequests is
-     * off; no token can be obtained without an admin changing server
-     * settings, so retrying is pointless). 'unreachable' on transport
-     * failure or an unaccepted request (400 duplicate/invalid, 413, 5xx —
-     * distinguished so the caller retries with backoff instead of
-     * falsely claiming an open server).
-     *
-     * @param {{clientId: string, description: string, permissions?: string}} req
-     * @returns {Promise<string|null|"forbidden"|"unreachable">}
-     */
-    async request(req) {
-      try {
-        const res = await fetchImpl(
-          `${opts.baseUrl}/signalk/v1/access/requests`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(req),
-          },
-        );
-        if (res.status === 501 || res.status === 404) return null;
-        if (res.status === 403) return "forbidden";
-        if (!res.ok) return "unreachable";
-        const body = await res.json();
-        // A 2xx without an href is a broken reply — retry later, never
-        // treat it as evidence of an open server.
-        return body?.href ?? "unreachable";
-      } catch {
-        return "unreachable";
-      }
-    },
-
-    /**
-     * Polls a pending access request once. Resolves null while PENDING
-     * or on failure; 'DENIED' when the administrator denied access;
-     * `{token, expirationTime}` when approved.
-     *
-     * @param {string} href
-     * @returns {Promise<null|"DENIED"|{token: string, expirationTime: string|null}>}
-     */
-    async poll(href) {
-      try {
-        const res = await fetchImpl(`${opts.baseUrl}${href}`);
-        if (!res.ok) return null;
-        const body = await res.json();
-        if (body?.state !== "COMPLETED") return null;
-        const access = body.accessRequest;
-        if (access?.permission === "APPROVED") {
-          return {
-            token: access.token,
-            expirationTime: access.expirationTime ?? null,
-          };
-        }
-        return "DENIED";
-      } catch {
-        return null;
-      }
-    },
-  };
-}
-
-/**
- * Generates a fresh v4 UUID client id (persist it — the spec requires the
- * same clientId for every request).
- *
- * @returns {string}
- */
-function newClientId() {
-  return randomUUID();
+async function probeLogbookProvider(resourcesApi) {
+  if (!resourcesApi || typeof resourcesApi.listResources !== "function") {
+    throw new Error("resourcesApi unavailable");
+  }
+  await resourcesApi.listResources("logentries", { limit: 1 });
 }
 
 module.exports = {
   POSITION_SOURCE,
-  formatPosition,
+  seaStateBeaufort,
   formatBearingTrue,
   observationSources,
   composeFixEntry,
@@ -545,6 +473,5 @@ module.exports = {
   composeTackEntry,
   composeObservationEntry,
   createLogbookClient,
-  createAccessRequestClient,
-  newClientId,
+  probeLogbookProvider,
 };

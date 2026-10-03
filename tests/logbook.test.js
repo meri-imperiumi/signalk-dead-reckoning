@@ -1,5 +1,6 @@
 /**
- * Tests for logbook entry composition and clients (SPEC §9.4, §9.5).
+ * Tests for logbook entry composition and the Resources API client
+ * (SPEC §9.4, §9.5; logentries resource contract).
  * @file logbook.test.js
  */
 
@@ -7,36 +8,46 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  formatPosition,
+  seaStateBeaufort,
   formatBearingTrue,
   observationSources,
   composeFixEntry,
   composeTackEntry,
   composeObservationEntry,
   createLogbookClient,
-  createAccessRequestClient,
-  newClientId,
+  probeLogbookProvider,
 } = require("../plugin/logbook.js");
 
-test("formatPosition renders decimal/dm/dms like the webapp", () => {
-  assert.strictEqual(formatPosition(60, 24, "decimal"), "60.0000 N 24.0000 E");
-  assert.strictEqual(
-    formatPosition(-33.5, -71.25, "decimal"),
-    "33.5000 S 71.2500 W",
-  );
-  assert.strictEqual(
-    formatPosition(60.0, 24.5, "dm"),
-    "60°00.000' N 24°30.000' E",
-  );
-  assert.strictEqual(
-    formatPosition(-18.8651, -159.8008, "dms"),
-    "18°51'54.4\" S 159°48'02.9\" W",
-  );
-  // Default stays decimal for callers that don't pass a preference.
-  assert.strictEqual(formatPosition(60, 24), "60.0000 N 24.0000 E");
+// The SI units the logentries contract speaks (mirrored from the module).
+const NM_TO_M = 1852;
+const KN_TO_MS = 463 / 900;
+const DEG_TO_RAD = Math.PI / 180;
+
+/**
+ * All telemetry pathvalues for a path (the contract allows duplicates
+ * per $source; composition emits one per path).
+ */
+function pv(entry, path) {
+  return (entry.telemetry ?? []).filter((t) => t.path === path);
+}
+
+function pv1(entry, path) {
+  const all = pv(entry, path);
+  assert.strictEqual(all.length, 1, `one ${path} pathvalue`);
+  return all[0].value;
+}
+
+test("seaStateBeaufort: WMO Douglas→Beaufort correspondence", () => {
+  assert.strictEqual(seaStateBeaufort(0), 0);
+  assert.strictEqual(seaStateBeaufort(3), 3);
+  assert.strictEqual(seaStateBeaufort(5), 6);
+  assert.strictEqual(seaStateBeaufort(9), 12);
+  assert.strictEqual(seaStateBeaufort(null), null);
+  assert.strictEqual(seaStateBeaufort(10), null, "Douglas tops out at 9");
+  assert.strictEqual(seaStateBeaufort(2.4), 2, "rounded to the code");
 });
 
-test("composeFixEntry: GPS fix maps per SPEC §9.5", () => {
+test("composeFixEntry: GPS fix maps per SPEC §9.5 (resources schema, SI)", () => {
   const body = composeFixEntry({
     datetime: "2026-08-24T12:00:00.000Z",
     source_type: "gps",
@@ -51,26 +62,38 @@ test("composeFixEntry: GPS fix maps per SPEC §9.5", () => {
   });
   assert.strictEqual(body.datetime, "2026-08-24T12:00:00.000Z");
   assert.strictEqual(body.category, "navigation");
-  assert.strictEqual(body.origin, "auto");
+  // Human-confirmed fix the machine writes down: 'agent' (SPEC §9.5).
+  assert.strictEqual(body.origin, "agent");
   assert.strictEqual(body.author, "Alice");
-  assert.strictEqual(body.position.source, "GPS");
-  assert.strictEqual(body.position.latitude, 60);
-  assert.strictEqual(body.log, 12.3);
-  assert.strictEqual(body.heading, 190.5);
-  assert.strictEqual(body.speed.stw, 5.1);
-  assert.strictEqual(body.speed.sog, undefined);
-  assert.deepStrictEqual(body.observations, { seaState: 3 });
+  const position = pv1(body, "navigation.position");
+  assert.strictEqual(position.source, "GPS");
+  assert.strictEqual(position.latitude, 60);
+  assert.strictEqual(position.longitude, 24);
+  // DR-integrated log in meters (SI), never GPS-derived.
+  assert.ok(Math.abs(pv1(body, "navigation.log") - 12.34 * NM_TO_M) < 1e-9);
+  assert.ok(
+    Math.abs(pv1(body, "navigation.headingTrue") - 190.5 * DEG_TO_RAD) < 1e-12,
+  );
+  assert.ok(
+    Math.abs(pv1(body, "navigation.speedThroughWater") - 5.1 * KN_TO_MS) <
+      1e-12,
+  );
+  assert.strictEqual(pv(body, "navigation.speedOverGround").length, 0);
+  // Douglas 3 rides the Beaufort-scale resource path (WMO: force 3).
+  assert.strictEqual(pv1(body, "environment.water.seaState"), 3);
   assert.ok(/GPS fix/.test(body.text));
   assert.ok(/0\.5 NM from DR/.test(body.text));
   assert.ok(!/by Alice/.test(body.text), "author stays in metadata, not text");
   assert.ok(
     !/60\.0000/.test(body.text),
-    "coordinates stay in the position field",
+    "coordinates stay in the position pathvalue",
   );
-  // Closed-schema discipline: no stray fields.
+  // No stray top-level fields beyond the logentries contract.
   assert.ok(!("ago" in body));
+  assert.ok(!("position" in body));
   assert.ok(!("course" in body));
   assert.ok(!("waypoint" in body));
+  assert.ok(!("observations" in body));
 });
 
 test("composeFixEntry: celestial fix composes sights + residual into text", () => {
@@ -83,14 +106,14 @@ test("composeFixEntry: celestial fix composes sights + residual into text", () =
     residual_nm: 1.2,
     observation_count: 3,
   });
-  assert.strictEqual(body.position.source, "Celestial");
+  assert.strictEqual(pv1(body, "navigation.position").source, "Celestial");
   assert.ok(/Celestial fix/.test(body.text));
   assert.ok(!/by Bob/.test(body.text), "author stays in metadata, not text");
   assert.ok(/from 3 sights/.test(body.text));
   assert.ok(/residual 1\.2 NM/.test(body.text));
   assert.ok(
     !/60\.0000/.test(body.text),
-    "coordinates stay in the position field",
+    "coordinates stay in the position pathvalue",
   );
 });
 
@@ -141,7 +164,7 @@ test("composeFixEntry: unattributed fix omits author and deviation clause when u
   assert.ok(!/from DR/.test(body.text));
 });
 
-test("composeFixEntry: unknown sea_state emits no observations", () => {
+test("composeFixEntry: unknown sea_state emits no seaState pathvalue", () => {
   const body = composeFixEntry({
     datetime: "2026-08-24T12:00:00.000Z",
     source_type: "gps",
@@ -149,7 +172,7 @@ test("composeFixEntry: unknown sea_state emits no observations", () => {
     longitude: 0,
     sea_state: null,
   });
-  assert.ok(!("observations" in body));
+  assert.strictEqual(pv(body, "environment.water.seaState").length, 0);
 });
 
 test("formatBearingTrue: zero-padded, normalized to 0-359, true notation", () => {
@@ -209,7 +232,6 @@ test("composeFixEntry: manual fix from bearing observations lists the sources", 
         azimuth_true: 321,
       },
     ],
-    positionFormat: "dms",
   });
   assert.strictEqual(body.author, "bergie");
   // Sources named, coordinates & author kept out of the text.
@@ -246,7 +268,7 @@ test("composeFixEntry: backfill fix gets its own label, not Manual", () => {
     deviation_nm: 1.0,
     deviation_bearing: 180,
   });
-  assert.strictEqual(body.position.source, "Backfill");
+  assert.strictEqual(pv1(body, "navigation.position").source, "Backfill");
   assert.ok(/^Backfill fix, 1\.0 NM at 180°T from DR$/.test(body.text));
 });
 
@@ -258,7 +280,9 @@ test("composeTackEntry: text, category, origin; heading zero-padded", () => {
   });
   assert.strictEqual(tack.text, "Tack to 045°");
   assert.strictEqual(tack.category, "navigation");
+  // Pure automation, no human in the loop: 'auto'.
   assert.strictEqual(tack.origin, "auto");
+  assert.strictEqual(tack.telemetry, undefined);
 
   const gybe = composeTackEntry({
     direction: "gybe",
@@ -267,205 +291,62 @@ test("composeTackEntry: text, category, origin; heading zero-padded", () => {
     sea_state: 2,
   });
   assert.strictEqual(gybe.text, "Gybe to 190°");
-  assert.deepStrictEqual(gybe.observations, { seaState: 2 });
+  assert.strictEqual(pv1(gybe, "environment.water.seaState"), 2);
 });
 
-test("createLogbookClient: sends auth both ways, returns datetime on 2xx", async () => {
+test("createLogbookClient: setResource under a fresh UUID, resolves {id}", async () => {
   const calls = [];
   const client = createLogbookClient({
-    url: "http://x/logs",
-    token: "tok",
-    fetchImpl: async (url, opts) => {
-      calls.push({ url, opts });
-      return { ok: true, status: 201 };
-    },
-  });
-  const ref = await client.createEntry({
-    datetime: "2026-08-24T12:00:00Z",
-    text: "t",
-  });
-  assert.strictEqual(ref, "2026-08-24T12:00:00Z");
-  assert.strictEqual(calls[0].opts.method, "POST");
-  assert.strictEqual(calls[0].opts.headers.Authorization, "Bearer tok");
-  assert.strictEqual(calls[0].opts.headers.Cookie, "JAUTHENTICATION=tok");
-  assert.strictEqual(calls[0].opts.headers["Content-Type"], "application/json");
-  assert.ok(calls[0].url.endsWith("/logs"));
-});
-
-test("createLogbookClient: no token omits auth headers; 403 → 'unauthorized'; other failures → null", async () => {
-  const noAuth = createLogbookClient({
-    url: "http://x/logs",
-    fetchImpl: async (_url, opts) => {
-      assert.ok(!("Authorization" in opts.headers));
-      return { ok: false, status: 500 };
-    },
-  });
-  assert.strictEqual(
-    await noAuth.createEntry({ datetime: "x", text: "t" }),
-    null,
-  );
-
-  const forbidden = createLogbookClient({
-    url: "http://x/logs",
-    fetchImpl: async () => ({ ok: false, status: 403 }),
-  });
-  assert.strictEqual(
-    await forbidden.createEntry({ datetime: "x", text: "t" }),
-    "unauthorized",
-  );
-
-  const throwing = createLogbookClient({
-    url: "http://x/logs",
-    fetchImpl: async () => {
-      throw new Error("network down");
-    },
-  });
-  assert.strictEqual(
-    await throwing.createEntry({ datetime: "x", text: "t" }),
-    null,
-  );
-});
-
-test("access request client: request posts clientId/description/permissions, returns href", async () => {
-  const seen = [];
-  const access = createAccessRequestClient({
-    baseUrl: "http://x",
-    fetchImpl: async (url, opts) => {
-      seen.push({ url, body: JSON.parse(opts.body) });
-      return {
-        ok: true,
-        status: 202,
-        json: async () => ({
-          state: "PENDING",
-          href: "/signalk/v1/requests/abc",
-        }),
-      };
-    },
-  });
-  const href = await access.request({
-    clientId: "uuid-1",
-    description: "desc",
-    permissions: "admin",
-  });
-  assert.strictEqual(href, "/signalk/v1/requests/abc");
-  assert.ok(seen[0].url.includes("/signalk/v1/access/requests"));
-  assert.strictEqual(seen[0].body.permissions, "admin");
-});
-
-test("access request client: 501/404 → null (open server)", async () => {
-  for (const status of [501, 404]) {
-    const access = createAccessRequestClient({
-      baseUrl: "http://x",
-      fetchImpl: async () => ({ ok: false, status }),
-    });
-    assert.strictEqual(
-      await access.request({ clientId: "u", description: "d" }),
-      null,
-    );
-  }
-});
-
-test("access request client: 403 → 'forbidden' (device access requests disallowed — must not read as open server)", async () => {
-  // signalk-server with security enabled but allowDeviceAccessRequests
-  // off completes the request with statusCode 403. Misreading that as
-  // "no access-request flow" made the plugin probe tokenless writes,
-  // eat the admin gate's 401, and loop — the 401-flood bug.
-  const access = createAccessRequestClient({
-    baseUrl: "http://x",
-    fetchImpl: async () => ({
-      ok: false,
-      status: 403,
-      json: async () => ({ state: "COMPLETED", statusCode: 403 }),
-    }),
-  });
-  assert.strictEqual(
-    await access.request({ clientId: "u", description: "d" }),
-    "forbidden",
-  );
-});
-
-test("access request client: 400/5xx → 'unreachable' (retry later, not an open server)", async () => {
-  for (const status of [400, 413, 500, 503]) {
-    const access = createAccessRequestClient({
-      baseUrl: "http://x",
-      fetchImpl: async () => ({ ok: false, status }),
-    });
-    assert.strictEqual(
-      await access.request({ clientId: "u", description: "d" }),
-      "unreachable",
-    );
-  }
-});
-
-test("access request client: 2xx without href → 'unreachable' (broken reply, never open server)", async () => {
-  const access = createAccessRequestClient({
-    baseUrl: "http://x",
-    fetchImpl: async () => ({
-      ok: true,
-      status: 202,
-      json: async () => ({ state: "PENDING" }),
-    }),
-  });
-  assert.strictEqual(
-    await access.request({ clientId: "u", description: "d" }),
-    "unreachable",
-  );
-});
-
-test("access request client: transport failure → 'unreachable' (distinct from open server)", async () => {
-  const access = createAccessRequestClient({
-    baseUrl: "http://x",
-    fetchImpl: async () => {
-      throw new Error("connect ECONNREFUSED");
-    },
-  });
-  assert.strictEqual(
-    await access.request({ clientId: "u", description: "d" }),
-    "unreachable",
-  );
-});
-
-test("access request client: poll states — pending null, approved token, denied", async () => {
-  const mk = (body) =>
-    createAccessRequestClient({
-      baseUrl: "http://x",
-      fetchImpl: async () => ({
-        ok: true,
-        status: 200,
-        json: async () => body,
-      }),
-    });
-  assert.strictEqual(await mk({ state: "PENDING" }).poll("/href"), null);
-  assert.deepStrictEqual(
-    await mk({
-      state: "COMPLETED",
-      statusCode: 200,
-      accessRequest: {
-        permission: "APPROVED",
-        token: "t1",
-        expirationTime: "2027-01-01T00:00:00Z",
+    resourcesApi: {
+      async setResource(type, id, value) {
+        calls.push({ type, id, value });
       },
-    }).poll("/href"),
-    { token: "t1", expirationTime: "2027-01-01T00:00:00Z" },
+    },
+  });
+  const body = { datetime: "2026-08-24T12:00:00Z", text: "t" };
+  const ref = await client.createEntry(body);
+  assert.match(
+    ref.id,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    "resource id is a v4 UUID",
   );
-  assert.strictEqual(
-    await mk({
-      state: "COMPLETED",
-      statusCode: 200,
-      accessRequest: { permission: "DENIED" },
-    }).poll("/href"),
-    "DENIED",
-  );
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].type, "logentries");
+  assert.strictEqual(calls[0].id, ref.id);
+  assert.strictEqual(calls[0].value, body, "the composed entry, verbatim");
 });
 
-test("newClientId returns distinct v4 UUIDs", () => {
-  const a = newClientId();
-  const b = newClientId();
-  assert.notStrictEqual(a, b);
-  assert.match(
-    a,
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+test("createLogbookClient: provider rejection → null (degrade, never throw)", async () => {
+  const client = createLogbookClient({
+    resourcesApi: {
+      async setResource() {
+        throw new Error("no logentries provider registered");
+      },
+    },
+  });
+  assert.strictEqual(await client.createEntry({ text: "t" }), null);
+});
+
+test("probeLogbookProvider: resolves when the provider answers, rejects otherwise", async () => {
+  await probeLogbookProvider({
+    async listResources(type, query) {
+      assert.strictEqual(type, "logentries");
+      // `limit` alone is a complete window under the contract's
+      // "no silent windows" rule.
+      assert.deepStrictEqual(query, { limit: 1 });
+      return {};
+    },
+  });
+
+  await assert.rejects(
+    probeLogbookProvider({
+      async listResources() {
+        throw new Error("Unknown resource type");
+      },
+    }),
   );
+  await assert.rejects(probeLogbookProvider(undefined));
+  await assert.rejects(probeLogbookProvider({}));
 });
 
 test("composeObservationEntry: celestial sight with reduction", () => {
@@ -480,7 +361,8 @@ test("composeObservationEntry: celestial sight with reduction", () => {
     sea_state: 3,
   });
   assert.strictEqual(body.category, "navigation");
-  assert.strictEqual(body.origin, "auto");
+  // Watchkeeper-entered observation the machine writes down: 'agent'.
+  assert.strictEqual(body.origin, "agent");
   assert.strictEqual(body.author, "Alice");
   assert.match(body.text, /Sun sight/);
   assert.doesNotMatch(
@@ -490,8 +372,8 @@ test("composeObservationEntry: celestial sight with reduction", () => {
   );
   assert.match(body.text, /Zn 180\.0/);
   assert.match(body.text, /intercept 2\.50 NM toward/);
-  assert.strictEqual(body.position.source, "Celestial");
-  assert.strictEqual(body.observations.seaState, 3);
+  assert.strictEqual(pv1(body, "navigation.position").source, "Celestial");
+  assert.strictEqual(pv1(body, "environment.water.seaState"), 3);
 });
 
 test("composeObservationEntry: bearing LOP names the object and the bearing", () => {
@@ -506,10 +388,10 @@ test("composeObservationEntry: bearing LOP names the object and the bearing", ()
   });
   assert.match(body.text, /lighthouse bearing 047°T/);
   assert.strictEqual(body.author, undefined);
-  assert.strictEqual(body.position.source, "DR");
+  assert.strictEqual(pv1(body, "navigation.position").source, "DR");
 });
 
-test("composeObservationEntry: coordinates stay in the position field, not text", () => {
+test("composeObservationEntry: coordinates stay in the position pathvalue, not text", () => {
   const body = composeObservationEntry({
     kind: "bearing",
     datetime: "2026-01-01T12:00:00Z",
@@ -519,9 +401,10 @@ test("composeObservationEntry: coordinates stay in the position field, not text"
     longitude: -159.8008,
   });
   assert.strictEqual(body.text, "Vessel COULD BE WORSE bearing 090°T");
-  assert.strictEqual(body.position.latitude, -18.8651);
-  assert.strictEqual(body.position.longitude, -159.8008);
-  assert.strictEqual(body.position.source, "DR");
+  const position = pv1(body, "navigation.position");
+  assert.strictEqual(position.latitude, -18.8651);
+  assert.strictEqual(position.longitude, -159.8008);
+  assert.strictEqual(position.source, "DR");
 });
 
 test("composeObservationEntry: vertical-angle CPL carries its radius", () => {
@@ -532,7 +415,7 @@ test("composeObservationEntry: vertical-angle CPL carries its radius", () => {
     radius_nm: 0.42,
   });
   assert.match(body.text, /lighthouse CPL 0.4 NM/);
-  assert.strictEqual(body.position, undefined);
+  assert.strictEqual(body.telemetry, undefined);
 });
 
 test("composeObservationEntry: intercept away when negative", () => {

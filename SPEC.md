@@ -23,7 +23,7 @@ The three motivations are causally linked: (1) generates the fix data and crew e
 - Learns vessel-specific leeway, speed-loss, and heading-deviation corrections via a binned EMA matrix, trained against GPS ground truth during normal sailing.
 - Detects GPS anomalies (sudden jumps, implausible-at-anchor/moored displacement, corroborating third-party AIS/ADS-B inconsistency) and alerts the watchkeeper — it does **not** auto-switch navigational authority; a human always decides when to trust DR over GPS.
 - Supports a unified concept of "fix" that spans GPS, celestial sights, compass bearings, vertical-angle-to-known-object, and future methods (Starlink-constellation positioning, radio direction finding), each contributing either a point, a line-of-position, or a circular position line to a common fix-resolution model.
-- Integrates with `signalk-logbook` (REST API) as an optional, gracefully-degrading write-through layer, so fixes and DR events become part of the vessel's actual logbook record.
+- Integrates with `signalk-logbook` (the `logentries` Signal K v2 Resources API, in-process) as an optional, gracefully-degrading write-through layer, so fixes and DR events become part of the vessel's actual logbook record.
 - Supports offline historical backfill and backtesting against 4–5 years of Signal K History API data, optionally enriched with reanalysis weather/current data and logbook records when broadband is available.
 
 \* "Zero-dependency" here means no external services required for core operation; the SQLite persistence layer should target Node's built-in `node:sqlite` (or an equivalent no-native-build option) rather than a compiled native binding, given the ARM/Raspberry-Pi-class hardware most Signal K installs run on.
@@ -135,7 +135,7 @@ CREATE TABLE IF NOT EXISTS fixes (
     estimated_error_radius REAL,
     confirmed_by TEXT,                -- crew name; simple free-text picker, no auth model assumed
     logged_to_logbook BOOLEAN NOT NULL DEFAULT 0,
-    logbook_entry_ref TEXT,           -- datetime key of the corresponding signalk-logbook entry, if written
+    logbook_entry_ref TEXT,           -- UUID of the corresponding signalk-logbook `logentries` resource, if written
     resets_dr_origin BOOLEAN NOT NULL DEFAULT 0,
     notes TEXT
 );
@@ -247,7 +247,7 @@ CREATE TABLE IF NOT EXISTS gps_anomalies (
 
 ```
 Main Thread (Signal K Event Loop)
-  N2K/N0183 Ingest → Delta Router → signalk-logbook API (REST, optional)
+  N2K/N0183 Ingest → Delta Router → signalk-logbook Resources API (in-process, optional)
                                    → GRIB Provider Service
                                    → AIS/ADS-B target tracking
 
@@ -262,7 +262,7 @@ Worker Thread (DR Physics)
 ```
 
 - Vector math and matrix lookups run isolated in a Worker Thread to avoid blocking the Signal K main event loop under high-frequency sensor input.
-- REST calls to `signalk-logbook` happen on the **main thread**, never the physics worker — network I/O has no place on the 1Hz hot path.
+- Logbook writes go through `app.resourcesApi` (`logentries` provider) on the **main thread**, never the physics worker — provider I/O has no place on the 1Hz hot path.
 - The DR engine computes continuously regardless of mode (see §3.1, `navigation.deadReckoning.active`), so switching to OVERRIDE is a warm, instant authority handoff rather than a cold start.
 - A separate, explicitly user-triggered backfill job (§10) runs as a one-shot batch process, not on the live path.
 
@@ -394,7 +394,7 @@ On every confirmed fix that resets the DR origin (symmetric across NORMAL and OV
 
 ### 9.4 Automatic Tack/Gybe Logbook Entries
 
-The rate-of-turn detection already built for matrix-training suppression (§6.4) is a free source of a routine, easily-forgotten logbook event: reuse the same tack/gybe detection to auto-generate a `signalk-logbook` entry (`category: navigation`, `origin: agent`, per the field mapping in §9.5) whenever a completed tack or gybe is detected — direction (tack→tack or gybe), new heading, and timestamp are all already available from the same signal.
+The rate-of-turn detection already built for matrix-training suppression (§6.4) is a free source of a routine, easily-forgotten logbook event: reuse the same tack/gybe detection to auto-generate a `signalk-logbook` entry (`category: navigation`, `origin: auto` — pure automation, no human in the loop; see §9.5) whenever a completed tack or gybe is detected — direction (tack→tack or gybe), new heading, and timestamp are all already available from the same signal.
 
 - No watchkeeper confirmation step is needed for this entry type — unlike fixes, there's no ambiguity or human judgment involved in "a tack happened," so it can write directly rather than going through the confirm-first pipeline used for fixes.
 - Should respect the same "avoid flooding the logbook" concern raised for routine GPS fixes (§9.1) — a beat to windward with frequent short tacks could generate a lot of entries; consider a minimum-interval debounce (e.g. don't log a second tack within some short window, treating rapid back-to-back direction changes as one transient event) rather than logging every single rate-of-turn crossing.
@@ -402,22 +402,21 @@ The rate-of-turn detection already built for matrix-training suppression (§6.4)
 
 ### 9.5 `signalk-logbook` Field Mapping
 
-The logbook's `NewEntry`/`Entry` schema (OpenAPI, confirmed against the actual plugin) has no dedicated fix-type or celestial-specific fields — it's a general entry with a required free-text `text` plus optional structured fields. `fixes` remains the local source of truth; the logbook write is a formatted export, not the canonical record.
+Logbook entries are written through the Signal K v2 Resources API — in-process `app.resourcesApi.setResource("logentries", <uuid>, entry)` against the provider signalk-logbook registers (the contract is documented in signalk-logbook's `docs/logentries-resource.md`). No REST, no tokens: the server gates in-process plugin access at nothing, which dissolves the access-request/token apparatus the deprecated v1 plugin routes forced. The `logentries` schema has no dedicated fix-type or celestial-specific fields — a required free-text `text`, logbook metadata fields, and an optional `telemetry` array of delta-shaped pathvalues in Signal K SI units. `fixes` remains the local source of truth; the logbook write is a formatted export, not the canonical record.
 
-| `fixes` / DR field | Logbook field | Notes |
+| `fixes` / DR field | `logentries` field | Notes |
 |---|---|---|
-| `timestamp` | `datetime` | Use explicit `datetime`, not `ago` — confirmations can lag a DR-origin reset by more than the 15-minute cap `ago` allows. |
-| `latitude`/`longitude` | `position.latitude`/`position.longitude` | |
-| — | `position.source` | Free string: `"GPS"` / `"Celestial"` / `"Bearing"` / `"DR"`. |
+| `timestamp` | `datetime` | Explicit RFC 3339 UTC, always — never rely on the provider's default-to-now (confirmations can lag a DR-origin reset by more than the enrichment buffer window). |
+| `latitude`/`longitude` | `telemetry[]` pathvalue `navigation.position` | Value shape `{latitude, longitude, source}` — `source` is a logbook extra naming the fix origin, a free string: `"GPS"` / `"Celestial"` / `"Bearing"` / `"DR"`. |
 | celestial specifics (body, Hs, Ho, Hc, intercept, azimuth, index error) | `text` | No structured field exists for these — compose into the free-text summary, templated per `source_type`. |
 | `confirmed_by` | `author` | |
 | — | `category` | `"navigation"`. |
-| — | `origin` | `"agent"` for plugin-generated entries from a human-confirmed fix (not `"manual"` — no free text was typed by a human; not `"auto"` — a human did confirm the underlying observation). Convention adopted for this plugin; verify against how `origin: agent` is used elsewhere before finalizing. |
-| DR-integrated distance since last fix | `log` | Sourced from `navigation.deadReckoning.log`, not GPS-derived distance (§10.3), especially important during OVERRIDE. |
-| STW/SOG, heading/COG if available | `speed.stw`/`speed.sog`, `heading`/`course` | |
-| `environment.seaState`, if available | `observations.seaState` | Schema is `additionalProperties: false` — only populate defined fields, don't attempt to pass extra data through. |
+| — | `origin` | `"agent"` for entries written on behalf of a human (confirmed fixes, watchkeeper-entered observations); `"auto"` for pure automation with no human in the loop (tack/gybe detection, §9.4). |
+| DR-integrated distance since last fix | `telemetry[]` pathvalue `navigation.log` | Meters (SI; NM × 1852). Sourced from `navigation.deadReckoning.log`, not GPS-derived distance (§10.3), especially important during OVERRIDE. |
+| STW/SOG, heading/COG if available | `telemetry[]` pathvalues `navigation.speedThroughWater`/`navigation.speedOverGround` (m/s; kn × 463/900), `navigation.headingTrue`/`navigation.courseOverGroundTrue` (rad true; deg × π/180) | |
+| `environment.seaState`, if available | `telemetry[]` pathvalue `environment.water.seaState` | The resource path carries Beaufort force 0–12; the DR-stored value is the Douglas code 0–9 the logbook watch flow publishes — convert via the WMO correspondence at the boundary (mirroring the logbook's own mapping). |
 
-Writes are POSTed from the main thread (never the physics worker), gated on `signalk-logbook` being detected as installed at startup (optional peer, degrade gracefully if absent — `fixes` remains complete regardless), and always use explicit `datetime` rather than relying on retry/idempotency assumptions not yet confirmed from the plugin's actual behavior under connectivity loss.
+Writes happen on the main thread (never the physics worker), gated on a registered `logentries` provider — probed with a minimal `listResources("logentries", {limit: 1})`, the one cheap complete-window query the contract's "no silent windows" rule allows; optional peer, degrade gracefully if absent — `fixes` remains complete regardless. Each write carries an explicit `datetime`, and `logbook_entry_ref` stores the resource UUID the provider assigned. Provider failures (absent or rejecting) queue the entry in the plugin DB and retry with backoff — nothing is lost while the provider is unavailable.
 
 ---
 
@@ -430,8 +429,8 @@ Two distinct jobs, both explicit, user-triggered, broadband-gated (Starlink) ope
 Replays History API data (4–5 years) through the same bin/EMA logic as live training mode, to seed `dr_matrix_bins` before significant live sailing accumulates.
 
 - **Weather/current enrichment:** when run with broadband available, fetches historical reanalysis current/wind data (e.g. Copernicus Marine Service / ERA5-class products — license/attribution terms to be confirmed before committing to a specific provider) for the dates/positions actually visited, rather than relying solely on climatological pilot-chart averages. Query set is deduplicated to distinct (date, grid-cell) tuples before fetching, batched and rate-limited/backed-off per the provider's documented limits, with a persisted progress checkpoint (`dr_state_store` high-water-mark) so an interrupted run can resume. Bins trained with reanalysis current get a higher `historical_confidence_tier` weight than climatology-only bins (§4.1).
-- **Logbook enrichment:** where `signalk-logbook` entries exist for the historical window (likely not the full 4–5 years), join by nearest-timestamp (~±30min) to recover `sail_state`/`observations.seaState` for spans that would otherwise fall to `'unknown'`. Historical `navigation`-category logbook entries with a `position` are additionally ingested into `fixes` (`source_type = 'backfill'`), so passage review isn't blank for the pre-plugin era.
-- **Resolution/provenance caveats, explicitly documented rather than silently absorbed:** ~10s History API resolution under-represents instantaneous heel/AWA response (gust/roll dynamics) versus live 1Hz IMU data; paddlewheel fouling status is essentially unknown for historical data and must be inferred via the STW≈0-while-moving heuristic (§6.3) applied retroactively; `navigation.log`/`navigation.trip.log`/logbook `log` fields are GPS-track-derived, not water-track, and must never be used as an STW proxy or ground truth during backfill.
+- **Logbook enrichment:** where `signalk-logbook` entries exist for the historical window (likely not the full 4–5 years), read them tokenlessly in-process via `app.resourcesApi.listResources("logentries", {from, to})` and join by nearest-timestamp (~±30min) to recover `sail_state`/sea state for spans that would otherwise fall to `'unknown'` (entry telemetry carries SI pathvalues — `environment.water.seaState` is Beaufort, convert back to the Douglas code DR stores). Historical `navigation`-category entries carrying a `navigation.position` pathvalue are additionally ingested into `fixes` (`source_type = 'backfill'`), so passage review isn't blank for the pre-plugin era.
+- **Resolution/provenance caveats, explicitly documented rather than silently absorbed:** ~10s History API resolution under-represents instantaneous heel/AWA response (gust/roll dynamics) versus live 1Hz IMU data; paddlewheel fouling status is essentially unknown for historical data and must be inferred via the STW≈0-while-moving heuristic (§6.3) applied retroactively; `navigation.log`/`navigation.trip.log`/logbook `navigation.log` telemetry are GPS-track-derived, not water-track, and must never be used as an STW proxy or ground truth during backfill.
 - **Outlier rejection:** a max-plausible-speed/position-jump filter, plus the fouling heuristic, applied before samples enter training — historical GPS glitches are otherwise uncorrected and would poison bins.
 - Also used to build `anchor_swing_stats` and `moored_position_stats` (§7.1, §7.2), each with their own drag-exclusion / settle-window preprocessing. Recomputed periodically (e.g. quarterly) rather than live-updated, since these have no need for 1Hz reactivity.
 

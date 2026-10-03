@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Logbook write-through now goes through the `logentries` Resources API** (in-process `app.resourcesApi`, the provider signalk-logbook registers) instead of POSTing to the logbook plugin's deprecated v1 REST routes. Entries are composed to the `logentries` schema — structured data as SI telemetry pathvalues (`navigation.position`, `navigation.log` in meters, headings in radians, speeds in m/s, sea state as Beaufort force on `environment.water.seaState`), free text unchanged. Confirmed fixes and watchkeeper observations are now stamped `origin: 'agent'` (machine writing on behalf of a human, per SPEC §9.5's original intent); tack/gybe entries stay 'auto'. Entry refs in `fixes` are now the resource UUID.
+- **All logbook auth machinery removed.** In-process Resources access needs no tokens, so the Access Requests flow, approval polling, 401 provenance handling, and the `logbook.url` / `logbook.token` settings are gone — only `logbook.enabled` (plus the retry backoff and tack debounce) remains. Queued-entry delivery survives restarts as before; the pending queue now covers the provider-unavailable window (logbook absent or not yet started) instead of the approval-window.
+
 ## [0.12.3] - 2026-10-03
 
 ### Fixed

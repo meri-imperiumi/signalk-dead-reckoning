@@ -40,7 +40,9 @@ class FakeSignalKApp extends EventEmitter {
     this.middleware = [];
     /**
      * Resource facade mirroring the server's `app.resourcesApi`:
-     * getResource dispatches to the matching registered provider.
+     * calls dispatch to the matching registered provider — a missing
+     * provider rejects, exactly like the server with no provider of
+     * that type.
      */
     this.resourcesApi = {
       getResource: async (type, id) => {
@@ -48,7 +50,51 @@ class FakeSignalKApp extends EventEmitter {
         if (!provider) throw new Error(`No provider for resource ${type}`);
         return provider.methods.getResource(id);
       },
+      listResources: async (type, query) => {
+        const provider = this.resourceProviders.find((p) => p.type === type);
+        if (!provider) throw new Error(`No provider for resource ${type}`);
+        return provider.methods.listResources(query);
+      },
+      setResource: async (type, id, value) => {
+        const provider = this.resourceProviders.find((p) => p.type === type);
+        if (!provider) throw new Error(`No provider for resource ${type}`);
+        return provider.methods.setResource(id, value);
+      },
+      deleteResource: async (type, id) => {
+        const provider = this.resourceProviders.find((p) => p.type === type);
+        if (!provider) throw new Error(`No provider for resource ${type}`);
+        return provider.methods.deleteResource(id);
+      },
     };
+  }
+
+  /**
+   * Registers a minimal recording `logentries` resource provider, the
+   * shape signalk-logbook now serves. Returns the record of setResource
+   * calls for assertions.
+   *
+   * @returns {{entries: Array<{id: string, value: object}>, provider: object}}
+   */
+  registerLogbookProvider() {
+    const record = { entries: [] };
+    const provider = {
+      type: "logentries",
+      methods: {
+        async listResources() {
+          return {};
+        },
+        async getResource() {
+          throw new Error("ENOENT");
+        },
+        async setResource(id, value) {
+          record.entries.push({ id, value });
+          return id;
+        },
+        async deleteResource() {},
+      },
+    };
+    this.registerResourceProvider(provider);
+    return { record, provider };
   }
 
   /**
