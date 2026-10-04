@@ -22,6 +22,8 @@ const {
   runReplay,
   summarize,
   currentAt,
+  toHtmlReport,
+  trackBox,
   PATH_SPECS,
 } = require("../tools/replay-passage.js");
 const {
@@ -315,4 +317,66 @@ test("leeway synthetic: the learning variant absorbs a 4° course offset", () =>
     last.learn.divNm < expectedCrossTrack * 0.2,
     `learn div ${last.learn.divNm}`,
   );
+});
+
+test("report plot: a track crossing the antimeridian renders contiguous", () => {
+  // A due-east track from 179°E crosses 180° and reads as -179° in the
+  // next fix (GPS wraps to [-180, 180]). The SVG plot must unwrap those
+  // longitudes so the polyline runs left-to-right across the seam —
+  // the naive min/max bounds used to smear the track across the whole
+  // 360° span.
+  const samples = [];
+  for (let i = 0; i < 20; i++) {
+    const lon = 179 + i * 0.2; // crosses 180 at i = 6
+    const wrapped = lon > 180 ? lon - 360 : lon;
+    samples.push({
+      tMs: Date.parse("2026-08-14T00:00:00Z") + i * DT_S * 1000,
+      gps: { latitude: -14, longitude: wrapped },
+      cold: {
+        position: { latitude: -14.001, longitude: wrapped },
+        divNm: 0.1 * i,
+      },
+    });
+  }
+  const summary = summarize(samples);
+  const html = toHtmlReport({
+    meta: {
+      vessel: "test",
+      from: "2026-08-14",
+      to: "2026-08-15",
+      historyUrl: "x",
+    },
+    samples,
+    summary,
+    hourly: [],
+  });
+  const polylines = html.match(/<polyline points="([^"]+)"/g);
+  assert.ok(polylines.length >= 1, "the report has a track polyline");
+  const gpsPts = polylines[0]
+    .match(/points="([^"]+)"/)[1]
+    .split(" ")
+    .map((p) => p.split(",").map(Number));
+  // x advances monotonically across the seam instead of jumping back
+  let monotonic = true;
+  for (let i = 1; i < gpsPts.length; i++) {
+    if (gpsPts[i][0] < gpsPts[i - 1][0] - 0.5) monotonic = false;
+  }
+  assert.ok(monotonic, "GPS polyline x is monotonic across the seam");
+  assert.ok(gpsPts[gpsPts.length - 1][0] > 800, "track spans the plot width");
+});
+
+test("trackBox: a seam-crossing track produces a contiguous SCUD box", () => {
+  // A track from 179E to 179W (wrapped at the seam by the GPS) must
+  // produce a box around 359-361 in the server's 0-360 frame — not the
+  // naive 179..359 span the raw min/max would request.
+  const track = [
+    { latitude: -14, longitude: 179.0 },
+    { latitude: -14.1, longitude: 179.5 },
+    { latitude: -14.2, longitude: -179.0 }, // wrapped at the seam
+  ];
+  const box = trackBox(track);
+  assert.ok(Math.abs(box.lonMin - 539) < 1e-9, `lonMin ${box.lonMin}`);
+  assert.ok(Math.abs(box.lonMax - 541) < 1e-9, `lonMax ${box.lonMax}`);
+  assert.ok(Math.abs(box.latMin - -14.2) < 1e-9);
+  assert.ok(Math.abs(box.latMax - -14) < 1e-9);
 });

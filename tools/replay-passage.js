@@ -289,6 +289,42 @@ const SCUD_ERDDAP =
 const SCUD_BOX_MARGIN_DEG = 0.5;
 
 /**
+ * Bounds of a GPS track as SCUD fetch-box coordinates: latitude in
+ * degrees, longitude in the server's 0–360 east frame. Longitudes are
+ * unwrapped against the first fix so a track crossing the antimeridian
+ * stays contiguous (179E → 181, not −179): the naive min/max would
+ * request a box spanning the whole Pacific.
+ *
+ * @param {{latitude: number, longitude: number}[]} track
+ * @returns {{latMin: number, latMax: number, lonMin: number, lonMax: number}}
+ */
+function trackBox(track) {
+  if (!track.length) {
+    return { latMin: 0, latMax: 0, lonMin: 360, lonMax: 360 };
+  }
+  const unwrap = (lon, ref) => lon - 360 * Math.round((lon - ref) / 360);
+  let latMin = Infinity;
+  let latMax = -Infinity;
+  let lonMinU = track[0].longitude;
+  let lonMaxU = lonMinU;
+  let prev = lonMinU;
+  for (const p of track) {
+    latMin = Math.min(latMin, p.latitude);
+    latMax = Math.max(latMax, p.latitude);
+    const u = unwrap(p.longitude, prev);
+    lonMinU = Math.min(lonMinU, u);
+    lonMaxU = Math.max(lonMaxU, u);
+    prev = u;
+  }
+  return {
+    latMin,
+    latMax,
+    lonMin: lonMinU + 360,
+    lonMax: lonMaxU + 360,
+  };
+}
+
+/**
  * Fetches a SCUD current grid over a lat/lon box and time range.
  *
  * The grid comes back as one row per (time, lat, lon) with u/v in m/s;
@@ -860,22 +896,34 @@ function toHtmlReport(report) {
     if (s.gps) pts.push(s.gps);
     for (const k of keys) if (s[k]?.position) pts.push(s[k].position);
   }
-  let latMinV = Infinity;
-  let latMaxV = -Infinity;
-  let lonMinV = Infinity;
-  let lonMaxV = -Infinity;
+  let latMin = Infinity;
+  let latMax = -Infinity;
   for (const p of pts) {
-    latMinV = Math.min(latMinV, p.latitude);
-    latMaxV = Math.max(latMaxV, p.latitude);
-    lonMinV = Math.min(lonMinV, p.longitude);
-    lonMaxV = Math.max(lonMaxV, p.longitude);
+    latMin = Math.min(latMin, p.latitude);
+    latMax = Math.max(latMax, p.latitude);
   }
-  const latMin = latMinV;
-  const latMax = latMaxV;
-  const lonMin = lonMinV;
-  const lonMax = lonMaxV;
+  // Unwrap longitudes against the first point so a track crossing the
+  // antimeridian stays contiguous (179 -> 181 instead of 179 -> -179,
+  // which the naive min/max would smear across the whole 360° span)
+  const unwrap = (lon, ref) => lon - 360 * Math.round((lon - ref) / 360);
+  const lon0 = pts.length ? pts[0].longitude : 0;
+  let lonMin = Infinity;
+  let lonMax = -Infinity;
+  let prev = lon0;
+  for (const p of pts) {
+    const u = unwrap(p.longitude, prev);
+    lonMin = Math.min(lonMin, u);
+    lonMax = Math.max(lonMax, u);
+    prev = u;
+  }
+  if (!pts.length) {
+    lonMin = 0;
+    lonMax = 0;
+    latMin = 0;
+    latMax = 0;
+  }
   const latMid = ((latMin + latMax) / 2) * (Math.PI / 180);
-  const xOf = (lon) => (lon - lonMin) * Math.cos(latMid);
+  const xOf = (lon) => (unwrap(lon, lonMin) - lonMin) * Math.cos(latMid);
   const yOf = (lat) => latMax - lat;
   const spanX = Math.max(1e-9, xOf(lonMax));
   const spanY = Math.max(1e-9, yOf(latMin));
@@ -1050,18 +1098,17 @@ async function main(argv) {
   let scudGrid = null;
   if (opts.scud) {
     const track = rows.map((r) => r.position).filter(Boolean);
-    const lats = track.map((p) => p.latitude);
-    const lons = track.map((p) => p.longitude);
+    const { latMin, latMax, lonMin, lonMax } = trackBox(track);
     const scudFrom = new Date(Date.parse(opts.from) - 86400000).toISOString();
     const scudTo = new Date(Date.parse(opts.to) + 86400000).toISOString();
     try {
       scudGrid = await fetchScudGrid({
         from: scudFrom,
         to: scudTo,
-        latMin: Math.min(...lats) - SCUD_BOX_MARGIN_DEG,
-        latMax: Math.max(...lats) + SCUD_BOX_MARGIN_DEG,
-        lonMin: Math.min(...lons) + 360 - SCUD_BOX_MARGIN_DEG,
-        lonMax: Math.max(...lons) + 360 + SCUD_BOX_MARGIN_DEG,
+        latMin: latMin - SCUD_BOX_MARGIN_DEG,
+        latMax: latMax + SCUD_BOX_MARGIN_DEG,
+        lonMin: lonMin - SCUD_BOX_MARGIN_DEG,
+        lonMax: lonMax + SCUD_BOX_MARGIN_DEG,
       });
       process.stderr.write(
         `SCUD grid: ${scudGrid.timesMs.length} days (${scudGrid.timesMs
@@ -1145,6 +1192,7 @@ module.exports = {
   forwardFill,
   fetchHistory,
   fetchScudGrid,
+  trackBox,
   currentAt,
   runReplay,
   hourlyBuckets,
