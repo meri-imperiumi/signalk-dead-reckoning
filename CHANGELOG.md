@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-05
+
 ### Fixed
 - The passage replay tool renders and fetches the short way across the antimeridian (`tools/replay-passage.js`): a track crossing 180° used to smear across the whole 360° span in the SVG track plot — the naive longitude min/max bounds turned 179E → 179W into a world-wide box — and the SCUD current grid fetch computed its 0–360 request box from the same raw bounds, returning nothing useful. Longitudes are now unwrapped against the first fix before bounds are computed, and the SCUD box is built by the new exported `trackBox()` helper in the server's 0–360 frame
 
