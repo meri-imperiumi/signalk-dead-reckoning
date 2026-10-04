@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Antimeridian crossings no longer corrupt the derived-current sampler and the celestial fix projection.** Two raw longitude deltas measured the long way around ±180°: the derived-current ground-velocity decomposition (`derived-current.js`) read a dateline crossing between two GPS fixes as a ~360° west jump — the SOG gate then rejected every crossing sample as "gps-glitch", so tier-2 current learning went silent exactly when sailing Fiji→Samoa or the Bering Strait — and the fix pipeline's equirectangular projection (`fixes.js` `projectToLocal`) exploded for assumed positions across the line from the projection center, scattering celestial LOPs halfway around the planet. Both deltas now wrap to ±180° (the short way), matching what `ground-track.js` interpolation already did. A new `tests/antimeridian.test.js` suite locks the whole longitude-touching chain down: geo primitives, DR track interpolation, fix projection, derived-current sampling, and engine tick integration.
+
 ### Added
 - **Notes show provenance: who published, when.** The note detail surface renders a "Published on 10-03 12:00Z by FIJI METEOROLOGICAL SERVICE" line, read from the note's `properties` — the stamp signalk-passage-briefing now puts on every metarea note it serves (issuer parsed from the bulletin header, bulletin issue time). Provider-shaped notes without a stamp fall back to the bare resource timestamp. Notes created in this webapp are stamped the same way: the Signal K session user (via `/skServer/loginStatus`, "anonymous" without a login) and the save time — a create stamps the publication, an edit preserves it and records `updatedBy`/`updatedAt` ("· edited on 10-04 08:15Z by crew2").
 

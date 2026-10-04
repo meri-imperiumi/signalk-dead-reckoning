@@ -52,8 +52,12 @@ const {
  */
 function projectToLocal(center, p) {
   const lat0 = degToRad(center.latitude);
+  // Wrap the longitude delta to ±180° so points across the antimeridian
+  // from the center project the short way (0.2° apart, not 359.8°).
   const x =
-    degToRad(p.longitude - center.longitude) * EARTH_RADIUS_M * Math.cos(lat0);
+    degToRad(normalizeDeg180(p.longitude - center.longitude)) *
+    EARTH_RADIUS_M *
+    Math.cos(lat0);
   const y = degToRad(p.latitude - center.latitude) * EARTH_RADIUS_M;
   return { x, y };
 }

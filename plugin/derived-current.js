@@ -27,6 +27,8 @@
  * @file derived-current.js
  */
 
+const { normalizeDeg180 } = require("./geo.js");
+
 /** Minimum seconds between GPS fixes used for ground-vector sampling. */
 const MIN_GPS_INTERVAL_S = 5;
 
@@ -157,7 +159,10 @@ function updateDerivedCurrent(st, s) {
   const rad = Math.PI / 180;
   const latAvg = ((prev.latitude + s.gps.latitude) / 2) * rad;
   const meanLatNm = (s.gps.latitude - prev.latitude) * 60;
-  const eastNm = (s.gps.longitude - prev.longitude) * 60 * Math.cos(latAvg);
+  // Longitude delta wrapped to ±180° so an antimeridian crossing
+  // (179.9995° → -179.9995°) measures 0.001° east, not ~360° west.
+  const eastNm =
+    normalizeDeg180(s.gps.longitude - prev.longitude) * 60 * Math.cos(latAvg);
   const distNm = Math.hypot(meanLatNm, eastNm);
   const sogKn = distNm / (dtS / 3600);
   if (sogKn > MAX_SOG_KN) {
