@@ -44,14 +44,14 @@ test.after(async () => {
  *
  * @returns {{app: FakeSignalKApp, plugin: object, router: FakeRouter}}
  */
-function makeStarted() {
+function makeStarted(options) {
   const app = new FakeSignalKApp();
   // Fresh data dir per call: the speed-plausibility gate and restart
   // persistence make cross-test DB leakage (a stale restored DR origin)
   // observable, so each test owns its database.
   app.dataPath = mkdtempSync(join(tmpdir(), "dr-plugin-"));
   const plugin = makePlugin(app);
-  plugin.start({});
+  plugin.start(options ?? {});
   const router = new FakeRouter();
   plugin.registerWithRouter(router);
   return { app, plugin, router };
@@ -2840,6 +2840,33 @@ test("app.get config endpoint serves the plugin config with a hash", () => {
   assert.strictEqual(res._body.config.positionFormat, "dms");
   assert.ok(typeof res._body.configHash === "string");
   assert.ok(res._body.configHash.length > 0);
+  plugin.stop();
+});
+
+test("insane intervals from stored config are clamped, ring capacity bounded", () => {
+  // The admin UI enforces the schema minimums, but a hand-edited stored
+  // config skips validation — a 1 ms tick would degenerate setInterval
+  // into a 1 ms storm, and the ground-track ring (sized as hours ÷ tick)
+  // would grow without bound. The floors are deliberately permissive
+  // (the test harness itself drives ticks at 20–100 ms); the clamp only
+  // stops the degenerate cases.
+  const { app, plugin } = makeStarted({
+    tickIntervalMs: 1,
+    saveIntervalMs: 100,
+  });
+  const cfg = app.appRoutes.find((r) =>
+    r.path.includes("/signalk-dead-reckoning/configuration"),
+  );
+  const res = {
+    set() {},
+    json(obj) {
+      this._body = obj;
+    },
+    status() {},
+  };
+  cfg.handler({}, res);
+  assert.strictEqual(res._body.config.tickIntervalMs, 10);
+  assert.strictEqual(res._body.config.saveIntervalMs, 1000);
   plugin.stop();
 });
 

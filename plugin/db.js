@@ -198,6 +198,14 @@ function openDatabase(dbPath) {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
+  // WAL's recommended durability level: commits sync the WAL to the OS
+  // but do not fsync per commit — a power loss may lose the last
+  // transactions but never corrupts the database. Everything this store
+  // holds is reconstructable (re-derivable from fixes, or a running
+  // average that self-corrects), so trading the per-commit fsync —
+  // sustained minute after minute on SD-card boat hardware — for that
+  // small window is the right default. FULL would fsync every commit.
+  db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA foreign_keys = ON");
   for (const stmt of SCHEMA_DDL) {
     db.exec(stmt);
@@ -558,6 +566,17 @@ function attachObservationsToFix(db, fixId, ids) {
 }
 
 /**
+ * Per-connection cache of prepared statements (WeakMap, so a closed db
+ * is collected with its statements). Statement compilation is not free,
+ * and `getDeviationRateStats` runs on the 1 Hz tick path — re-preparing
+ * the same SQL every second would pay the compile over and over for the
+ * life of the process.
+ *
+ * @type {WeakMap<import("node:sqlite").DatabaseSync, Record<string, import("node:sqlite").StatementSync>>}
+ */
+const preparedStatements = new WeakMap();
+
+/**
  * Reads recent `dr_corrections` rows for the uncertainty polygon's
  * empirical deviation-rate (SPEC §8). Returns rows newest-first so the
  * EWMA in `uncertainty.js` can apply them oldest→newest. Filters by
@@ -571,8 +590,12 @@ function attachObservationsToFix(db, fixId, ids) {
  * @returns {Array<{deviation_nm: number, dr_elapsed_seconds: number}>}
  */
 function getDeviationRateStats(db, q = {}) {
-  const limit = q.limit ?? 50;
-  const stmt = db.prepare(
+  let stmts = preparedStatements.get(db);
+  if (!stmts) {
+    stmts = {};
+    preparedStatements.set(db, stmts);
+  }
+  stmts.deviationRate ??= db.prepare(
     `SELECT deviation_nm, dr_elapsed_seconds
      FROM dr_corrections
      WHERE (? IS NULL OR sail_state = ?)
@@ -580,12 +603,12 @@ function getDeviationRateStats(db, q = {}) {
      ORDER BY correction_id DESC
      LIMIT ?`,
   );
-  return stmt.all(
+  return stmts.deviationRate.all(
     q.sail_state ?? null,
     q.sail_state ?? null,
     q.sea_state ?? null,
     q.sea_state ?? null,
-    limit,
+    q.limit ?? 50,
   );
 }
 

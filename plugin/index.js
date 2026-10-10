@@ -740,11 +740,19 @@ module.exports = (app) => {
         tickIntervalMs: {
           type: "integer",
           title: "DR Integration Interval (ms)",
+          // Floor guards the whole pipeline: the ground-track ring is
+          // sized as hours/tickInterval, so a small tick multiplies the
+          // ring's memory, the tick-path work and the flush cadence by
+          // the same factor (1 ms would allocate a ~130 M-sample ring).
+          // 500 ms (2 Hz) is the useful ceiling for a shadow boat.
+          minimum: 500,
+          maximum: 60000,
           default: DEFAULT_CONFIG.tickIntervalMs,
         },
         saveIntervalMs: {
           type: "integer",
           title: "State Save Interval (ms)",
+          minimum: 5000,
           default: DEFAULT_CONFIG.saveIntervalMs,
         },
         "publish.everyTicks": {
@@ -836,6 +844,31 @@ module.exports = (app) => {
       // logbook write-through).
       const opts = deflattenConfig(options);
       config = { ...DEFAULT_CONFIG, ...opts };
+      // Defensive clamps: the admin UI enforces the schema minimums, but
+      // hand-edited or legacy stored configs skip validation, and a
+      // 0/negative/NaN tick would degenerate setInterval to a 1 ms storm
+      // that also multiplies the tick path and the flush cadence. The
+      // floors are deliberately permissive (10 ms — the test harness
+      // drives ticks at 20–100 ms); the UI schema is where the human
+      //-facing floor (500 ms) lives.
+      config.tickIntervalMs = Math.min(
+        60000,
+        Math.max(
+          10,
+          Math.round(
+            Number(config.tickIntervalMs) || DEFAULT_CONFIG.tickIntervalMs,
+          ),
+        ),
+      );
+      config.saveIntervalMs = Math.min(
+        24 * 3600 * 1000,
+        Math.max(
+          1000,
+          Math.round(
+            Number(config.saveIntervalMs) || DEFAULT_CONFIG.saveIntervalMs,
+          ),
+        ),
+      );
       // Allow partial divergence overrides without losing the defaults.
       config.divergence = {
         ...DEFAULT_CONFIG.divergence,
@@ -891,10 +924,18 @@ module.exports = (app) => {
         tripLogNm: Number.isFinite(savedTripNm) ? savedTripNm : 0,
       });
       groundTrack = new deps.GroundTrack({
-        capacity: Math.max(
-          60,
-          Math.round(
-            (config.groundTrackHours * 3600 * 1000) / config.tickIntervalMs,
+        capacity: Math.min(
+          // Memory guard: the ring is sized as hours/tickInterval, so a
+          // fast stored tick would scale it without bound (1 ms → a
+          // ~130 M-sample ring). 1 M samples ≈ 50 MB is the hard
+          // ceiling; at the default 1 s tick it is never reached
+          // (168 h, the schema max, is 604,800).
+          1_000_000,
+          Math.max(
+            60,
+            Math.round(
+              (config.groundTrackHours * 3600 * 1000) / config.tickIntervalMs,
+            ),
           ),
         ),
       });

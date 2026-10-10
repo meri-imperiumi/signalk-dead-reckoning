@@ -378,6 +378,52 @@ test("getDeviationRateStats returns recent rows filtered by sail/sea state", asy
   await rm(dir, { recursive: true, force: true });
 });
 
+test("getDeviationRateStats reuses its prepared statement per connection", async () => {
+  // The 1 Hz tick path calls this with the same SQL every second — the
+  // statement is memoized per database (WeakMap). Repeated calls with
+  // different bindings must stay correct, and a second connection must
+  // get its own statement, not share the first one's.
+  const dirs = await Promise.all([
+    mkdtemp(join(tmpdir(), "dr-stmt-a-")),
+    mkdtemp(join(tmpdir(), "dr-stmt-b-")),
+  ]);
+  const dbs = dirs.map((dir) => openDatabase(join(dir, "t.sqlite")));
+  for (const db of dbs) {
+    const fid = recordFix(db, {
+      timestamp: "2026-01-01T00:00:00Z",
+      source_type: "gps",
+      latitude: 60,
+      longitude: 24,
+      resets_dr_origin: true,
+    });
+    recordCorrection(db, {
+      fix_id: fid,
+      timestamp: "2026-01-01T00:00:00Z",
+      dr_lat: 60.01,
+      dr_lon: 24.01,
+      fix_lat: 60,
+      fix_lon: 24,
+      deviation_nm: 0.4,
+      deviation_bearing: 200,
+      dr_elapsed_seconds: 1800,
+      sail_state: "sailing",
+    });
+  }
+  // Interleaved calls across both connections, changing bindings each time.
+  const a1 = getDeviationRateStats(dbs[0], { limit: 10 });
+  const b1 = getDeviationRateStats(dbs[1], { limit: 10 });
+  const a2 = getDeviationRateStats(dbs[0], { limit: 1 });
+  const b2 = getDeviationRateStats(dbs[1], { sail_state: "motoring" });
+  assert.strictEqual(a1.length, 1);
+  assert.strictEqual(b1.length, 1);
+  assert.strictEqual(a2.length, 1);
+  assert.strictEqual(b2.length, 0);
+  for (const [db, dir] of dbs.map((db, i) => [db, dirs[i]])) {
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // --- Observation & fix CRUD (work doc #13 stage D) -------------------------
 
 const {
