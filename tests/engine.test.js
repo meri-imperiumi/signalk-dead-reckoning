@@ -39,6 +39,41 @@ test("under-way clock only advances while under way", () => {
   assert.strictEqual(e.underwaySinceOriginS, 0);
 });
 
+test("anchored tick holds the shadow boat on the anchor", () => {
+  const e = new DeadReckoningEngine();
+  e.snapToFix({ latitude: -18.65, longitude: 174.0 });
+  // A month on the hook: sensors on a stopped hull still read — the
+  // paddlewheel sees the current streaming past, the resolver hands back
+  // a GRIB current — but the anchor holds the ground position, so none
+  // of it may move the shadow boat or grow the logs.
+  const before = { ...e };
+  for (let day = 0; day < 30; day++) {
+    const pos = e.tick(
+      {
+        stwKn: 0.8,
+        headingTrueDeg: 90,
+        leewayDeg: 5,
+        current: { setTrue: 90, drift: 0.4 },
+        underway: false,
+      },
+      24 * 3600,
+    );
+    assert.deepStrictEqual(pos, before.origin);
+  }
+  assert.deepStrictEqual(e.origin, before.origin);
+  assert.strictEqual(e.logNm, before.logNm);
+  assert.strictEqual(e.tripLogNm, before.tripLogNm);
+  assert.strictEqual(e.logNmSinceOrigin, before.logNmSinceOrigin);
+  // The under-way clock — the cone's growth axis — stays frozen, while
+  // the wall-clock "since fix" keeps counting the real stay.
+  assert.strictEqual(e.underwaySinceOriginS, 0);
+  assert.strictEqual(e.elapsedSinceOriginS, 30 * 24 * 3600);
+  // The engine stays warm: sailing off the hook resumes integration
+  // from the held position with no snap needed.
+  const pos = e.tick({ stwKn: 5, headingTrueDeg: 0, underway: true }, 3600);
+  assert.ok(Math.abs(pos.latitude - (before.origin.latitude + 5 / 60)) < 1e-4);
+});
+
 test("tick advances north along a meridian at the given STW", () => {
   const e = new DeadReckoningEngine();
   e.snapToFix({ latitude: 60, longitude: 24 });

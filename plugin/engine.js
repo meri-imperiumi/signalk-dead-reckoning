@@ -129,13 +129,30 @@ class DeadReckoningEngine {
    * @param {number} inputs.speedLoss - learned speed-loss fraction [0,1]
    * @param {{setTrue: number, drift: number}} [inputs.current] - resolved current (deg true, kn)
    * @param {boolean} [inputs.underway=true] - whether the vessel is under
-   *   way this tick (from `navigation.state`); gates the under-way clock
-   *   the uncertainty cone grows on, not the wall-clock one
+   *   way this tick (from `navigation.state`); false (moored/anchored)
+   *   freezes the shadow boat's position — the anchor holds the ground
+   *   position, so neither the water-track vector nor the resolved
+   *   current vector may integrate — and gates the under-way clock the
+   *   uncertainty cone grows on. The wall-clock `elapsedSinceOriginS`
+   *   still advances: time since the last fix really did elapse.
    * @param {number} [inputs.dtS=1] - tick interval in seconds
    * @returns {{latitude: number, longitude: number}|null} new position, or null if no origin
    */
   tick(inputs, dtS = 1) {
     if (!this.origin) return null;
+    // §7.1–2: moored/anchored is a different regime. The anchor holds the
+    // ground position, so the shadow boat must not sail: neither the
+    // water-track vector (a paddlewheel on a stopped hull reads the water
+    // streaming past it) nor the resolved current vector (a GRIB tier
+    // would otherwise walk the shadow boat across the chart at drift kn
+    // for the whole stay — a month on the hook painted a fictional
+    // passage east) may integrate. The engine stays warm — origin, logs
+    // and clocks carry — so an OVERRIDE handoff stays instant; only the
+    // displacement is frozen, exactly like the real boat.
+    if (inputs.underway === false) {
+      this.elapsedSinceOriginS += dtS;
+      return this.origin;
+    }
     const stw = toNumber(inputs.stwKn);
     const hdg = toNumber(inputs.headingTrueDeg);
     if (stw == null || hdg == null) return this.origin;

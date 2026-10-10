@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The shadow boat no longer sails away while anchored.** `engine.tick()` integrated its displacement unconditionally — the `underway` flag from `navigation.state` only gated the uncertainty cone's clock, never the position integration. A month on the hook therefore painted a fictional eastward passage across the chart: the resolved current vector (tier 3 Weather API keeps reporting a set/drift at the anchor position) was integrated every tick as ground displacement, and the paddlewheel on a stopped hull reads the water streaming past it as STW, integrated along the swinging bow. The anchor holds the ground position, so a moored/anchored tick now freezes the shadow boat's position and the logs entirely — water-track vector, current vector, `logNm`/`tripLogNm`/`logNmSinceOrigin` all hold — while the wall-clock `elapsedSinceOriginS` keeps counting the real stay and the engine stays warm for an instant OVERRIDE handoff. Sailing off the hook resumes integration from the held position with no snap needed.
+
 ## [0.13.1] - 2026-10-05
 
 ### Fixed
