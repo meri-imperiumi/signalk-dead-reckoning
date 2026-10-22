@@ -2,8 +2,9 @@
  * Tests for celestial sight reduction (SPEC §13).
  *
  * Hc/Zn are cross-validated against astronomy-engine's Horizon (an
- * independent horizontal-coordinate path through the same library) for
- * the Sun; the star path is validated against paper-almanac anchors.
+ * independent horizontal-coordinate path through a separate library, a
+ * dev dependency only) for the Sun; the star path is validated against
+ * paper-almanac anchors.
  * Ephemeris snapshots and almanac anchors live in tests/ephemeris.test.js.
  * @file celestial.test.js
  */

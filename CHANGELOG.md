@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Celestial ephemerides are computed by Almanac** (`@openwaters/almanac`, MIT, pure JS, zero dependencies, fully offline — 0.36 MB installed against astronomy-engine's 1.8 MB). Almanac is a translation of astronomy-engine with the same models, so Sun, Moon and star geographic positions agree with the previous wiring to within 0.4″. The largest difference is the Sun near perihelion: astronomy-engine's `SunPosition` backdates the Sun by a fixed one-AU light time, Almanac by the true distance. Star places keep annual aberration, precession and nutation. astronomy-engine stays as a dev dependency for the independent Hc/Zn cross-check in tests/celestial.test.js. Requires Node.js 22.12 or newer, which loads the ES-module package from `require`.
+
 ## [0.15.0] - 2026-10-21
 
 ### Added
