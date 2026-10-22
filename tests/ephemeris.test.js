@@ -1,7 +1,7 @@
 /**
  * Ephemeris regression tests (SPEC §13).
  *
- * The Sun/Moon/star geographic positions are computed by astronomy-engine;
+ * The Sun/Moon/star geographic positions are computed by Almanac;
  * these tests pin that wiring with snapshot values and — more importantly
  * — anchor it against INDEPENDENT derivations:
  *
@@ -115,13 +115,13 @@ function aaMoon(epochMs) {
   return { gha_deg: normalizeDeg360(gmst - ra), declination_deg: dec };
 }
 
-// --- Snapshots (astronomy-engine 2.1.19, generated 2026-08-29) ----------
+// --- Snapshots (@openwaters/almanac, generated 2026-10-21) ---------------
 // Tight pinning of the wiring: GHA to 1e-5 deg, Dec to 1e-5 deg.
 const SUN_SNAPSHOTS = [
-  ["2026-03-15T06:30:00Z", 275.26502, -2.11344, 16.077],
-  ["2026-06-21T10:00:00Z", 329.55058, 23.43801, 15.732],
-  ["2026-09-15T22:30:00Z", 158.73453, 2.73922, 15.899],
-  ["2026-12-21T22:00:00Z", 150.43239, -23.43758, 16.252],
+  ["2026-03-15T06:30:00Z", 275.26499, -2.11343, 16.077],
+  ["2026-06-21T10:00:00Z", 329.55067, 23.43801, 15.732],
+  ["2026-09-15T22:30:00Z", 158.73456, 2.73924, 15.899],
+  ["2026-12-21T22:00:00Z", 150.43228, -23.43758, 16.252],
 ];
 
 test("sun GHA/Dec snapshots pin the ephemeris wiring", () => {
@@ -174,10 +174,10 @@ test("sun semi-diameter tracks the annual distance variation", () => {
 
 // --- Moon ---------------------------------------------------------------
 const MOON_SNAPSHOTS = [
-  ["2026-03-15T06:30:00Z", 319.2176, -20.88754, 15.264, 56.04],
-  ["2026-06-21T10:00:00Z", 245.76439, 0.55751, 15.491, 56.87],
+  ["2026-03-15T06:30:00Z", 319.21759, -20.88754, 15.264, 56.04],
+  ["2026-06-21T10:00:00Z", 245.76439, 0.5575, 15.491, 56.87],
   ["2026-09-15T22:30:00Z", 105.56947, -22.92011, 15.009, 55.1],
-  ["2026-12-21T22:00:00Z", 4.14864, 25.03069, 16.482, 60.508],
+  ["2026-12-21T22:00:00Z", 4.14863, 25.03069, 16.482, 60.508],
 ];
 
 test("moon GHA/Dec/SD/HP snapshots pin the ephemeris wiring", () => {
@@ -251,12 +251,12 @@ test("star GHA snapshot pins the wiring (Vega, Acrux 2026-07-01)", () => {
   const vega = celestial.starGeographicPosition(t, almanac.lookup("Vega"));
   assert.ok(Math.abs(vega.gha_deg - 359.60437) < 1e-4, `Vega ${vega.gha_deg}`);
   assert.ok(
-    Math.abs(vega.declination_deg - 38.80226) < 1e-4,
+    Math.abs(vega.declination_deg - 38.80225) < 1e-4,
     `Vega dec ${vega.declination_deg}`,
   );
   const acrux = celestial.starGeographicPosition(t, almanac.lookup("Acrux"));
   assert.ok(
-    Math.abs(acrux.gha_deg - 92.04301) < 1e-4,
+    Math.abs(acrux.gha_deg - 92.04299) < 1e-4,
     `Acrux ${acrux.gha_deg}`,
   );
   assert.ok(
