@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-26
+
 ### Fixed
 - **The webapp no longer renders the DR plugin's own extension buttons** in its map control: the webapp is itself a plotter-extension host, so it discovered this plugin's own extension — published for Freeboard-SK — and showed its mapToolbar buttons (Sight / Fix, override engage/release, confirm, pending, current) next to the identical native toolbar. Buttons from the webapp's own plugin (`SELF_EXTENSION_ID`) never render now.
 - **Extension toolbar buttons show real icons** — manifest `icon` fields are Material Icons ligature names, which the webapp rendered as clipped text since it ships no icon font; the host now draws the glyphs as inline SVG (Apache-2.0 path data, offline), falling back to the title's initial for unknown names. Also honors `visible: false`: statically hidden buttons (release, confirm, pending — whose visibility Freeboard drives via `buttons.visibility`, a capability the webapp host does not offer) no longer render permanently.
