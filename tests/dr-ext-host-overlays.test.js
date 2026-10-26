@@ -9,9 +9,13 @@
  */
 
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import test from "node:test";
 import { PlotterExtHost } from "../public/dr-ext-host.js";
 import * as core from "../public/dr-ext-host-core.js";
+
+const require = createRequire(import.meta.url);
+const { buildManifest } = require("../plugin/plotterext.js");
 
 // ---- fakes --------------------------------------------------------------
 
@@ -201,6 +205,68 @@ test("buttonUsable: mapToolbar only", () => {
   assert.equal(core.buttonUsable({ id: "b" }), true);
   assert.equal(core.buttonUsable({ id: "b", slot: "topBar" }), false);
   assert.equal(core.buttonUsable({ slot: "mapToolbar" }), false);
+});
+
+test("hostButtons: skips excluded extensions and statically hidden buttons", () => {
+  const compatible = new Map([
+    [
+      "signalk-dead-reckoning",
+      {
+        manifest: {},
+        buttons: [
+          { id: "open-sight", icon: "explore", visible: true },
+          { id: "override-release", visible: false },
+        ],
+      },
+    ],
+    [
+      "signalk-livedepth",
+      {
+        manifest: {},
+        buttons: [
+          { id: "toggle-depth", icon: "waves", visible: true },
+          { id: "hidden-by-default", visible: false },
+          { id: "not-mapToolbar", slot: "topBar" },
+        ],
+      },
+    ],
+  ]);
+  // The webapp's own plugin never renders (its buttons duplicate the
+  // native toolbar), and visible:false means the static manifest
+  // default is "hidden" — this host cannot drive visibility.
+  assert.deepEqual(
+    core
+      .hostButtons(compatible, [core.SELF_EXTENSION_ID])
+      .map(({ extId, button }) => `${extId}/${button.id}`),
+    ["signalk-livedepth/toggle-depth"],
+  );
+  // Without the exclusion only the hidden/unusable entries drop.
+  assert.deepEqual(
+    core.hostButtons(compatible).map(({ button }) => button.id),
+    ["open-sight", "toggle-depth"],
+  );
+  // Defensive: a non-map (discovery failed) yields no buttons.
+  assert.deepEqual(core.hostButtons(null), []);
+});
+
+test("hostButtons: the DR plugin's own manifest renders nothing in the webapp", () => {
+  // The real manifest the plugin publishes, discovered by the real
+  // compatibility filter — the exact path the webapp host takes.
+  const manifest = buildManifest("/plotterext/signalk-dead-reckoning", "0.0.0");
+  const compatible = core.compatibleExtensions(
+    { ["signalk-dead-reckoning"]: manifest },
+    core.HOST_CAPABILITIES,
+  );
+  // The webapp's own plugin's buttons duplicate the native toolbar →
+  // none render.
+  assert.deepEqual(core.hostButtons(compatible, [core.SELF_EXTENSION_ID]), []);
+  // Without the exclusion only the statically visible buttons would
+  // render — the context-only ones (release, confirm, pending) stay
+  // hidden, as their manifest default says.
+  assert.deepEqual(
+    core.hostButtons(compatible).map(({ button }) => button.id),
+    ["open-sight", "override-engage", "open-current"],
+  );
 });
 
 // ---- overlay state store ----------------------------------------------------

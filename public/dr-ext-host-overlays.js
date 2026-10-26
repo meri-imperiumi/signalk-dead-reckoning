@@ -36,6 +36,48 @@ const LIVE_INTERVAL_MS = 200;
  * subscribed to receive (background iframe still booting). */
 const REQUEST_RETRY_MS = 250;
 
+/** Material Icons ligature names → 24px filled path data (Apache-2.0,
+ * google/material-design-icons — license-compatible with EUPL-1.2).
+ * Manifest `icon` fields carry these ligature names; Freeboard renders
+ * them with its bundled icon font, and the webapp — which ships no
+ * icon font — draws the same glyphs as inline SVG so extension buttons
+ * get real icons offline. Unknown names fall back to the title. */
+const ICON_PATHS = {
+  explore:
+    "M12 10.9c-.61 0-1.1.49-1.1 1.1s.49 1.1 1.1 1.1c.61 0 1.1-.49 1.1-1.1s-.49-1.1-1.1-1.1zM12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm2.19 12.19L6 18l3.81-8.19L18 6l-3.81 8.19z",
+  swap_horizontal_circle:
+    "M22 12c0-5.52-4.48-10-10-10S2 6.48 2 12s4.48 10 10 10 10-4.48 10-10zm-7-5.5l3.5 3.5-3.5 3.5V11h-4V9h4V6.5zm-6 11L5.5 14 9 10.5V13h4v2H9v2.5z",
+  gps_off:
+    "M20.94 11c-.46-4.17-3.77-7.48-7.94-7.94V1h-2v2.06c-1.13.12-2.19.46-3.16.97l1.5 1.5C10.16 5.19 11.06 5 12 5c3.87 0 7 3.13 7 7 0 .94-.19 1.84-.52 2.65l1.5 1.5c.5-.96.84-2.02.97-3.15H23v-2h-2.06zM3 4.27l2.04 2.04C3.97 7.62 3.25 9.23 3.06 11H1v2h2.06c.46 4.17 3.77 7.48 7.94 7.94V23h2v-2.06c1.77-.2 3.38-.91 4.69-1.98L19.73 21 21 19.73 4.27 3 3 4.27zm13.27 13.27C15.09 18.45 13.61 19 12 19c-3.87 0-7-3.13-7-7 0-1.61.55-3.09 1.46-4.27l9.81 9.81z",
+  where_to_vote:
+    "M12 2c3.86 0 7 3.14 7 7 0 5.25-7 13-7 13S5 14.25 5 9c0-3.86 3.14-7 7-7zm-1.53 12L17 7.41 15.6 6l-5.13 5.18L8.4 9.09 7 10.5l3.47 3.5z",
+  fact_check:
+    "M20,3H4C2.9,3,2,3.9,2,5v14c0,1.1,0.9,2,2,2h16c1.1,0,2-0.9,2-2V5 C22,3.9,21.1,3,20,3z M10,17H5v-2h5V17z M10,13H5v-2h5V13z M10,9H5V7h5V9z M14.82,15L12,12.16l1.41-1.41l1.41,1.42L17.99,9 l1.42,1.42L14.82,15z",
+};
+
+/**
+ * Builds the inline-SVG icon for a manifest button's `icon` ligature
+ * name, or null when the name is missing/unknown (the caller falls
+ * back to text).
+ *
+ * @param {string|undefined} name - Material Icons ligature name
+ * @returns {SVGElement|null}
+ */
+function buttonIcon(name) {
+  const d = ICON_PATHS[name ?? ""];
+  if (!d) return null;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "20");
+  svg.setAttribute("height", "20");
+  svg.setAttribute("fill", "currentColor");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", d);
+  svg.appendChild(path);
+  return svg;
+}
+
 /**
  * @param {string} message
  * @returns {RpcError}
@@ -781,6 +823,13 @@ export const OVERLAY_METHODS = {
           background-color: var(--color-teal, #4b8b99);
           color: var(--bg-base, #080a0c);
         }
+        /* Text fallback for buttons without a known icon: keep the
+           initial inside the 34 px square. */
+        .dr-ext-mapctl button.dr-ext-btn-fallback {
+          overflow: hidden;
+          font-size: 0.85rem;
+          font-weight: 600;
+        }
       `;
       (root.appendChild ? root : document.head).appendChild(style);
     }
@@ -808,12 +857,11 @@ export const OVERLAY_METHODS = {
         break;
       }
     }
-    const buttons = [];
-    for (const [extId, ext] of this.compatible) {
-      for (const button of ext.buttons) {
-        buttons.push({ extId, button });
-      }
-    }
+    // The webapp is served by the DR plugin, whose own extension's
+    // mapToolbar buttons duplicate the webapp's native toolbar — never
+    // render them (SELF_EXTENSION_ID). hostButtons also drops
+    // `visible: false` entries, whose rendering the host cannot drive.
+    const buttons = core.hostButtons(this.compatible, [core.SELF_EXTENSION_ID]);
     if (!anyOverlay && buttons.length === 0) {
       if (this.mapControl) {
         this.mapControl.remove();
@@ -838,7 +886,16 @@ export const OVERLAY_METHODS = {
     for (const { extId, button } of buttons) {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.textContent = button.icon ?? button.title ?? button.id;
+      const icon = buttonIcon(button.icon);
+      if (icon) {
+        btn.appendChild(icon);
+      } else {
+        // No icon or an unknown (non-Material ligature) name: the
+        // title's initial reads better than a clipped ligature word in
+        // a 34 px button.
+        btn.textContent = (button.title ?? button.id ?? "·").charAt(0);
+        btn.classList.add("dr-ext-btn-fallback");
+      }
       btn.title = button.title ?? button.id;
       btn.setAttribute("aria-label", button.title ?? button.id);
       btn.addEventListener("click", () => this.runButtonAction(extId, button));

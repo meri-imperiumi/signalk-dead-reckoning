@@ -41,6 +41,13 @@ export const HOST_CAPABILITIES = [
 /** API major version this host implements. */
 export const API_VERSION = "1";
 
+/** The webapp is served by this plugin, and the plugin also publishes
+ * its own plotter extension — for Freeboard-SK. When the webapp acts as
+ * an extension host, that extension's mapToolbar buttons would
+ * duplicate the webapp's own native toolbar (Sight / Fix, override
+ * engage/release, confirm, pending), so the host never renders them. */
+export const SELF_EXTENSION_ID = "signalk-dead-reckoning";
+
 /** Baseline sandbox for every extension iframe: fault containment,
  * not an adversarial boundary (install time is the trust decision).
  * Shared by the widget/panel contexts and the headless background
@@ -478,6 +485,33 @@ export function buttonUsable(entry) {
   if (typeof entry.id !== "string" || entry.id === "") return false;
   if (entry.slot !== undefined && entry.slot !== "mapToolbar") return false;
   return true;
+}
+
+/**
+ * Collects the mapToolbar buttons a host should render from a
+ * compatible collection: usable entries only, `visible: false` entries
+ * dropped (the static manifest default — hosts with `buttons.visibility`
+ * drive visibility dynamically instead), and any extension id in
+ * `exclude` skipped entirely (the webapp skips its own plugin's
+ * extension — `SELF_EXTENSION_ID` — whose buttons duplicate the
+ * webapp's native toolbar).
+ *
+ * @param {Map<string, {manifest: object, buttons: object[]}>} compatible
+ * @param {string[]} [exclude] - extension ids whose buttons never render
+ * @returns {{extId: string, button: object}[]}
+ */
+export function hostButtons(compatible, exclude = []) {
+  const out = [];
+  if (!compatible || typeof compatible.entries !== "function") return out;
+  for (const [extId, ext] of compatible.entries()) {
+    if (exclude.includes(extId)) continue;
+    for (const button of ext.buttons ?? []) {
+      if (!buttonUsable(button)) continue;
+      if (button.visible === false) continue;
+      out.push({ extId, button });
+    }
+  }
+  return out;
 }
 
 /**

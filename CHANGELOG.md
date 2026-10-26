@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The webapp no longer renders the DR plugin's own extension buttons** in its map control: the webapp is itself a plotter-extension host, so it discovered this plugin's own extension — published for Freeboard-SK — and showed its mapToolbar buttons (Sight / Fix, override engage/release, confirm, pending, current) next to the identical native toolbar. Buttons from the webapp's own plugin (`SELF_EXTENSION_ID`) never render now.
+- **Extension toolbar buttons show real icons** — manifest `icon` fields are Material Icons ligature names, which the webapp rendered as clipped text since it ships no icon font; the host now draws the glyphs as inline SVG (Apache-2.0 path data, offline), falling back to the title's initial for unknown names. Also honors `visible: false`: statically hidden buttons (release, confirm, pending — whose visibility Freeboard drives via `buttons.visibility`, a capability the webapp host does not offer) no longer render permanently.
+
 ### Changed
 - **Celestial ephemerides are computed by Almanac** (`@openwaters/almanac`, MIT, pure JS, zero dependencies, fully offline — 0.36 MB installed against astronomy-engine's 1.8 MB). Almanac is a translation of astronomy-engine with the same models, so Sun, Moon and star geographic positions agree with the previous wiring to within 0.4″. The largest difference is the Sun near perihelion: astronomy-engine's `SunPosition` backdates the Sun by a fixed one-AU light time, Almanac by the true distance. Star places keep annual aberration, precession and nutation. astronomy-engine stays as a dev dependency for the independent Hc/Zn cross-check in tests/celestial.test.js. Requires Node.js 22.12 or newer, which loads the ES-module package from `require`.
 
