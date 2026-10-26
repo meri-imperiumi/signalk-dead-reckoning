@@ -434,18 +434,30 @@ test("cplFeature draws the arc toward the DR position, full circle without it", 
 
 test("fixFeature colors per source type and labels with fix time", async () => {
   const { cw, vm } = await load();
-  const fix = {
-    fix_id: 21,
-    timestamp: "2026-10-21T02:30:00Z",
+  // fixTimeLabel switches to a dated label once a fix is over 24 h old, so
+  // the fixtures are built relative to the wall clock to stay deterministic.
+  const base = {
     source_type: "celestial",
     latitude: 60.123,
     longitude: 24.567,
   };
-  const f = cw.fixFeature(fix);
-  assert.equal(f.id, "fix:21");
-  assert.equal(f.properties.color, vm.STYLE.fix.celestial);
-  assert.match(f.properties.label, /^Fix \d\d:\d\dZ$/);
-  assert.deepEqual(f.geometry.coordinates, [24.567, 60.123]);
+  const fresh = cw.fixFeature({
+    ...base,
+    fix_id: 21,
+    timestamp: new Date(Date.now() - 3600 * 1000).toISOString(),
+  });
+  assert.equal(fresh.id, "fix:21");
+  assert.equal(fresh.properties.color, vm.STYLE.fix.celestial);
+  assert.match(fresh.properties.label, /^Fix \d\d:\d\dZ$/);
+  assert.deepEqual(fresh.geometry.coordinates, [24.567, 60.123]);
+
+  const old = cw.fixFeature({
+    ...base,
+    fix_id: 22,
+    timestamp: new Date(Date.now() - 48 * 3600 * 1000).toISOString(),
+  });
+  assert.equal(old.id, "fix:22");
+  assert.match(old.properties.label, /^Fix \d{1,2}\.\d{1,2}\. \d\d:\d\dZ$/);
 });
 
 test("snapFeature builds the dashed correction vector", async () => {

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The chartwork fix-label test no longer depends on the wall clock** (#2): it pinned its fixture to a hardcoded timestamp, which `fixTimeLabel` relabels with a date prefix once the fixture is over 24 h old — the test passed for its first day and then failed on every run. Fixtures are now built relative to `Date.now()`, and a second fixture older than 24 h asserts the dated label form.
+
 ## [0.15.0] - 2026-10-21
 
 ### Added
