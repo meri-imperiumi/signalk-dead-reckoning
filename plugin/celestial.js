@@ -22,16 +22,17 @@
  *      offset by the intercept — exactly the form `recordLineOfPosition`
  *      and the fix resolver expect.
  *
- * Ephemeris (SPEC §13): computed by astronomy-engine (MIT, pure JS,
- * zero sub-dependencies, fully offline) — Sun and Moon geocentric
- * apparent places, stars from the bundled J2000 almanac (verified
- * against a Hipparcos-derived catalog) converted to the date by the
- * library's precession/nutation/aberration. The nautical-almanac
- * convention throughout is GEOCENTRIC, coordinates of date; parallax
- * is applied as a separate sight correction (step 3), never baked into
- * the GP. Library accuracy is arcsecond-class — far below sextant
- * precision — and is pinned by paper-almanac anchors in
- * tests/ephemeris.test.js.
+ * Ephemeris (SPEC §13): computed by Almanac (@openwaters/almanac, MIT,
+ * pure JS, zero dependencies, fully offline), a translation of
+ * astronomy-engine — Sun and Moon geocentric apparent places, stars from
+ * the bundled J2000 almanac (verified against a Hipparcos-derived
+ * catalog) converted to the date with annual aberration, precession and
+ * nutation. GHA is Greenwich apparent sidereal time minus the right
+ * ascension of date. The nautical-almanac convention throughout is
+ * GEOCENTRIC, coordinates of date; parallax is applied as a separate
+ * sight correction (step 3), never baked into the GP. Library accuracy
+ * is arcsecond-class — far below sextant precision — and is pinned by
+ * paper-almanac anchors in tests/ephemeris.test.js.
  *
  * The module is pure: no DB, no I/O, no `new Date()` (the sight time is
  * passed in explicitly so reduction is deterministic and testable).
@@ -41,21 +42,26 @@
  * @file celestial.js
  */
 
-const Astronomy = require("astronomy-engine");
+const {
+  greenwichSiderealTime,
+  moonPosition,
+  starPosition,
+  sunPosition,
+} = require("@openwaters/almanac");
 const { normalizeDeg360 } = require("./geo.js");
 
 /** Radians per degree. */
 const RAD = Math.PI / 180;
 /** Degrees per radian. */
 const DEG = 180 / Math.PI;
-/** Mean obliquity of the ecliptic (J2000), degrees. */
-const OBLIQUITY_DEG = 23.4397;
 /** Sun radius, km (IAU nominal). */
 const SUN_RADIUS_KM = 695700;
 /** Moon radius, km. */
 const MOON_RADIUS_KM = 1737.4;
 /** Earth equatorial radius, km. */
 const EARTH_EQ_RADIUS_KM = 6378.14;
+/** Kilometres per astronomical unit. */
+const KM_PER_AU = 149597870.69098932;
 
 /**
 /**
@@ -74,62 +80,20 @@ const NOON_MAX_LHA_DEG = 20;
 const NOON_MAX_LAT_DELTA_DEG = 12;
 
 /**
- * Reduces an ecliptic longitude/latitude to right ascension (degrees),
- * for a given obliquity (degrees).
- *
- * @param {number} lonDeg - ecliptic longitude, degrees
- * @param {number} latDeg - ecliptic latitude, degrees (0 for the Sun)
- * @param {number} [epsDeg=OBLIQUITY_DEG] - obliquity of the ecliptic
- * @returns {number} RA, degrees
- */
-function raFromEcliptic(lonDeg, latDeg, epsDeg = OBLIQUITY_DEG) {
-  const e = epsDeg * RAD;
-  const l = lonDeg * RAD;
-  const b = latDeg * RAD;
-  const ra = Math.atan2(
-    Math.sin(l) * Math.cos(e) - Math.tan(b) * Math.sin(e),
-    Math.cos(l),
-  );
-  return normalizeDeg360(ra * DEG);
-}
-
-/**
- * Reduces an ecliptic longitude/latitude to declination (degrees), for
- * a given obliquity (degrees).
- *
- * @param {number} lonDeg
- * @param {number} latDeg
- * @param {number} [epsDeg=OBLIQUITY_DEG] - obliquity of the ecliptic
- * @returns {number} declination, degrees [-90, 90]
- */
-function decFromEcliptic(lonDeg, latDeg, epsDeg = OBLIQUITY_DEG) {
-  const e = epsDeg * RAD;
-  const l = lonDeg * RAD;
-  const b = latDeg * RAD;
-  const dec = Math.asin(
-    Math.sin(b) * Math.cos(e) + Math.cos(b) * Math.sin(e) * Math.sin(l),
-  );
-  return dec * DEG;
-}
-
-/**
- * Geocentric apparent GHA/Dec from true-ecliptic-of-date coordinates.
- * The obliquity (true, of date) and Greenwich apparent sidereal time
- * both come from the library, so nutation is included on both sides of
- * GHA = GAST − RA — the nautical-almanac convention.
+ * Geocentric apparent GHA/Dec from right ascension and declination of
+ * date. GHA = GAST − RA, with the apparent sidereal time carrying the
+ * equation of the equinoxes — the nautical-almanac convention.
  *
  * @param {number} epochMs
- * @param {number} lonDeg - ecliptic longitude of date, degrees
- * @param {number} latDeg - ecliptic latitude of date, degrees
+ * @param {{raDeg: number, decDeg: number}} eq - apparent place of date, degrees
  * @returns {{gha_deg: number, declination_deg: number}}
  */
-function ghaDecFromEcliptic(epochMs, lonDeg, latDeg) {
-  const date = new Date(epochMs);
-  const eps = Astronomy.e_tilt(Astronomy.MakeTime(date)).tobl;
-  const ra = raFromEcliptic(lonDeg, latDeg, eps);
-  const dec = decFromEcliptic(lonDeg, latDeg, eps);
-  const gastDeg = Astronomy.SiderealTime(date) * 15;
-  return { gha_deg: normalizeDeg360(gastDeg - ra), declination_deg: dec };
+function ghaDecOfDate(epochMs, eq) {
+  const gastDeg = greenwichSiderealTime(new Date(epochMs));
+  return {
+    gha_deg: normalizeDeg360(gastDeg - eq.raDeg),
+    declination_deg: eq.decDeg,
+  };
 }
 
 /**
@@ -141,10 +105,10 @@ function ghaDecFromEcliptic(epochMs, lonDeg, latDeg) {
  * @returns {{gha_deg: number, declination_deg: number, semi_diameter_deg: number}}
  */
 function sunGeographicPosition(epochMs) {
-  const ecl = Astronomy.SunPosition(new Date(epochMs));
-  const distKm = ecl.vec.Length() * Astronomy.KM_PER_AU;
+  const sun = sunPosition(new Date(epochMs));
+  const distKm = sun.distanceAu * KM_PER_AU;
   return {
-    ...ghaDecFromEcliptic(epochMs, ecl.elon, ecl.elat),
+    ...ghaDecOfDate(epochMs, sun),
     semi_diameter_deg: Math.asin(SUN_RADIUS_KM / distKm) * DEG,
   };
 }
@@ -159,10 +123,10 @@ function sunGeographicPosition(epochMs) {
  * @returns {{gha_deg: number, declination_deg: number, semi_diameter_deg: number, horizontal_parallax_deg: number}}
  */
 function moonGeographicPosition(epochMs) {
-  const ecl = Astronomy.EclipticGeoMoon(new Date(epochMs));
-  const distKm = ecl.dist * Astronomy.KM_PER_AU;
+  const moon = moonPosition(new Date(epochMs));
+  const distKm = moon.distanceKm;
   return {
-    ...ghaDecFromEcliptic(epochMs, ecl.lon, ecl.lat),
+    ...ghaDecOfDate(epochMs, moon),
     semi_diameter_deg: Math.asin(MOON_RADIUS_KM / distKm) * DEG,
     horizontal_parallax_deg: Math.asin(EARTH_EQ_RADIUS_KM / distKm) * DEG,
   };
@@ -170,39 +134,19 @@ function moonGeographicPosition(epochMs) {
 
 /**
  * A star's geographic position at a timestamp: GHA and declination.
- * The bundled almanac's J2000 mean place is registered with the library
- * (`DefineStar`), which returns the apparent place of date — full
- * precession, nutation and aberration.
- *
- * `DefineStar` mutates its slot globally; the single-threaded
- * sight-reduction path re-registers per lookup, which is fine for
- * per-sight (rare) events, not per-tick use.
+ * The bundled almanac's J2000 mean place is converted to the apparent
+ * place of date — annual aberration, precession and nutation.
  *
  * @param {number} epochMs
  * @param {{sha_deg: number, declination_deg: number}} star
  * @returns {{gha_deg: number, declination_deg: number}}
  */
 function starGeographicPosition(epochMs, star) {
-  const date = new Date(epochMs);
-  const raHours = (360 - normalizeDeg360(star.sha_deg)) / 15;
-  Astronomy.DefineStar(
-    Astronomy.Body.Star1,
-    raHours,
-    star.declination_deg,
-    100,
+  const raDeg = normalizeDeg360(360 - normalizeDeg360(star.sha_deg));
+  return ghaDecOfDate(
+    epochMs,
+    starPosition(raDeg, star.declination_deg, new Date(epochMs)),
   );
-  const eq = Astronomy.Equator(
-    Astronomy.Body.Star1,
-    date,
-    new Astronomy.Observer(0, 0, 0),
-    true,
-    true,
-  );
-  const gastDeg = Astronomy.SiderealTime(date) * 15;
-  return {
-    gha_deg: normalizeDeg360(gastDeg - eq.ra * 15),
-    declination_deg: eq.dec,
-  };
 }
 
 /**
@@ -525,8 +469,6 @@ function reduceNoonSight(input) {
 module.exports = {
   NOON_MAX_LHA_DEG,
   NOON_MAX_LAT_DELTA_DEG,
-  raFromEcliptic,
-  decFromEcliptic,
   sunGeographicPosition,
   moonGeographicPosition,
   starGeographicPosition,
