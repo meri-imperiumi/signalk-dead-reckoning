@@ -151,10 +151,36 @@ test("clipLineToBounds clips a long line to the box, world-copy-safe", async () 
   ];
   const crossed = cw.clipLineToBounds(crossingLine, crossingBox);
   assert.equal(crossed.length, 1);
-  // The output is normalized to [-180, 180): 180.05 → -179.95.
+  // The output keeps the box's frame coordinates: 180.05 stays east of
+  // the seam — normalizing it to -179.95 re-folds the dateline into
+  // the geometry, and the host drew the leg around the globe (the
+  // Freeboard wrap regression).
   for (const [lon] of crossed[0]) {
-    assert.ok(Math.abs(Math.abs(lon) - 179.95) < 0.1, `lon ${lon}`);
+    assert.ok(Math.abs(lon - 180.05) < 1e-9, `lon ${lon}`);
   }
+
+  // A track whose SAMPLES jump the seam (plugin TrackLog longitudes
+  // are normalized to [-180, 180), so a crossing is stored as
+  // 179.99 → -179.99) clips to a run that stays continuous across it:
+  // the vertices keep the unwrapped strip, never re-folding to ±180.
+  const seamTrack = [
+    [179.98, -18.6],
+    [-179.98, -18.64],
+  ];
+  const seamRun = cw.clipLineToBounds(seamTrack, crossingBox);
+  assert.equal(seamRun.length, 1);
+  const [aLon, bLon] = [seamRun[0][0][0], seamRun[0][1][0]];
+  assert.ok(bLon > aLon, `crossing stays eastbound (${aLon} → ${bLon})`);
+  assert.ok(Math.abs(bLon - aLon) < 1, `short hop (${aLon} → ${bLon})`);
+
+  // A full-world clip box (zoomed out past 360° of longitude) cannot
+  // cut anything — the line comes back unclipped and unwrapped.
+  const whole = cw.clipLineToBounds(seamTrack, [-180, -20, 180, -17]);
+  assert.equal(whole.length, 1);
+  assert.deepEqual(
+    whole[0].map(([lon]) => lon),
+    [179.98, 180.02],
+  );
 });
 
 test("clipPolygonToBounds keeps the inside of a huge circle", async () => {
@@ -168,6 +194,31 @@ test("clipPolygonToBounds keeps the inside of a huge circle", async () => {
     assert.ok(lon >= box[0] - 1e-6 && lon <= box[2] + 1e-6, `lon ${lon}`);
     assert.ok(lat >= box[1] - 1e-6 && lat <= box[3] + 1e-6, `lat ${lat}`);
   }
+  // Closed ring.
+  assert.deepEqual(clipped[0], clipped[clipped.length - 1]);
+});
+
+test("clipPolygonToBounds keeps a dateline circle in the view's frame", async () => {
+  const { cw } = await load();
+  // A circle centered just WEST of the antimeridian: circleRing
+  // normalizes its longitudes, so the raw ring jumps +180 ↔ -180 and
+  // would fill the long way around the planet. Clipped to a crossing
+  // box it must come out one closed ring in the box's frame (the
+  // >180° unwrapped side kept as-is, not re-folded to negative).
+  const box = [179.5, -18.8, -179.5, -18.4]; // w > e: crossing
+  const ring = cw.circleRing([-18.6, 179.8], 20);
+  const clipped = cw.clipPolygonToBounds(ring, box);
+  assert.ok(clipped.length > 3, "clipped ring has vertices");
+  let jumped = 0;
+  for (let i = 1; i < clipped.length; i++) {
+    const d = Math.abs(clipped[i][0] - clipped[i - 1][0]);
+    if (d > 180) jumped += 1;
+  }
+  assert.equal(jumped, 0, `no seam jumps in the ring (${jumped})`);
+  assert.ok(
+    clipped.some(([lon]) => lon > 180),
+    "keeps the unwrapped east-of-seam side",
+  );
   // Closed ring.
   assert.deepEqual(clipped[0], clipped[clipped.length - 1]);
 });
@@ -479,6 +530,23 @@ test("snapFeature builds the dashed correction vector", async () => {
   ]);
 });
 
+test("snapFeature crosses the antimeridian the short way", async () => {
+  const { cw } = await load();
+  // A snap whose DR and fix sides sit on opposite sides of the seam
+  // keeps the unwrapped strip — not a line around the planet.
+  const f = cw.snapFeature({
+    correction_id: 4,
+    dr_lat: -18.6,
+    dr_lon: 179.999,
+    fix_lat: -18.6,
+    fix_lon: -179.999,
+    deviation_nm: 0.06,
+    deviation_bearing: 90,
+  });
+  const lons = f.geometry.coordinates.map(([lon]) => lon);
+  assert.deepEqual(lons, [179.999, 180.001]);
+});
+
 test("ghostFeature converts TrackLog points and rejects short tracks", async () => {
   const { cw } = await load();
   assert.equal(cw.ghostFeature([[60, 25, 1]]), null);
@@ -491,6 +559,41 @@ test("ghostFeature converts TrackLog points and rejects short tracks", async () 
     [25, 60],
     [25.01, 60.01],
   ]);
+});
+
+test("ghostFeature unwraps a track across the antimeridian", async () => {
+  const { cw } = await load();
+  // TrackLog samples come normalized to [-180, 180): the crossing
+  // point is stored as a +180 ↔ -180 jump, which a host renderer joins
+  // the long way around the planet (the Freeboard wrap regression).
+  // Without a clip box the feature must carry the unwrapped strip.
+  const f = cw.ghostFeature([
+    [60, 179.98, 1],
+    [60.01, -179.98, 2],
+    [60.02, -179.96, 3],
+  ]);
+  assert.equal(f.geometry.type, "LineString");
+  assert.deepEqual(
+    f.geometry.coordinates.map(([lon]) => lon),
+    [179.98, 180.02, 180.04],
+  );
+  // With a crossing view box the clipped run keeps the same strip.
+  const clipped = cw.ghostFeature(
+    [
+      [60, 179.98, 1],
+      [60.01, -179.98, 2],
+      [60.02, -179.96, 3],
+    ],
+    [179.9, 59.9, -179.9, 60.1],
+  );
+  assert.equal(clipped.geometry.type, "LineString");
+  const lons = clipped.geometry.coordinates.map(([lon]) => lon);
+  for (let i = 1; i < lons.length; i++) {
+    assert.ok(
+      lons[i] > lons[i - 1] && lons[i] - lons[i - 1] < 1,
+      `short hop east (${lons[i - 1]} → ${lons[i]})`,
+    );
+  }
 });
 
 test("uncertaintyFeature scales the radius and skips empty ones", async () => {

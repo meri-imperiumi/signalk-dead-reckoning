@@ -224,11 +224,41 @@ function lonInFrame(lon, baseLon) {
 }
 
 /**
+ * Unwraps a polyline's longitudes onto a continuous strip: every vertex
+ * after the first shifts by ±360° onto the previous vertex's strip, so
+ * an antimeridian crossing stays a short segment in the emitted
+ * geometry. A host renderer projects unwrapped longitudes onto the
+ * neighbouring world copy — MapLibre on Freeboard-SK, Leaflet in the
+ * webapp (`vm.worldCopies`) — instead of joining the seam the long way
+ * around the planet. Takes GeoJSON `[lon, lat]` points; the input list
+ * is untouched.
+ *
+ * @param {Array<[number, number]>} coords
+ * @returns {Array<[number, number]>} unwrapped copy
+ */
+function unwrapLongitudes(coords) {
+  const out = [];
+  for (const [lon, lat] of coords) {
+    let l = lon;
+    if (out.length > 0) {
+      const prev = out[out.length - 1][0];
+      while (l - prev > 180) l -= 360;
+      while (l - prev < -180) l += 360;
+    }
+    out.push([l, lat]);
+  }
+  return out;
+}
+
+/**
  * Clips a polyline (GeoJSON coordinates, `[lon, lat]`) to a lon/lat
  * box, one or more runs — a track that leaves and re-enters the box
- * comes back as a MultiLineString's runs. Longitudes are first unwrapped
- * into the box's frame (the view's world copy), the clipped result is
- * normalized back to `[-180, 180)`.
+ * comes back as a MultiLineString's runs. Longitudes are unwrapped
+ * into the box's frame (the view's world copy) and STAY there: a leg
+ * crossing ±180° comes out continuous (179.99 → 180.01), which the
+ * host renders as the short hop over the seam. Normalizing back to
+ * `[-180, 180)` — the first cut did — re-folds the seam into the
+ * coordinates and the track drew itself around the globe.
  *
  * Cohen–Sutherland-style segment clipping against a convex box.
  *
@@ -238,14 +268,29 @@ function lonInFrame(lon, baseLon) {
  */
 export function clipLineToBounds(coords, bounds) {
   const [w, s, e, n] = bounds;
-  const frame = w <= e ? w : w; // the box's west edge, its own frame
+  const frame = w; // the box's west edge, its own frame
   const boxW = frame;
   const boxE = frame + (e >= w ? e - w : e - w + 360);
+  if (boxE - boxW >= 360 - 1e-9) {
+    // The whole world is in view — nothing to clip away, and the
+    // frame's own ±180° edges would only cut a seam crossing apart.
+    return [unwrapLongitudes(coords)];
+  }
   const inLat = (lat) => lat >= s && lat <= n;
   const inLon = (lon) => lon >= boxW && lon <= boxE;
   const runs = [];
   let run = null;
   const push = (p) => {
+    // Skip a repeat of the just-pushed vertex: each segment start is
+    // pushed, and an interior vertex inside both of its segments would
+    // otherwise land twice in the run.
+    if (
+      run &&
+      run[run.length - 1][0] === p[0] &&
+      run[run.length - 1][1] === p[1]
+    ) {
+      return;
+    }
     if (!run) {
       run = [];
       runs.push(run);
@@ -318,18 +363,16 @@ export function clipLineToBounds(coords, bounds) {
     }
     if (!bIn) endRun();
   }
-  // Normalize back to [-180, 180).
-  const wrap = (lon) => (((lon % 360) + 540) % 360) - 180;
-  return runs
-    .filter((r) => r.length >= 2)
-    .map((r) => r.map(([lon, lat]) => [wrap(lon), lat]));
+  return runs.filter((r) => r.length >= 2);
 }
 
 /**
  * Clips a polygon ring (GeoJSON coordinates, `[lon, lat]`) to a lon/lat
  * box — Sutherland–Hodgman, one convex box against one ring, so the
  * result is a single closed ring (possibly empty). Longitudes are
- * unwrapped into the box's frame first and normalized back after.
+ * unwrapped into the box's frame and stay there — the same seam
+ * continuity as `clipLineToBounds` — so a dateline-crossing uncertainty
+ * circle fills the short way instead of smearing around the globe.
  *
  * @param {Array<[number, number]>} ring - open or closed ring
  * @param {[number, number, number, number]} bounds - [w, s, e, n]
@@ -341,6 +384,12 @@ export function clipPolygonToBounds(ring, bounds) {
   const frame = w;
   const boxW = frame;
   const boxE = frame + (e >= w ? e - w : e - w + 360);
+  if (boxE - boxW >= 360 - 1e-9) {
+    // Whole world in view — nothing to clip away; the unwrapped ring
+    // is the answer. The closure vertex unwraps identically, so the
+    // ring stays closed.
+    return unwrapLongitudes(ring);
+  }
   let poly = [];
   {
     // Unwrap sequentially around the ring (the closure edge stays
@@ -393,10 +442,8 @@ export function clipPolygonToBounds(ring, bounds) {
     poly = clipEdge(poly, keep, (a, b) => lerp(a, b, tAt(a, b, at, axis)));
     if (poly.length === 0) return [];
   }
-  const wrap = (lon) => (((lon % 360) + 540) % 360) - 180;
-  const out = poly.map(([lon, lat]) => [wrap(lon), lat]);
-  out.push(out[0]);
-  return out;
+  poly.push([poly[0][0], poly[0][1]]);
+  return poly;
 }
 
 /**
@@ -623,10 +670,12 @@ export function snapFeature(c) {
   return feature(
     `snap:${id}`,
     "snap",
-    lineString([
-      [spec.from[1], spec.from[0]],
-      [spec.to[1], spec.to[0]],
-    ]),
+    lineString(
+      unwrapLongitudes([
+        [spec.from[1], spec.from[0]],
+        [spec.to[1], spec.to[0]],
+      ]),
+    ),
     {
       name: `Snap ${spec.deviationNm?.toFixed(2) ?? "?"} nm`,
     },
@@ -643,12 +692,10 @@ export function snapFeature(c) {
  */
 export function ghostFeature(points, clip = null) {
   if (!Array.isArray(points) || points.length < 2) return null;
+  const coords = points.map((p) => [p[1], p[0]]);
   const runs = clip
-    ? clipLineToBounds(
-        points.map((p) => [p[1], p[0]]),
-        clip,
-      )
-    : [points.map((p) => [p[1], p[0]])];
+    ? clipLineToBounds(coords, clip)
+    : [unwrapLongitudes(coords)];
   if (runs.length === 0) return null;
   return feature(
     "ghost",
@@ -671,7 +718,11 @@ export function uncertaintyFeature(drPosition, uncertainty, clip = null) {
   if (!drPosition) return null;
   const spec = vm.uncertaintySpec(drPosition, uncertainty);
   if (!(spec.radiusNm > 0)) return null;
-  let ring = circleRing(spec.center, spec.radiusNm);
+  // Unwrap before clipping: a circle centered near ±180° comes out of
+  // circleRing with its longitudes normalized, i.e. with a seam jump —
+  // unwrapped it fills across the dateline instead of around the globe
+  // (clipPolygonToBounds re-unwraps, idempotently, into its frame).
+  let ring = unwrapLongitudes(circleRing(spec.center, spec.radiusNm));
   if (clip) {
     ring = clipPolygonToBounds(ring, clip);
     if (ring.length === 0) return null;
