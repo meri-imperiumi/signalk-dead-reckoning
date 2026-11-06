@@ -19,7 +19,7 @@
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-category-chart-plotters",
-    "signalk-category-instruments",
+    "category-plotter-extensions",
     "signalk-webapp"
   ],
   "author": "Henri Bergius <henri.bergius@iki.fi>",
@@ -35,7 +35,8 @@
       "@meri-imperiumi/signalk-autostate",
       "@meri-imperiumi/signalk-logbook",
       "signalk-polar-performance-plugin",
-      "signalk-polar-management"
+      "signalk-polar-management",
+      "speedandcurrent"
     ],
     "screenshots": [
       "./doc/dr-map.png",

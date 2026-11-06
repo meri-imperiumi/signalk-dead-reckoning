@@ -153,6 +153,56 @@ test("tick publishes a deadReckoning.position delta with the origin", async () =
   plugin.stop();
 });
 
+test("fresh companion leeway drives the shadow boat (leeway-source wiring)", async () => {
+  const { app, plugin } = makeStarted();
+  // Origin + north-bound water track, empty matrix (leeway fallback 0).
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 60, longitude: 24 },
+          },
+          { path: "navigation.speedThroughWater", value: 5 },
+          { path: "navigation.headingTrue", value: 0 },
+        ],
+      },
+    ],
+  });
+  // Companion leeway: 5° starboard slip (rad, starboard-positive).
+  // Positive leeway rotates the course toward starboard, so the shadow
+  // boat must acquire an eastward component — without it (matrix 0,
+  // heading 0) the longitude would stay exactly 24.
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          { path: "navigation.leewayAngle", value: (5 * Math.PI) / 180 },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 2300));
+  const positions = app.handledMessages
+    .map(
+      (m) =>
+        m.message?.updates
+          ?.flatMap((u) => u.values ?? [])
+          .find((v) => v.path === "navigation.deadReckoning.position")?.value,
+    )
+    .filter((p) => p && Number.isFinite(p.longitude));
+  assert.ok(positions.length > 0, "no DR position published");
+  const last = positions[positions.length - 1];
+  assert.ok(
+    last.longitude > 24,
+    `companion leeway not applied — shadow boat stayed on the meridian (lon=${last.longitude})`,
+  );
+  plugin.stop();
+});
+
 test("tick publishes an idle state reason when moored (no speed/heading)", async () => {
   const { app, plugin } = makeStarted();
   // Moored, no STW or heading → step() can't compute DR.

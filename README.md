@@ -27,6 +27,7 @@ Planning for life without GPS is no longer hypothetical: the UK Maritime and Coa
    * `signalk-logbook` (or any other `logentries` resource provider) — writes confirmed fixes and maneuvers to the vessel's logbook
    * `signalk-polar-performance-plugin` — polar-derived speed when the paddlewheel is fouled or silent
    * `@meri-imperiumi/signalk-autostate` — keeps the navigation state (anchored, sailing, motoring) accurate, which gates training
+   * [speedandcurrent](https://github.com/Asw1n/speedandcurrent) — learns a heel- and speed-aware paddlewheel correction table and publishes the resulting `navigation.leewayAngle` and current estimate. While GPS is trusted, its Kalman-smoothed leeway gives the DR training pipeline a second, independently modeled opinion on the lateral water-track residual; its own learned table keeps publishing during GPS denial, covering the same physics from a different estimator. If both plugins correct `navigation.speedThroughWater`, set the Signal K source priority for one of them so a single calibrated source wins.
    * Signal K Weather API — point-forecast current vectors for the DR solution
 
 ## Daily use

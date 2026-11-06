@@ -59,6 +59,7 @@ The three motivations are causally linked: (1) generates the fix data and crew e
 | `navigation.sails` | Active sail configuration, from `signalk-logbook`. |
 | `environment.seaState` | Sea state tier, from logbook watch entries. |
 | `navigation.state` | `anchored` \| `moored` \| `sailing` \| `motoring` \| ... — trip boundaries, and the anchored/moored anomaly-detection gates. |
+| `navigation.leewayAngle` | Companion leeway (rad, starboard-positive) — published by e.g. the `speedandcurrent` plugin's learned correction table. Consumed as the runtime leeway source while fresh and plausible (§6.1); our own matrix stays the fallback and keeps training independently. Optional: absent companion changes nothing. |
 | `propulsion.main.state` | `started` \| `stopped` — **authoritative** (non-GPS-derived) gate for excluding motoring intervals from sail-leeway matrix training. Preferred over inferring from `navigation.state`, since that is itself typically SOG-threshold-derived and therefore GPS-dependent. |
 | `vessels.*` (AIS targets), and any locally available ADS-B feed | Third-party track corroboration for spoofing detection (§7.4). |
 | `electrical.solar.*` (path TBD per installation) | Opportunistic passive time/position sanity check (§7.5). |
@@ -278,6 +279,8 @@ Worker Thread (DR Physics)
 
 **Inference Mode** — active when `isGpsReliable = false` OR OVERRIDE is manually engaged:
 - Freezes matrix learning. Reads raw sensors, looks up matching bins, applies corrections, integrates the resolved current vector, publishes `navigation.deadReckoning.position` as authoritative (`navigation.deadReckoning.active = true`).
+
+**Runtime leeway source** — mode-independent, `leeway-source.js`: a fresh, plausible published `navigation.leewayAngle` (companion plugin, e.g. speedandcurrent) outranks the matrix lookup — the same "a working measurement outranks a model" rule as the speed-source fallback, and the companion's value is likewise learned from GPS ground truth, not a weather model. Freshness window is 15 s (the companion publishes continuously; exceeding it means it stopped); plausibility bound matches the training bound (|leeway| ≤ 15°) — the companion's own estimator can misbehave the same way ours can (its slow current smoother lags in a tide race, which leaks lateral current into its leeway). Sign and units: the companion publishes rad, starboard-positive — the same signed convention as the matrix (positive = slip toward starboard), so no flip is needed, only rad→deg. Training deliberately does NOT switch over while the companion drives the runtime: the geometric observation pipeline keeps feeding our own matrix, so the fallback stays warm — a season of companion presence must not leave the matrix stale for the day the companion is removed. Also applies on the polar speed fallback: the companion learns from GPS plus its own paddlewheel handling, not from our bins, so it is not circular with the polar estimate (and it is plausibility-gated).
 
 **Speed-source fallback** — mode-independent (the shadow boat integrates regardless of GPS trust, §5, so a sensor lost in NORMAL mode is handled the same way as one lost in Inference/OVERRIDE). A fouled or silent paddlewheel degrades the speed source by preference:
 

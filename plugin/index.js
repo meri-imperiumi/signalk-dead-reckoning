@@ -49,6 +49,7 @@ const {
 } = require("./db.js");
 const { MatrixStore } = require("./matrix.js");
 const { DeadReckoningEngine } = require("./engine.js");
+const { resolveLeewayDeg } = require("./leeway-source.js");
 const { GroundTrack } = require("./ground-track.js");
 const {
   TrainingState,
@@ -256,6 +257,11 @@ const SUBSCRIPTION_PATHS = [
   "navigation.magneticVariation",
   "navigation.magneticVariation.source",
   "navigation.attitude",
+  // Companion leeway (SPEC §3.2): published by e.g. the speedandcurrent
+  // plugin's learned correction table. Consumed as the runtime leeway
+  // source while fresh and plausible; our own matrix stays the fallback
+  // and keeps training independently (leeway-source.js).
+  "navigation.leewayAngle",
   "environment.wind.angleApparent",
   "environment.wind.speedApparent",
   // §3.1 inertial-polar fallback: polar-derived STW from the polar
@@ -498,6 +504,10 @@ module.exports = (app) => {
 
   /** @type {Map<string, unknown>} latest per-path values from the delta stream */
   const deltaState = new Map();
+
+  /** Latest companion-published leeway (leeway-source.js): value in rad
+   * plus the local receipt time for freshness gating. */
+  let companionLeeway = { rad: null, atMs: null };
 
   /** @type {import("node:sqlite").DatabaseSync|null} */
   let db = null;
@@ -1337,6 +1347,9 @@ module.exports = (app) => {
       }
       for (const v of update.values) {
         deltaState.set(v.path, v.value);
+        if (v.path === "navigation.leewayAngle") {
+          companionLeeway = { rad: unwrapNumber(v.value), atMs: Date.now() };
+        }
         // Seed the engine origin from the first GPS fix if we have none yet.
         if (v.path === "navigation.position") {
           latestGpsFixMeta = {
@@ -1843,6 +1856,20 @@ module.exports = (app) => {
           heelDeg: heel ?? 0,
         });
 
+    // Companion leeway (leeway-source.js): a fresh, plausible published
+    // `navigation.leewayAngle` (speedandcurrent) outranks our matrix
+    // lookup — a working measurement outranks a model. The matrix keeps
+    // training independently so the fallback stays warm. Also applies on
+    // the polar fallback: the companion learns from GPS + its own STW
+    // handling, not from our paddlewheel-driven bins, so it is not
+    // circular with the polar estimate — and it is plausibility-gated.
+    const companion = resolveLeewayDeg({
+      companionRad: companionLeeway.rad,
+      companionAtMs: companionLeeway.atMs,
+      nowMs: Date.now(),
+      matrixLeewayDeg: corrections.leeway_angle,
+    });
+
     // Speed source for this tick: the real paddlewheel when it reads,
     // the running-averaged polar estimate otherwise (§3.1 method token).
     const effectiveStwKn = onPolar ? polar.averageKn : stwKn;
@@ -1885,7 +1912,7 @@ module.exports = (app) => {
       {
         stwKn: effectiveStwKn,
         headingTrueDeg,
-        leewayDeg: corrections.leeway_angle,
+        leewayDeg: companion.leewayDeg,
         speedLoss: corrections.speed_loss,
         current,
         underway,
@@ -2153,7 +2180,7 @@ module.exports = (app) => {
         const vel = deps.resolveShadowVelocity({
           stwKn: effectiveStwKn,
           headingTrueDeg,
-          leewayDeg: corrections.leeway_angle,
+          leewayDeg: companion.leewayDeg,
           speedLoss: corrections.speed_loss,
           current,
         });
