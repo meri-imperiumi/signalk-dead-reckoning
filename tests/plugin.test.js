@@ -1557,7 +1557,7 @@ test("divergence advisory raises on sustained DR-GPS divergence and publishes th
   assert.ok(notif, "advisory notification not published");
   assert.strictEqual(notif.state, "alert");
   assert.ok(Array.isArray(notif.method) && notif.method.includes("visual"));
-  assert.ok(/consider taking a fix/.test(notif.message));
+  assert.ok(/take a fix/.test(notif.message));
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -1612,7 +1612,7 @@ test("divergence advisory clears after a confirmed fix snaps DR back to GPS", as
     "notifications.navigation.deadReckoning.divergenceAdvisory",
   );
   assert.strictEqual(cleared.state, "normal");
-  assert.ok(/back within expected uncertainty/.test(cleared.message));
+  assert.ok(/cleared/.test(cleared.message));
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -1880,7 +1880,7 @@ test("moored with wind: no fouled paddlewheel alert, advisory withdrawn, null di
     "notifications.navigation.deadReckoning.divergenceAdvisory",
   );
   assert.strictEqual(notif.state, "normal");
-  assert.ok(/suspended while moored/.test(notif.message));
+  assert.ok(/paused/.test(notif.message));
 
   // Divergence readout is an explicit null — no stale underway figure.
   assert.strictEqual(latestDivergence(app), null);
@@ -3492,9 +3492,7 @@ test("inertial-polar: missing STW + polar deltas → integrates averaged polar s
       "notifications.navigation.deadReckoning.status",
     );
     assert.ok(
-      alerts.some(
-        (a) => a.state === "alert" && /polar-derived/.test(a.message),
-      ),
+      alerts.some((a) => a.state === "alert" && /polar/i.test(a.message)),
       `no polar alert: ${JSON.stringify(alerts)}`,
     );
   } finally {
@@ -3764,9 +3762,7 @@ test("inertial-polar: paddlewheel recovery flips method back and clears the aler
       "notifications.navigation.deadReckoning.status",
     );
     assert.ok(
-      alerts.some(
-        (a) => a.state === "normal" && /sensor health nominal/.test(a.message),
-      ),
+      alerts.some((a) => a.state === "normal" && /nominal/.test(a.message)),
       `no clear transition: ${JSON.stringify(alerts)}`,
     );
   } finally {
@@ -3893,13 +3889,14 @@ test("resource polar: missing STW + active polar resource → integrates without
       "plugin published navigation.speedThroughWater while on resource polar",
     );
 
-    // The alert names the active resource, and /status mirrors it.
+    // The alert says DR is on polar speed (resource id is a /status
+    // detail), and /status mirrors it.
     const alerts = lastValues(
       app,
       "notifications.navigation.deadReckoning.status",
     );
     assert.ok(
-      alerts.some((a) => a.state === "alert" && /'test'/.test(a.message)),
+      alerts.some((a) => a.state === "alert" && /polar/i.test(a.message)),
       `no resource-polar alert: ${JSON.stringify(alerts)}`,
     );
     const router = new FakeRouter();

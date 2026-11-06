@@ -1281,7 +1281,7 @@ module.exports = (app) => {
       if (divergence?.active) {
         publishNotification(PATHS.divergenceAdvisory, {
           state: "normal",
-          message: "DR monitoring stopped",
+          message: "DR stopped",
         });
       }
       divergence = null;
@@ -1298,7 +1298,7 @@ module.exports = (app) => {
       if (sensorHealthIssue) {
         publishNotification(PATHS.sensorHealth, {
           state: "normal",
-          message: "DR monitoring stopped",
+          message: "DR stopped",
         });
         sensorHealthIssue = null;
       }
@@ -1798,7 +1798,7 @@ module.exports = (app) => {
       setSensorHealth(
         moving ? "idle-moving" : null,
         moving
-          ? `DR stopped tracking (${reason}) but the vessel is making ~${gpsMotion.speedKn.toFixed(1)} kn over ground — DR position is stale, uncertainty growing`
+          ? `DR stale (${reason}) — moving ${gpsMotion.speedKn.toFixed(1)}kn`
           : null,
       );
 
@@ -1996,18 +1996,18 @@ module.exports = (app) => {
     // the missing-paddlewheel case while DR runs on the polar fallback.
     // Both are transition-published by setSensorHealth.
     if (onPolar && stwKn == null) {
+      // Which polar resource is active is a /status detail — the
+      // notification just says the speed source changed.
       setSensorHealth(
         "polar",
-        polarSource === "polar-resource" && polarModel
-          ? `Paddlewheel speed unavailable — DR is integrating speed from the active polar resource '${polarModel.id}' (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`
-          : `Paddlewheel speed unavailable — DR is integrating polar-derived speed (running average ${polar.averageKn.toFixed(1)} kn). Verify position by other means`,
+        `No STW — polar ${polar.averageKn.toFixed(1)}kn`,
       );
     } else if (fouled) {
       setSensorHealth(
         "fouled",
         onPolar
-          ? "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR has switched to polar-derived speed; verify position by other means"
-          : "Paddlewheel appears fouled — STW≈0 while the vessel makes way. DR is integrating near-zero speed; verify position by other means",
+          ? `STW fouled — polar ${polar.averageKn.toFixed(1)}kn`
+          : "STW fouled — DR not advancing",
       );
     } else {
       setSensorHealth(null, null);
@@ -2088,22 +2088,24 @@ module.exports = (app) => {
           config.divergence,
         );
         if (d.transition === "raise") {
-          const margin = d.divergenceNm - d.expectedNm;
           publishNotification(PATHS.divergenceAdvisory, {
             state: "alert",
-            message: `DR-GPS divergence ${d.divergenceNm.toFixed(2)} nm exceeds expected ${d.expectedNm.toFixed(2)} nm by ${margin.toFixed(2)} nm (uncertainty × ${config.divergence.factor}) — consider taking a fix`,
+            // Notification panels render message text verbatim — keep it
+            // to one short line. The expected radius, margin and factor
+            // detail stays on REST /status.
+            message: `DR ${d.divergenceNm.toFixed(1)}nm off GPS — take a fix`,
           });
         } else if (d.transition === "clear") {
           publishNotification(PATHS.divergenceAdvisory, {
             state: "normal",
-            message: `DR-GPS divergence back within expected uncertainty (${d.divergenceNm.toFixed(2)} nm)`,
+            message: `DR divergence cleared (${d.divergenceNm.toFixed(1)}nm)`,
           });
         }
       } else if (divergence.active) {
         divergence = deps.createDivergenceState();
         publishNotification(PATHS.divergenceAdvisory, {
           state: "normal",
-          message: "DR monitoring suspended while moored/anchored",
+          message: `DR paused (${navState ?? "moored"})`,
         });
       }
 
@@ -2513,7 +2515,7 @@ module.exports = (app) => {
     } else if (wasIssue) {
       publishNotification(PATHS.sensorHealth, {
         state: "normal",
-        message: "DR sensor health nominal",
+        message: "DR nominal",
       });
     }
   }

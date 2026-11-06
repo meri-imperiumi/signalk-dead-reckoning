@@ -217,24 +217,21 @@ test("drStatusText: engine-warm on a tied-up boat is its own status, not 'underw
   const vm = await loadVm();
   assert.strictEqual(
     vm.drStatusText({ status: "warm", navState: "moored" }),
-    "DR warm — moored, integrating sensors",
+    "DR warm (moored)",
   );
   assert.strictEqual(
     vm.drStatusText({ status: "warm", navState: "anchored" }),
-    "DR warm — anchored, integrating sensors",
+    "DR warm (anchored)",
   );
   // Fouling outranks the warm wording.
   assert.match(
     vm.drStatusText({ status: "warm", navState: "moored", fouled: true }),
     /fouled/,
   );
-  assert.strictEqual(
-    vm.drStatusText({ status: "underway" }),
-    "Dead reckoning active",
-  );
+  assert.strictEqual(vm.drStatusText({ status: "underway" }), "DR active");
   assert.strictEqual(
     vm.drStatusText({ status: "underway", transient: true }),
-    "Dead reckoning active — tack/gybe in progress, divergence may spike temporarily.",
+    "DR active — tack/gybe, divergence may spike.",
   );
   assert.match(vm.drStatusText({ status: "idle", reason: "moored" }), /idle/);
   assert.match(

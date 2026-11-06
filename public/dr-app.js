@@ -1567,7 +1567,7 @@ class DrApp extends HTMLElement {
         // beat angle question.
         this.snap.sailing = value === "sailing";
         // Re-render the DR status line — its wording depends on the
-        // vessel state ("DR warm — moored").
+        // vessel state ("DR warm (moored)").
         if (this.drStateValue) this.renderDrState(this.drStateValue);
         break;
       case "navigation.deadReckoning.state":

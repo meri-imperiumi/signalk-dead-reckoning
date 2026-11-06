@@ -687,26 +687,26 @@ export function drStatusText(s) {
     if (s.moving) {
       // Idle while making way — the dangerous case (fouled paddlewheel,
       // sensor dropout): DR is stale, not merely paused.
-      return `⚠ DR stale — ${reason}, but the vessel is making way. DR position is NOT tracking; uncertainty is growing.`;
+      return `⚠ DR stale (${reason}) — vessel moving, position not tracking.`;
     }
-    return `Dead reckoning idle — ${reason}. GPS position still shown on map.`;
+    return `DR idle — ${reason}. GPS shown on map.`;
   }
   if (s.status === "underway") {
     if (s.fouled) {
-      return "⚠ Paddlewheel appears fouled — STW≈0 while making way. DR is integrating near-zero speed.";
+      return "⚠ STW fouled — DR not advancing.";
     }
     if (s.transient) {
-      return "Dead reckoning active — tack/gybe in progress, divergence may spike temporarily.";
+      return "DR active — tack/gybe, divergence may spike.";
     }
-    return "Dead reckoning active";
+    return "DR active";
   }
   if (s.status === "warm") {
     // The engine runs warm on a tied-up boat (SPEC §5 — instant OVERRIDE
     // handoff): integrating an honest 0 kn is not "underway".
     if (s.fouled) {
-      return "⚠ Paddlewheel appears fouled — STW≈0 while making way. DR is integrating near-zero speed.";
+      return "⚠ STW fouled — DR not advancing.";
     }
-    return `DR warm — ${s.navState ?? "moored"}, integrating sensors`;
+    return `DR warm (${s.navState ?? "moored"})`;
   }
   return null;
 }
