@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-08
+
 ### Added
 - [speedandcurrent](https://github.com/Asw1n/speedandcurrent) is now a recommended companion plugin: it learns a heel- and speed-aware paddlewheel correction table (per-cell Kalman fusion) and publishes corrected STW, `navigation.leewayAngle` and a current estimate while GPS is trusted. Note both plugins may publish corrected `navigation.speedThroughWater` — set Signal K source priority so one wins.
 - **Companion leeway consumption** (`plugin/leeway-source.js`, SPEC §3.2/§6.1): when a fresh, plausible `navigation.leewayAngle` is on the bus, it drives the shadow boat in place of the matrix lookup — a working measurement outranks a model. Freshness window 15 s, plausibility bound |leeway| ≤ 15° (the companion's slow current smoother can leak lateral tide-race current into its leeway, same failure shape as ours). Sign convention and units verified: rad, starboard-positive, matching the matrix — rad→deg only, no flip. Matrix training continues independently so the fallback stays warm when the companion is removed; absent companion changes nothing.
