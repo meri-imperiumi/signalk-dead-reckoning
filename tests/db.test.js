@@ -70,6 +70,66 @@ test("openDatabase records the schema version in dr_state_store", () => {
   db.close();
 });
 
+test("v3 column migration adds entered-bearing provenance to an existing DB in place", () => {
+  const path = join(tempDir, "v3-bearing-provenance.sqlite");
+  // Create a current database, then strip the entered-bearing columns
+  // to simulate one written by a pre-v3 build (schema v2 era).
+  const fresh = openDatabase(path);
+  fresh.close();
+  const old = new DatabaseSync(path);
+  for (const column of ["bearing_raw_deg", "bearing_ref", "variation_deg"]) {
+    old.exec(`ALTER TABLE lines_of_position DROP COLUMN ${column}`);
+  }
+  // A bearing LOP recorded before the update: no provenance.
+  old
+    .prepare(
+      `INSERT INTO lines_of_position (
+         timestamp, lop_type, assumed_lat, assumed_lon, azimuth_true,
+         intercept_nm, body_or_object
+       ) VALUES ('2026-01-01T12:00:00Z', 'bearing', 60, 24, 296, 0, 'lighthouse')`,
+    )
+    .run();
+  old.close();
+
+  // Reopening with the new build migrates in place.
+  const db = openDatabase(path);
+  assert.strictEqual(getState(db, "schema_version"), String(SCHEMA_VERSION));
+  const cols = db
+    .prepare("SELECT name FROM pragma_table_info('lines_of_position')")
+    .all()
+    .map((r) => r.name);
+  for (const column of ["bearing_raw_deg", "bearing_ref", "variation_deg"]) {
+    assert.ok(cols.includes(column), `column ${column} added`);
+  }
+  // The pre-migration row survived, reading with null provenance —
+  // which the logbook entry composer treats as legacy (fallback to
+  // the stored line normal − 90°).
+  const legacyId = db
+    .prepare("SELECT lop_id FROM lines_of_position")
+    .get().lop_id;
+  const legacy = getLineOfPosition(db, legacyId);
+  assert.strictEqual(legacy.body_or_object, "lighthouse");
+  assert.strictEqual(legacy.azimuth_true, 296);
+  assert.strictEqual(legacy.bearing_raw_deg, null);
+  assert.strictEqual(legacy.bearing_ref, null);
+  assert.strictEqual(legacy.variation_deg, null);
+  // New records persist the provenance through the normal API.
+  const newId = recordLineOfPosition(db, {
+    timestamp: "2026-01-02T12:00:00Z",
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 296,
+    bearing_raw_deg: 206,
+    bearing_ref: "true",
+    body_or_object: "spire",
+  });
+  const recorded = getLineOfPosition(db, newId);
+  assert.strictEqual(recorded.bearing_raw_deg, 206);
+  assert.strictEqual(recorded.bearing_ref, "true");
+  db.close();
+});
+
 test("v1 → v2 migration adds fixes.derived_from_fix_id in place", () => {
   const path = join(tempDir, "v1-migration.sqlite");
   // Hand-build a v1 database: the pre-v2 `fixes` shape (no

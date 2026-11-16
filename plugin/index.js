@@ -3019,6 +3019,20 @@ module.exports = (app) => {
         assumed_lat: b.assumed_lat,
         assumed_lon: b.assumed_lon,
         azimuth_true: b.azimuth_true,
+        // Entered-bearing provenance (schema v3): the logbook records
+        // the observation as the navigator took it — reading, its
+        // reference, and the variation used for a magnetic conversion —
+        // while `azimuth_true` stays the derived line normal.
+        bearing_raw_deg: Number.isFinite(b.bearing_raw_deg)
+          ? b.bearing_raw_deg
+          : null,
+        bearing_ref:
+          b.bearing_ref === "mag" || b.bearing_ref === "true"
+            ? b.bearing_ref
+            : null,
+        variation_deg: Number.isFinite(b.variation_deg)
+          ? b.variation_deg
+          : null,
         intercept_nm: b.intercept_nm ?? null,
         body_or_object: b.body_or_object ?? null,
         confirmed_by: b.confirmed_by ?? null,
@@ -3037,6 +3051,16 @@ module.exports = (app) => {
           // object's position is a chart feature; the logbook is ours.
           latitude: engine.origin?.latitude,
           longitude: engine.origin?.longitude,
+          bearing_raw_deg: Number.isFinite(b.bearing_raw_deg)
+            ? b.bearing_raw_deg
+            : null,
+          bearing_ref:
+            b.bearing_ref === "mag" || b.bearing_ref === "true"
+              ? b.bearing_ref
+              : null,
+          variation_deg: Number.isFinite(b.variation_deg)
+            ? b.variation_deg
+            : null,
           azimuth_true: b.azimuth_true,
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
@@ -3128,6 +3152,7 @@ module.exports = (app) => {
           longitude: engine.origin?.longitude,
           radius_nm: b.radius_nm,
           angle_deg: b.angle_deg ?? null,
+          height_m: b.height_m ?? null,
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
@@ -3268,6 +3293,10 @@ module.exports = (app) => {
             azimuth_true: result.azimuth_true,
             intercept_nm: result.intercept_nm,
           },
+          // The sextant reading is the observation — logged ahead of the
+          // derived Zn/intercept (see composeObservationEntry).
+          hs_deg: b.hs_deg ?? null,
+          index_correction_deg: b.index_correction_deg ?? null,
           sea_state:
             resolveSeaState() !== "unknown" ? Number(resolveSeaState()) : null,
         }),
@@ -3947,6 +3976,9 @@ function hydrateObservationSources(db, candidate) {
       lop_type: row.lop_type,
       body_or_object: row.body_or_object ?? null,
       azimuth_true: row.azimuth_true ?? null,
+      bearing_raw_deg: row.bearing_raw_deg ?? null,
+      bearing_ref: row.bearing_ref ?? null,
+      variation_deg: row.variation_deg ?? null,
       intercept_nm: row.intercept_nm ?? null,
     });
   }
@@ -3958,6 +3990,7 @@ function hydrateObservationSources(db, candidate) {
       cpl_type: row.cpl_type,
       source_object: row.source_object ?? null,
       radius_nm: row.radius_nm ?? null,
+      raw_angle_deg: row.raw_angle_deg ?? null,
     });
   }
   return out;

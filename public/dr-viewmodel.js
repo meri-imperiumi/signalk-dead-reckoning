@@ -1308,10 +1308,14 @@ export function verticalAngleDistanceNm(heightM, angleDeg) {
  *
  * @param {object} form - { object, bearing, bearing_ref?, variation_deg?,
  *   variation_hem?, object_lat, object_lon, sight_time?, sight_tz?, confirmed_by? }
- * @returns {object}
+ * @returns {object} body with `azimuth_true` (the derived line normal) plus
+ *   `bearing_raw_deg`/`bearing_ref`/`variation_deg` — the entered reading and
+ *   its provenance, for the logbook to record the observation as taken
  */
 export function bearingLopBody(form) {
   const bearing = bearingFromFormTrue(form);
+  const ref = form.bearing_ref === "mag" ? "mag" : "true";
+  const variation = variationFromForm(form);
   const body = {
     // A radar-derived bearing is recorded with its own provenance (work
     // doc #33) — same geometry as a hand-bearing compass (a ray to the
@@ -1321,6 +1325,14 @@ export function bearingLopBody(form) {
     assumed_lon: Number(form.object_lon),
     // +90° so the line runs along the bearing (engine normal ⊥ line).
     azimuth_true: (bearing + 90) % 360,
+    // Logbook provenance: the reading exactly as entered, its reference,
+    // and the variation used for a magnetic conversion — the log records
+    // the observation, not just the derived true bearing.
+    bearing_raw_deg: Number(form.bearing),
+    bearing_ref: ref,
+    ...(ref === "mag" && Number.isFinite(variation)
+      ? { variation_deg: variation }
+      : {}),
     intercept_nm: 0,
     body_or_object: form.object || null,
     confirmed_by: form.confirmed_by || null,

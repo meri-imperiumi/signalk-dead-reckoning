@@ -9,7 +9,7 @@ const assert = require("node:assert/strict");
 
 const {
   seaStateBeaufort,
-  formatBearingTrue,
+  formatBearing,
   observationSources,
   composeFixEntry,
   composeTackEntry,
@@ -175,13 +175,16 @@ test("composeFixEntry: unknown sea_state emits no seaState pathvalue", () => {
   assert.strictEqual(pv(body, "environment.water.seaState").length, 0);
 });
 
-test("formatBearingTrue: zero-padded, normalized to 0-359, true notation", () => {
-  assert.strictEqual(formatBearingTrue(0), "000°T");
-  assert.strictEqual(formatBearingTrue(9.4), "009°T");
-  assert.strictEqual(formatBearingTrue(47.2), "047°T");
-  assert.strictEqual(formatBearingTrue(360), "000°T");
-  assert.strictEqual(formatBearingTrue(370), "010°T");
-  assert.strictEqual(formatBearingTrue(-90), "270°T");
+test("formatBearing: zero-padded, normalized to 0-359, reference suffix", () => {
+  assert.strictEqual(formatBearing(0), "000°T");
+  assert.strictEqual(formatBearing(9.4), "009°T");
+  assert.strictEqual(formatBearing(47.2), "047°T");
+  assert.strictEqual(formatBearing(360), "000°T");
+  assert.strictEqual(formatBearing(370), "010°T");
+  assert.strictEqual(formatBearing(-90), "270°T");
+  // Magnetic entries carry the reference the navigator read.
+  assert.strictEqual(formatBearing(116.8, "mag"), "117°M");
+  assert.strictEqual(formatBearing(45, "mag"), "045°M");
 });
 
 test("observationSources: shapes bearing LOPs, celestial sights, CPLs", () => {
@@ -190,7 +193,12 @@ test("observationSources: shapes bearing LOPs, celestial sights, CPLs", () => {
       kind: "lop",
       lop_type: "bearing",
       body_or_object: "Aitutaki Atoll",
-      azimuth_true: 123,
+      // Entered reading: 116°M converted with 4°E variation (→ 120°T,
+      // stored as line normal 210). The log records the reading.
+      bearing_raw_deg: 116,
+      bearing_ref: "mag",
+      variation_deg: 4,
+      azimuth_true: 210,
     },
     { kind: "lop", lop_type: "celestial", body_or_object: "Sun" },
     {
@@ -201,10 +209,34 @@ test("observationSources: shapes bearing LOPs, celestial sights, CPLs", () => {
     },
   ]);
   assert.deepStrictEqual(out, [
-    "Aitutaki Atoll bearing 123°T",
+    "Aitutaki Atoll bearing 116°M (var 4°E)",
     "Sun sight",
     "lighthouse CPL 0.4 NM",
   ]);
+  // A horizontal-angle CPL's observation is the measured sextant angle,
+  // not the derived radius.
+  const hangle = observationSources([
+    {
+      kind: "cpl",
+      cpl_type: "horizontal-angle",
+      source_object: "Lighthouse / Tower",
+      radius_nm: 1.8,
+      raw_angle_deg: 45.5,
+    },
+  ]);
+  assert.deepStrictEqual(hangle, ["Lighthouse / Tower angle 45.5°"]);
+  // Without the raw angle it falls back to the radius.
+  // A row with only the stored line normal (legacy data) falls back to
+  // the derived true bearing: normal 213 → 123°T.
+  const legacy = observationSources([
+    {
+      kind: "lop",
+      lop_type: "bearing",
+      body_or_object: "Aitutaki Atoll",
+      azimuth_true: 213,
+    },
+  ]);
+  assert.deepStrictEqual(legacy, ["Aitutaki Atoll bearing 123°T"]);
   assert.deepStrictEqual(observationSources(null), []);
   assert.deepStrictEqual(observationSources(undefined), []);
 });
@@ -223,20 +255,27 @@ test("composeFixEntry: manual fix from bearing observations lists the sources", 
         kind: "lop",
         lop_type: "bearing",
         body_or_object: "Aitutaki Atoll",
-        azimuth_true: 123,
+        // Entered provenance: 116°M with 4°E variation; and a true
+        // entry of 321°T (stored normal 51 wraps through 0).
+        bearing_raw_deg: 116,
+        bearing_ref: "mag",
+        variation_deg: 4,
+        azimuth_true: 210,
       },
       {
         kind: "lop",
         lop_type: "bearing",
         body_or_object: "Vessel Foo",
-        azimuth_true: 321,
+        bearing_raw_deg: 321,
+        bearing_ref: "true",
+        azimuth_true: 51,
       },
     ],
   });
   assert.strictEqual(body.author, "bergie");
   // Sources named, coordinates & author kept out of the text.
   assert.ok(
-    /Manual fix from Aitutaki Atoll bearing 123°T, Vessel Foo bearing 321°T/.test(
+    /Manual fix from Aitutaki Atoll bearing 116°M \(var 4°E\), Vessel Foo bearing 321°T/.test(
       body.text,
     ),
   );
@@ -278,7 +317,7 @@ test("composeTackEntry: text, category, origin; heading zero-padded", () => {
     newHeadingDeg: 45,
     datetime: "2026-08-24T12:00:00.000Z",
   });
-  assert.strictEqual(tack.text, "Tack to 045°");
+  assert.strictEqual(tack.text, "Tack to 045°T");
   assert.strictEqual(tack.category, "navigation");
   // Pure automation, no human in the loop: 'auto'.
   assert.strictEqual(tack.origin, "auto");
@@ -290,7 +329,7 @@ test("composeTackEntry: text, category, origin; heading zero-padded", () => {
     datetime: "2026-08-24T12:00:00.000Z",
     sea_state: 2,
   });
-  assert.strictEqual(gybe.text, "Gybe to 190°");
+  assert.strictEqual(gybe.text, "Gybe to 190°T");
   assert.strictEqual(pv1(gybe, "environment.water.seaState"), 2);
 });
 
@@ -357,6 +396,9 @@ test("composeObservationEntry: celestial sight with reduction", () => {
     confirmed_by: "Alice",
     latitude: 60,
     longitude: 24,
+    // The sextant reading leads the specifics — it is the observation.
+    hs_deg: 47.34,
+    index_correction_deg: -0.4,
     reduction: { azimuth_true: 180, intercept_nm: 2.5 },
     sea_state: 3,
   });
@@ -370,25 +412,77 @@ test("composeObservationEntry: celestial sight with reduction", () => {
     /by Alice/,
     "author stays in metadata, not text",
   );
+  assert.match(body.text, /Hs 47\.3° \(IC -0\.4°\)/);
   assert.match(body.text, /Zn 180\.0/);
   assert.match(body.text, /intercept 2\.50 NM toward/);
   assert.strictEqual(pv1(body, "navigation.position").source, "Celestial");
   assert.strictEqual(pv1(body, "environment.water.seaState"), 3);
+  // A zero intercept — meridian altitude (noon sight) — has no
+  // direction to state, so the intercept clause is left out.
+  const noon = composeObservationEntry({
+    kind: "celestial",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "Sun",
+    hs_deg: 78.4,
+    reduction: { azimuth_true: 180, intercept_nm: 0 },
+  });
+  assert.match(noon.text, /Sun sight, Hs 78\.4°, Zn 180\.0°$/);
+  assert.ok(!/intercept/.test(noon.text));
 });
 
-test("composeObservationEntry: bearing LOP names the object and the bearing", () => {
+test("composeObservationEntry: bearing LOP logs the reading as taken", () => {
+  // Magnetic entry: the log records the compass reading and the
+  // variation used, not the derived true bearing.
   const body = composeObservationEntry({
     kind: "bearing",
     datetime: "2026-01-01T12:00:00Z",
     body_or_object: "lighthouse",
-    azimuth_true: 47.2,
+    bearing_raw_deg: 116.8,
+    bearing_ref: "mag",
+    variation_deg: 4,
+    azimuth_true: 210.8,
     confirmed_by: null,
     latitude: 60,
     longitude: 24,
   });
-  assert.match(body.text, /lighthouse bearing 047°T/);
+  assert.match(body.text, /lighthouse bearing 117°M \(var 4°E\)/);
   assert.strictEqual(body.author, undefined);
   assert.strictEqual(pv1(body, "navigation.position").source, "DR");
+  // True entry: no variation note, "°T" suffix.
+  const trueRef = composeObservationEntry({
+    kind: "bearing",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "beacon",
+    bearing_raw_deg: 45,
+    bearing_ref: "true",
+    latitude: 60,
+    longitude: 24,
+  });
+  assert.match(trueRef.text, /beacon bearing 045°T/);
+});
+
+test("composeObservationEntry: bearing falls back to the stored line normal", () => {
+  // Legacy rows carry only `azimuth_true` — the stored line normal
+  // (measured bearing + 90°). The fallback derives the true bearing:
+  // 137.2 → 047°T; wrapping below 0: 10° → 280°T.
+  const body = composeObservationEntry({
+    kind: "bearing",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "lighthouse",
+    azimuth_true: 137.2,
+    latitude: 60,
+    longitude: 24,
+  });
+  assert.match(body.text, /lighthouse bearing 047°T/);
+  const wrapped = composeObservationEntry({
+    kind: "bearing",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "beacon",
+    azimuth_true: 10,
+    latitude: 60,
+    longitude: 24,
+  });
+  assert.match(wrapped.text, /beacon bearing 280°T/);
 });
 
 test("composeObservationEntry: coordinates stay in the position pathvalue, not text", () => {
@@ -396,7 +490,9 @@ test("composeObservationEntry: coordinates stay in the position pathvalue, not t
     kind: "bearing",
     datetime: "2026-01-01T12:00:00Z",
     body_or_object: "Vessel COULD BE WORSE",
-    azimuth_true: 90,
+    // Entered reading, referenced true.
+    bearing_raw_deg: 90,
+    bearing_ref: "true",
     latitude: -18.8651,
     longitude: -159.8008,
   });
@@ -416,6 +512,17 @@ test("composeObservationEntry: vertical-angle CPL carries its radius", () => {
   });
   assert.match(body.text, /lighthouse CPL 0.4 NM/);
   assert.strictEqual(body.telemetry, undefined);
+  // The measured sextant angle over the charted height rides along —
+  // the distance is derived from those inputs.
+  const measured = composeObservationEntry({
+    kind: "vertical",
+    datetime: "2026-01-01T12:00:00Z",
+    body_or_object: "lighthouse",
+    radius_nm: 0.42,
+    angle_deg: 2.1,
+    height_m: 30,
+  });
+  assert.match(measured.text, /lighthouse CPL 0\.4 NM \(angle 2\.1° on 30 m\)/);
 });
 
 test("composeObservationEntry: intercept away when negative", () => {

@@ -468,6 +468,11 @@ test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing 
   // +90° so the engine's perpendicular-line convention yields a line
   // running along the bearing.
   assert.strictEqual(body.azimuth_true, 135);
+  // Entered-bearing provenance rides along for the logbook: the reading
+  // as entered, referenced true, no variation involved.
+  assert.strictEqual(body.bearing_raw_deg, 45);
+  assert.strictEqual(body.bearing_ref, "true");
+  assert.ok(!("variation_deg" in body));
   assert.strictEqual(body.intercept_nm, 0);
   // Object position is the assumed (line passes through the object).
   assert.strictEqual(body.assumed_lat, 60);
@@ -497,6 +502,11 @@ test("bearingLopBody: object position as assumed, azimuth +90 for along-bearing 
     object_lon: 24,
   });
   assert.strictEqual(magBody.azimuth_true, 145);
+  // The magnetic provenance is preserved: the logbook records the
+  // reading as taken (45°M) plus the variation used (10°E).
+  assert.strictEqual(magBody.bearing_raw_deg, 45);
+  assert.strictEqual(magBody.bearing_ref, "mag");
+  assert.strictEqual(magBody.variation_deg, 10);
   // …and magnetic without variation refuses rather than guessing.
   assert.throws(
     () =>
@@ -1040,6 +1050,10 @@ test("bearingLopBody: radar instrument records radar-bearing provenance", async 
   });
   assert.strictEqual(body.lop_type, "radar-bearing");
   assert.strictEqual(body.azimuth_true, 205.5);
+  // Radar bearings are true-referenced — provenance says so.
+  assert.strictEqual(body.bearing_raw_deg, 115.5);
+  assert.strictEqual(body.bearing_ref, "true");
+  assert.ok(!("variation_deg" in body));
   // Same geometry as a hand-compass bearing — only provenance differs.
   const hand = vm.bearingLopBody({
     object: "MATILDA",

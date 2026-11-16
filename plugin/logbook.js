@@ -85,17 +85,6 @@ function pathvalue(path, value) {
 }
 
 /**
- * Rounds a number to `places` decimals, returning null for non-finite.
- *
- * @param {number|null|undefined} n
- * @param {number} places
- * @returns {number|null}
- */
-function round(n, places) {
-  return Number.isFinite(n) ? Number(n.toFixed(places)) : null;
-}
-
-/**
  * Composes a `logentries`-shaped entry body for a confirmed fix (SPEC
  * §9.5 mapping, resources schema). Structured data rides the SI
  * telemetry pathvalues; the free-text `text` carries only what those
@@ -117,8 +106,12 @@ function round(n, places) {
  *   (fallback when `observations` rows aren't supplied)
  * @param {Array<object>|null} [f.observations] - hydrated LOP/CPL rows that
  *   resolved into the fix, shaped as {kind, lop_type|cpl_type,
- *   body_or_object|source_object, azimuth_true?, radius_nm?}; named per-source
- *   in `text` so the logbook records what produced the fix
+ *   body_or_object|source_object, azimuth_true?, bearing_raw_deg?,
+ *   bearing_ref?, variation_deg?, radius_nm?, raw_angle_deg?}; named
+ *   per-source in `text` so the logbook records what produced the fix —
+ *   bearing rows log the entered reading + reference (+ variation when
+ *   magnetic), falling back to the stored line normal − 90° when the
+ *   entered value is absent; horizontal-angle CPLs log the measured angle)
  * @param {number|null} [f.stw_kn]
  * @param {number|null} [f.sog_kn]
  * @param {number|null} [f.heading_deg]
@@ -177,17 +170,79 @@ function composeFixEntry(f) {
 }
 
 /**
- * Formats a true bearing as a zero-padded "090°T" string — the standard
- * nautical abbreviation ("T" for true; "M" for magnetic). Bearings are
- * stored degrees-true and no magnetic-variation source is subscribed, so
- * only true bearings are emitted.
+ * Formats a bearing as a zero-padded "090°T" / "090°M" string — the
+ * standard nautical abbreviations ("T" for true, "M" for magnetic
+ * compass reading). The suffix follows the bearing's own reference, so
+ * the log records what the navigator actually read.
  *
  * @param {number} deg
+ * @param {"true"|"mag"} [ref="true"]
  * @returns {string}
  */
-function formatBearingTrue(deg) {
+function formatBearing(deg, ref = "true") {
   const b = ((Math.round(deg) % 360) + 360) % 360;
-  return `${String(b).padStart(3, "0")}°T`;
+  return `${String(b).padStart(3, "0")}°${ref === "mag" ? "M" : "T"}`;
+}
+
+/**
+ * Formats magnetic variation as a "var 4°E" / "var 3.5°W" note — the
+ * conventional logbook shorthand, east/west per the sign convention
+ * (east positive) used at submission.
+ *
+ * @param {number} deg - signed variation, east positive
+ * @returns {string}
+ */
+function formatVariation(deg) {
+  const mag = Math.abs(deg);
+  const value = Number.isInteger(mag) ? String(mag) : mag.toFixed(1);
+  return `var ${value}°${deg < 0 ? "W" : "E"}`;
+}
+
+/**
+ * Measured bearing from a bearing LOP's stored `azimuth_true`. Bearing
+ * rows keep the line's *normal* in `azimuth_true` — the engine's LOP
+ * convention is a line through the anchor perpendicular to the azimuth,
+ * so the webapp submits bearing + 90° (celestial Zn is stored
+ * unrotated). The angle the navigator read off the compass is the
+ * stored value − 90°; logging the stored value would put a bearing
+ * 90° off into the book while the chart draws the LoP correctly.
+ *
+ * @param {number} azimuthTrue - stored line normal, deg true
+ * @returns {number} measured true bearing, deg 0–360
+ */
+function bearingFromNormal(azimuthTrue) {
+  return (((azimuthTrue - 90) % 360) + 360) % 360;
+}
+
+/**
+ * The " bearing …" fragment for a bearing observation. Logs what the
+ * navigator actually entered — the compass reading and its reference,
+ * plus the variation used when the entry was magnetic — rather than
+ * only the derived true bearing. Falls back to the stored line normal
+ * (azimuth_true − 90°, degrees true) for rows recorded before the
+ * entered-bearing provenance columns existed.
+ *
+ * @param {object} o - observation (submission or hydrated LOP row)
+ * @param {number|null} [o.bearing_raw_deg] - bearing as entered, deg
+ * @param {"true"|"mag"} [o.bearing_ref] - reference of the entered bearing
+ * @param {number|null} [o.variation_deg] - variation applied to a magnetic
+ *   entry, east positive
+ * @param {number|null} [o.azimuth_true] - stored line normal, deg true
+ * @returns {string} " 047°T"-style suffix, or "" when nothing is known
+ */
+function bearingEntrySuffix(o) {
+  if (Number.isFinite(o.bearing_raw_deg)) {
+    const ref = o.bearing_ref === "mag" ? "mag" : "true";
+    let suffix = ` ${formatBearing(o.bearing_raw_deg, ref)}`;
+    if (ref === "mag" && Number.isFinite(o.variation_deg)) {
+      suffix += ` (${formatVariation(o.variation_deg)})`;
+    }
+    return suffix;
+  }
+  if (Number.isFinite(o.azimuth_true)) {
+    return ` ${formatBearing(bearingFromNormal(o.azimuth_true))}`;
+  }
+  return "";
 }
 
 /**
@@ -195,7 +250,7 @@ function formatBearingTrue(deg) {
  * fragments for the entry text — the navigable context the structured
  * `position` field can't carry (it holds only the fix's own coordinates).
  * One fragment per observation:
- *   - bearing LOP:   "Aitutaki Atoll bearing 123°T"
+ *   - bearing LOP:   "Aitutaki Atoll bearing 116°M (var 4°E)"
  *   - celestial LOP: "Sun sight"
  *   - vertical CPL:  "lighthouse CPL 0.4 NM"
  *
@@ -214,6 +269,12 @@ function observationSources(observations) {
 function observationSourceLabel(o) {
   if (o.kind === "cpl") {
     const obj = o.source_object ?? "object";
+    // A horizontal-angle CPL's observation is the sextant angle — the
+    // radius is derived from it, so the measured angle is what the
+    // source list names (mirrors the per-entry text).
+    if (o.cpl_type === "horizontal-angle" && Number.isFinite(o.raw_angle_deg)) {
+      return `${obj} angle ${o.raw_angle_deg.toFixed(1)}°`;
+    }
     const r = Number.isFinite(o.radius_nm)
       ? ` ${o.radius_nm.toFixed(1)} NM`
       : "";
@@ -223,10 +284,7 @@ function observationSourceLabel(o) {
     return `${o.body_or_object ?? "Body"} sight`;
   }
   const obj = o.body_or_object ?? "object";
-  const b = Number.isFinite(o.azimuth_true)
-    ? ` bearing ${formatBearingTrue(o.azimuth_true)}`
-    : "";
-  return `${obj}${b}`;
+  return `${obj} bearing${bearingEntrySuffix(o)}`;
 }
 
 /**
@@ -292,7 +350,7 @@ function deviationClause(f) {
   if (!Number.isFinite(f.deviation_nm)) return "";
   const dist = f.deviation_nm.toFixed(1);
   const at = Number.isFinite(f.deviation_bearing)
-    ? ` at ${formatBearingTrue(f.deviation_bearing)}`
+    ? ` at ${formatBearing(f.deviation_bearing)}`
     : "";
   return `, ${dist} NM${at} from DR`;
 }
@@ -304,17 +362,17 @@ function deviationClause(f) {
  *
  * @param {object} t
  * @param {"tack"|"gybe"} t.direction
- * @param {number} t.newHeadingDeg - stabilized post-maneuver heading
+ * @param {number} t.newHeadingDeg - stabilized post-maneuver heading, deg
+ *   true (logged with the °T reference, like every other angle in the book)
  * @param {string} t.datetime - ISO timestamp of the maneuver completion
  * @param {number|null} [t.sea_state] - Douglas sea state code 0-9
  * @returns {object} setResource body
  */
 function composeTackEntry(t) {
-  const heading = round(t.newHeadingDeg, 0);
   const text =
     t.direction === "gybe"
-      ? `Gybe to ${String(heading).padStart(3, "0")}°`
-      : `Tack to ${String(heading).padStart(3, "0")}°`;
+      ? `Gybe to ${formatBearing(t.newHeadingDeg)}`
+      : `Tack to ${formatBearing(t.newHeadingDeg)}`;
   const body = {
     datetime: t.datetime,
     text,
@@ -348,8 +406,21 @@ function composeTackEntry(t) {
  * @param {number} [o.latitude] - vessel position to anchor the entry
  * @param {number} [o.longitude]
  * @param {object} [o.reduction] - celestial reduction (Hc/Ho/Zn/intercept)
- * @param {number|null} [o.azimuth_true] - true bearing to the object, deg
- *   (bearing LOPs — the observed angle is the event, it belongs in text)
+ * @param {number|null} [o.hs_deg] - raw sextant altitude, deg (celestial —
+ *   the reading is the observation; the reduction is reconstruction)
+ * @param {number|null} [o.index_correction_deg] - index correction applied
+ *   to Hs, deg (celestial — noted so the correction stays auditable)
+ * @param {number|null} [o.height_m] - charted object height the vertical
+ *   angle was measured over, m (vertical-angle CPLs)
+ * @param {number|null} [o.bearing_raw_deg] - bearing as the navigator entered
+ *   it, deg — logged in preference to the derived true bearing (the
+ *   observation is the event; the conversion is reconstruction)
+ * @param {"true"|"mag"} [o.bearing_ref] - reference of the entered bearing
+ * @param {number|null} [o.variation_deg] - variation applied to a magnetic
+ *   entry, east positive (noted in text so the conversion stays auditable)
+ * @param {number|null} [o.azimuth_true] - bearing LOP's stored line
+ *   normal, deg true — fallback for rows without the entered value (the
+ *   measured true bearing is that − 90°, see {@link bearingFromNormal})
  * @param {number|null} [o.radius_nm] - CPL radius, nm (vertical-angle / radar
  *   range CPLs)
  * @param {number|null} [o.angle_deg] - measured horizontal angle, deg
@@ -363,20 +434,42 @@ function composeObservationEntry(o) {
   let text;
   if (o.kind === "celestial") {
     const r = o.reduction ?? {};
-    const ic = Number.isFinite(r.intercept_nm)
-      ? `, intercept ${Math.abs(r.intercept_nm).toFixed(2)} NM ${
-          r.intercept_nm >= 0 ? "toward" : "away"
-        }`
+    // The sextant reading is the observation — Zn and the intercept are
+    // derived from it, so the raw Hs (with the index correction applied
+    // to it) leads the specifics. A zero intercept (meridian altitude /
+    // noon sight) has no direction to state and is left out.
+    const ic =
+      Number.isFinite(o.index_correction_deg) && o.index_correction_deg !== 0
+        ? ` (IC ${o.index_correction_deg >= 0 ? "+" : "-"}${Math.abs(
+            o.index_correction_deg,
+          ).toFixed(1)}°)`
+        : "";
+    const hs = Number.isFinite(o.hs_deg)
+      ? `, Hs ${o.hs_deg.toFixed(1)}°${ic}`
       : "";
     const zn = Number.isFinite(r.azimuth_true)
       ? `, Zn ${r.azimuth_true.toFixed(1)}°`
       : "";
-    text = `${o.body_or_object ?? "Body"} sight${zn}${ic}`;
+    const intercept =
+      Number.isFinite(r.intercept_nm) && Math.abs(r.intercept_nm) >= 0.005
+        ? `, intercept ${Math.abs(r.intercept_nm).toFixed(2)} NM ${
+            r.intercept_nm >= 0 ? "toward" : "away"
+          }`
+        : "";
+    text = `${o.body_or_object ?? "Body"} sight${hs}${zn}${intercept}`;
   } else if (o.kind === "vertical") {
     const r = Number.isFinite(o.radius_nm)
       ? ` ${o.radius_nm.toFixed(1)} NM`
       : "";
-    text = `${o.body_or_object ?? "object"} CPL${r}`;
+    // The sextant angle over the object's charted height is what was
+    // measured — the distance is derived from it (height / tan angle) —
+    // so both measured inputs ride along with the radius.
+    const measured = Number.isFinite(o.angle_deg)
+      ? ` (angle ${o.angle_deg.toFixed(1)}°${
+          Number.isFinite(o.height_m) ? ` on ${o.height_m} m` : ""
+        })`
+      : "";
+    text = `${o.body_or_object ?? "object"} CPL${r}${measured}`;
   } else if (o.kind === "radar") {
     const r = Number.isFinite(o.radius_nm)
       ? ` ${o.radius_nm.toFixed(1)} NM`
@@ -387,13 +480,11 @@ function composeObservationEntry(o) {
     text = `${o.body_or_object ?? "objects"} horizontal angle${a}`;
   } else {
     // The observed angle is the event — a bearing entry without it
-    // isn't navigable after the fact. Zero-padded like the tack text;
-    // "°T" is the standard nautical abbreviation for true (bearings are
-    // stored degrees-true — magnetic entries are converted at submit).
-    const b = Number.isFinite(o.azimuth_true)
-      ? ` ${String(((Math.round(o.azimuth_true) % 360) + 360) % 360).padStart(3, "0")}°T`
-      : "";
-    text = `${o.body_or_object ?? "object"} bearing${b}`;
+    // isn't navigable after the fact. Log what was entered (reading +
+    // reference, variation for a magnetic entry) via the shared
+    // suffix helper; it falls back to the stored line normal − 90°
+    // for legacy rows.
+    text = `${o.body_or_object ?? "object"} bearing${bearingEntrySuffix(o)}`;
   }
   const body = {
     datetime: o.datetime,
@@ -481,7 +572,7 @@ async function probeLogbookProvider(resourcesApi) {
 module.exports = {
   POSITION_SOURCE,
   seaStateBeaufort,
-  formatBearingTrue,
+  formatBearing,
   observationSources,
   composeFixEntry,
   composeFixText,

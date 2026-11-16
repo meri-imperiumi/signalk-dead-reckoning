@@ -3009,7 +3009,12 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
     lop_type: "bearing",
     assumed_lat: 60,
     assumed_lon: 24,
-    azimuth_true: 116,
+    // Geometrically consistent fixture: from the seeded DR position
+    // (61, 25) the lighthouse at (60, 24) bears ~206°T — the line normal
+    // is that + 90 — and the logbook records the reading as entered.
+    azimuth_true: 296,
+    bearing_raw_deg: 206,
+    bearing_ref: "true",
     body_or_object: "lighthouse",
   });
   assert.strictEqual(status, 200);
@@ -3021,7 +3026,7 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
   );
   const entry = record.entries[0].value;
   assert.strictEqual(entry.category, "navigation");
-  assert.match(entry.text, /lighthouse bearing 116°T/);
+  assert.match(entry.text, /lighthouse bearing 206°T/);
   const position = entry.telemetry.find(
     (t) => t.path === "navigation.position",
   ).value;
@@ -3030,6 +3035,51 @@ test("logbook: posting a bearing LOP writes an observation entry", async () => {
   // position (assumed_lat/lon 60,24 is the lighthouse).
   assert.strictEqual(position.latitude, 61);
   assert.strictEqual(position.longitude, 25);
+  plugin.stop();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("logbook: a magnetic bearing entry logs the reading as taken, with variation", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dr-lb-mag-"));
+  const app = new FakeSignalKApp();
+  app.dataPath = dir;
+  const { record } = app.registerLogbookProvider();
+  const plugin = makePlugin(app);
+  plugin.start({ logbook: { enabled: true } });
+  const router = new FakeRouter();
+  plugin.registerWithRouter(router);
+  app.emitDelta({
+    context: "vessels.self",
+    updates: [
+      {
+        values: [
+          {
+            path: "navigation.position",
+            value: { latitude: 61, longitude: 25 },
+          },
+        ],
+      },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  // 202°M read off the hand-bearing compass (from (61, 25) the
+  // lighthouse at (60, 24) bears ~206°T), converted with 4°E variation
+  // → 206°T → line normal 296. The log records the reading.
+  const { status } = router.invoke("post", "/fix/lop", {
+    lop_type: "bearing",
+    assumed_lat: 60,
+    assumed_lon: 24,
+    azimuth_true: 296,
+    bearing_raw_deg: 202,
+    bearing_ref: "mag",
+    variation_deg: 4,
+    body_or_object: "lighthouse",
+  });
+  assert.strictEqual(status, 200);
+  await new Promise((r) => setTimeout(r, 100));
+  const entry = record.entries[0].value;
+  assert.match(entry.text, /lighthouse bearing 202°M \(var 4°E\)/);
+  assert.ok(!/°T/.test(entry.text));
   plugin.stop();
   await rm(dir, { recursive: true, force: true });
 });
@@ -3081,6 +3131,9 @@ test("logbook: posting a celestial sight writes a sight entry with reduction", a
   assert.strictEqual(position.latitude, 40);
   assert.strictEqual(position.longitude, -70);
   assert.match(entry.text, /Sun sight/);
+  // The sextant reading leads the specifics — the observation, not the
+  // derived reduction.
+  assert.match(entry.text, /Hs 45\.0°/);
   assert.match(entry.text, /intercept/);
   plugin.stop();
   await rm(dir, { recursive: true, force: true });

@@ -84,6 +84,9 @@ const SCHEMA_DDL = [
     assumed_lat REAL NOT NULL,
     assumed_lon REAL NOT NULL,
     azimuth_true REAL NOT NULL,
+    bearing_raw_deg REAL,
+    bearing_ref TEXT,
+    variation_deg REAL,
     intercept_nm REAL,
     body_or_object TEXT,
     confirmed_by TEXT,
@@ -299,6 +302,25 @@ const COLUMN_MIGRATIONS = [
     column: "object_height_m",
     ddl: "ALTER TABLE circular_position_lines ADD COLUMN object_height_m REAL",
   },
+  // Schema v3 (entered-bearing provenance): persist the bearing exactly
+  // as the navigator entered it — reading, reference, and the variation
+  // used for a magnetic conversion — so the logbook records the
+  // observation rather than a derived reconstruction of it.
+  {
+    table: "lines_of_position",
+    column: "bearing_raw_deg",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN bearing_raw_deg REAL",
+  },
+  {
+    table: "lines_of_position",
+    column: "bearing_ref",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN bearing_ref TEXT",
+  },
+  {
+    table: "lines_of_position",
+    column: "variation_deg",
+    ddl: "ALTER TABLE lines_of_position ADD COLUMN variation_deg REAL",
+  },
 ];
 
 /**
@@ -503,7 +525,12 @@ function recordFix(db, r) {
  * @param {string} r.lop_type - 'celestial' | 'bearing' | 'rdf'
  * @param {number} r.assumed_lat - assumed position latitude (celestial) or observer latitude (bearing/rdf)
  * @param {number} r.assumed_lon - assumed position longitude
- * @param {number} r.azimuth_true - Zn (celestial) or measured bearing (deg true)
+ * @param {number} r.azimuth_true - Zn (celestial) or the line's normal
+ *   (bearing rotated +90°; the stored value is not the compass reading)
+ * @param {number} [r.bearing_raw_deg] - bearing exactly as entered (deg)
+ * @param {"true"|"mag"} [r.bearing_ref] - reference of the entered bearing
+ * @param {number} [r.variation_deg] - variation applied to a magnetic entry,
+ *   east positive
  * @param {number} [r.intercept_nm] - signed intercept, toward/away — celestial only
  * @param {string} [r.body_or_object] - 'Sun LL', 'Polaris', 'Radio Antenna XYZ'
  * @param {string} [r.confirmed_by]
@@ -513,9 +540,10 @@ function recordLineOfPosition(db, r) {
   const stmt = db.prepare(
     `INSERT INTO lines_of_position (
        timestamp, lop_type, assumed_lat, assumed_lon, azimuth_true,
+       bearing_raw_deg, bearing_ref, variation_deg,
        intercept_nm, body_or_object, confirmed_by,
        raw_hs_deg, index_correction_deg, eye_height_m, limb, ho_deg, hc_deg
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const info = stmt.run(
     r.timestamp,
@@ -523,6 +551,11 @@ function recordLineOfPosition(db, r) {
     r.assumed_lat,
     r.assumed_lon,
     r.azimuth_true,
+    // Entered-bearing provenance (schema v3): the logbook records the
+    // observation as taken, not a derived reconstruction.
+    r.bearing_raw_deg ?? null,
+    r.bearing_ref ?? null,
+    r.variation_deg ?? null,
     r.intercept_nm ?? null,
     r.body_or_object ?? null,
     r.confirmed_by ?? null,
@@ -777,7 +810,8 @@ function getLineOfPosition(db, id) {
   return db
     .prepare(
       `SELECT lop_id, timestamp, lop_type, assumed_lat, assumed_lon,
-              azimuth_true, intercept_nm, body_or_object, used_in_fix_id
+              azimuth_true, bearing_raw_deg, bearing_ref, variation_deg,
+              intercept_nm, body_or_object, used_in_fix_id
        FROM lines_of_position WHERE lop_id = ?`,
     )
     .get(id);
@@ -794,7 +828,8 @@ function getCircularPositionLine(db, id) {
   return db
     .prepare(
       `SELECT cpl_id, timestamp, cpl_type, center_lat, center_lon,
-              radius_nm, source_object, used_in_fix_id
+              radius_nm, source_object, used_in_fix_id,
+              raw_angle_deg, object_height_m
        FROM circular_position_lines WHERE cpl_id = ?`,
     )
     .get(id);
@@ -814,7 +849,8 @@ function listLinesOfPosition(db, q = {}) {
   return db
     .prepare(
       `SELECT lop_id, timestamp, lop_type, assumed_lat, assumed_lon,
-              azimuth_true, intercept_nm, body_or_object, used_in_fix_id
+              azimuth_true, bearing_raw_deg, bearing_ref, variation_deg,
+              intercept_nm, body_or_object, used_in_fix_id
        FROM lines_of_position ${sinceClause(q)} ORDER BY lop_id DESC LIMIT ?`,
     )
     .all(...sinceArgs(q), q.limit ?? 100);
@@ -833,8 +869,8 @@ function listLinesOfPosition(db, q = {}) {
 function listCircularPositionLines(db, q = {}) {
   return db
     .prepare(
-      `SELECT cpl_id, timestamp, center_lat, center_lon, radius_nm,
-              source_object, used_in_fix_id
+      `SELECT cpl_id, timestamp, cpl_type, center_lat, center_lon, radius_nm,
+              source_object, used_in_fix_id, raw_angle_deg, object_height_m
        FROM circular_position_lines ${sinceClause(q)} ORDER BY cpl_id DESC LIMIT ?`,
     )
     .all(...sinceArgs(q), q.limit ?? 100);
@@ -964,12 +1000,15 @@ function getFix(db, id) {
     .get(id);
 }
 
-/** Columns a pending LOP may be edited on (geometry + object label). */
+/** Columns a pending LOP may be edited on (geometry + object label + entered-bearing provenance). */
 const LOP_EDITABLE_COLUMNS = [
   "body_or_object",
   "assumed_lat",
   "assumed_lon",
   "azimuth_true",
+  "bearing_raw_deg",
+  "bearing_ref",
+  "variation_deg",
   "intercept_nm",
 ];
 
